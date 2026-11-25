@@ -8,10 +8,11 @@
 | 层级 | 范围 | 工具 | 命令 | CI job |
 | --- | --- | --- | --- | --- |
 | core 单元 / 集成 | `packages/core/src/**` | Vitest 4（`environment: node`） | `pnpm --filter @readany/core test` | `test-core` |
+| CLI 单元 / 集成 | `packages/cli/src/**` | Vitest 4 | `pnpm --filter @readany/cli test` | `test-core` |
 | 同步集成 | 本地 mock WebDAV HTTP server + `ISyncBackend` | Vitest + `node:http` | 同上 | `test-core` |
 | app 类型 / 构建 | `packages/app/src/**` | `tsc --noEmit`、Vite build | `pnpm --filter app exec tsc --noEmit` | `typecheck-app` |
 | Rust | `packages/app/src-tauri/**` | `cargo check` / `cargo test` | 见第 9 节 | `cargo-check` |
-| 规范 / CI | 文档、workflow、脚本 | Biome（仅变更文件）、YAML 解析、`version:check` | `pnpm lint:changed` | `lint` |
+| 规范 / CI | 文档、workflow、脚本 | Biome（仅变更文件）、`version:check` | `pnpm lint:changed` + `pnpm version:check` | `lint` |
 | 手动验收 | 桌面 Tauri、WebView2、移动端、真实 WebDAV | 人工 | 见第 10 节 | 不在 CI |
 
 约束：
@@ -24,8 +25,9 @@
 | 检查 | 结果 | 说明 |
 | --- | --- | --- |
 | `pnpm --filter @readany/core test` | **通过** | 85 个测试文件 / 628 个用例全部通过 |
+| `pnpm --filter @readany/cli test` | **本地 Windows 失败（平台限制，预存）** | 7 个测试文件：14 failed / 114 passed；失败集中在 `symlink EPERM`、Unix 路径断言和 `build-smoke` 超时。Ubuntu CI 首跑需确认 |
 | `pnpm --filter app exec tsc --noEmit` | **通过** | 无输出，退出码 0 |
-| `cargo check --manifest-path packages/app/src-tauri/Cargo.toml` | **通过** | 前置条件：先执行 `pnpm --filter @readany/cli build`，否则 Tauri build script 报 `resource path ../../cli/dist doesn't exist` |
+| `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` | **通过** | 前置：`pnpm --filter @readany/cli build` 与 `pnpm --filter app build`；本地 Windows 冷缓存约 5m50s。缺少 `packages/cli/dist` 时 Tauri build script 会报 `resource path ../../cli/dist doesn't exist` |
 | `pnpm lint`（全量） | **失败（预存债务）** | 默认 20 条诊断：1661 errors / 288 warnings；全量诊断：2628 errors / 575 warnings |
 | CRLF 文件 | 913 / 917 | `core.autocrlf=true` 且此前无 `.gitattributes`，与 Biome 的 LF 期望不符 |
 | `pnpm lint:changed` | **通过** | PR 门禁；只检查相对 `origin/main` 的变更文件 |
@@ -59,9 +61,9 @@
 
 | 测什么 | 测试文件 | fixture / mock | CI job |
 | --- | --- | --- | --- |
-| PDF worker 路径选择：Tauri / Web / 低版本 WebView2 各自可用 | `packages/core/src/pdf/worker-polyfill.test.ts`（新增，纯函数） | 假 `navigator.userAgent`、`window.__TAURI__` 标志；不加载真实 PDF | `test-core` |
+| PDF worker 路径选择：Tauri / Web / 低版本 WebView2 各自可用 | 目标位置（以 T3 实现为准）：`packages/core/src/pdf/worker-polyfill.test.ts` 或 `packages/app` 内纯函数测试 | 假 `navigator.userAgent`、`window.__TAURI__` 标志；不加载真实 PDF | `test-core`（落在 core 时） |
 | worker 初始化失败时回退主线程 / 给出可重试错误 | 同上 | 注入抛错的 loader | `test-core` |
-| PDF 章节解析回归 | `packages/core/src/pdf/chapter.test.ts` | 现有小型 PDF fixture | `test-core` |
+| PDF 章节解析回归 | `packages/core/src/pdf/chapter.test.ts` | 运行时生成小型 PDF（`buildSimplePdf()`），仓库不提交二进制 fixture | `test-core` |
 | 错误边界展示友好文案，不暴露原始异常/堆栈/URL | `packages/app/src/components/common/__tests__/error-boundary.test.tsx`（目标文件；app 暂无测试运行器时先手动验收） | 抛错子组件；断言 DOM 不含 `Error:`、堆栈、凭据 | 手动验收；后续 app 测试就绪后纳入 CI |
 
 ### T4 新设备接入（Onboarding）
@@ -79,8 +81,7 @@
 | 测什么 | 测试文件 / 检查 | fixture / mock | CI job |
 | --- | --- | --- | --- |
 | 变更文件 lint 门禁可运行、无变更时成功退出 | `scripts/lint-changed.mjs`（自身） | 本地分支与 `origin/main` 对比 | `lint` |
-| workflow YAML 可被解析 | `.github/workflows/ci.yml` | `yaml.safe_load` 或等价解析器 | 本地 / PR 检查 |
-| 版本文案一致 | `pnpm version:check` | 仓库版本文件 | 发布前手动 |
+| 版本文案一致 | `pnpm version:check` | 仓库版本文件 | `lint`（发布前也手动跑） |
 | 文档链接与命令真实存在 | `docs/development/*` | 人工检查 | PR review |
 
 ### T6 增量同步与结构
@@ -144,12 +145,16 @@ pnpm lint:changed
 # core 全量测试（85 文件 / 628 用例基线）
 pnpm --filter @readany/core test
 
+# CLI 测试（7 个测试文件；CLI 会打进桌面安装包）
+pnpm --filter @readany/cli test
+
 # app 类型检查
 pnpm --filter app exec tsc --noEmit
 
-# Rust 检查（先构建 CLI 资源）
+# Rust 检查（与 CI 一致：先构建 CLI 资源与前端产物）
 pnpm --filter @readany/cli build
-cargo check --manifest-path packages/app/src-tauri/Cargo.toml
+pnpm --filter app build
+cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol
 
 # 发布前版本一致性
 pnpm version:check
@@ -161,10 +166,12 @@ pnpm version:check
 
 | job | 命令 | 说明 |
 | --- | --- | --- |
-| `lint` | `pnpm lint:changed` | 只检查相对 `origin/main`（PR 使用 `GITHUB_BASE_REF`）的变更文件；无变更成功退出 |
-| `test-core` | `pnpm --filter @readany/core test` | 85 文件 / 628 用例基线 |
+| `lint` | `pnpm version:check` → `pnpm lint:changed` | 只检查相对 `origin/main`（PR 使用 `GITHUB_BASE_REF`，可用 `LINT_BASE_REF` 覆盖）的变更文件；无变更成功退出 |
+| `test-core` | `pnpm --filter @readany/core test` → `pnpm --filter @readany/cli test` | core 85 文件 / 628 用例基线；CLI 7 个测试文件 |
 | `typecheck-app` | `pnpm --filter app exec tsc --noEmit` | 已验证命令可用 |
-| `cargo-check` | `pnpm --filter @readany/cli build` → `cargo check --manifest-path packages/app/src-tauri/Cargo.toml` | 先构建 CLI，Tauri build script 需要 `packages/cli/dist` 资源；Ubuntu 依赖与 `release.yml` 一致 |
+| `cargo-check` | `pnpm --filter @readany/cli build` → `pnpm --filter app build` → `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` | 覆盖 `frontendDist` / 资源嵌入等 release-only 失败；Ubuntu 依赖与 `release.yml` 一致；超时 45 分钟 |
+
+PR 只保留一个 `cargo-check` job：本地实测前端构建约 1 分钟、Rust 冷缓存约 6 分钟，45 分钟足够；拆成 dev/release 两个 job 会让两套依赖与缓存漂移，且 PR 仍无法跳过 release 特性检查。若后续耗时成为瓶颈，再拆分并在本表标注 PR 覆盖边界。
 
 ## 10. 手动验收清单
 

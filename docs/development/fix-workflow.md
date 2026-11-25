@@ -45,6 +45,7 @@ ci: add lint test typecheck gates
 要求：
 
 - **一个提交只做一件事**。格式化、重命名、逻辑修复不要塞进同一个提交。
+- 变更文件门禁会要求**整个文件**符合 Biome 格式；如果只是历史文件的行尾/格式问题被触发，单独提交 `style(<scope>): normalize formatting`，不要混进功能提交。
 - 提交信息写“做了什么 + 为什么”，不要只写 `update`、`fix bug`。
 - 不提交生成物、`node_modules`、本地数据库、日志、真实凭据。
 - 不为了通过检查而批量格式化无关文件；Biome 只检查本次变更文件（见第 6 节）。
@@ -63,7 +64,7 @@ ci: add lint test typecheck gates
 
 1. 关联 issue 已填写，范围与验收标准对得上。
 2. 回归测试已先红后绿，命令与结果写进 PR 的“测试证据”。
-3. `pnpm lint:changed`、`pnpm --filter @readany/core test`、`pnpm --filter app exec tsc --noEmit` 全部通过；涉及 Rust 时 `cargo check` 通过。
+3. `pnpm lint:changed`、`pnpm --filter @readany/core test`、`pnpm --filter @readany/cli test`、`pnpm --filter app exec tsc --noEmit` 全部通过；涉及 Rust 时 `cargo check` 通过。
 4. 自己完整看过一遍 diff，没有调试输出、临时文件、无关格式化。
 5. 涉及 UI / PDF / 移动端时，附截图或录屏。
 6. 风险与回滚方式已写明。
@@ -101,7 +102,7 @@ ci: add lint test typecheck gates
 - [ ] **回归测试先红后绿**：修复前能复现失败，修复后通过；测试名能说明场景。
 - [ ] `pnpm lint:changed` 通过（只检查相对 `origin/main` 的变更文件）。
 - [ ] `pnpm --filter app exec tsc --noEmit` 通过。
-- [ ] `pnpm --filter @readany/core test` 通过；涉及 Rust 时 `cargo check --manifest-path packages/app/src-tauri/Cargo.toml` 通过。
+- [ ] `pnpm --filter @readany/core test` 与 `pnpm --filter @readany/cli test` 通过；涉及 Rust 时 `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` 通过。
 - [ ] issue 已回填测试证据（命令 + 结果 + 手动验收）。
 - [ ] 文档同步：行为、配置、错误语义变化时更新对应 `docs/`。
 - [ ] 无密钥：diff、测试 fixture、issue、日志中都没有真实密码、token、内网地址。
@@ -125,10 +126,11 @@ ci: add lint test typecheck gates
 
 因此：
 
-- **PR 门禁使用 `pnpm lint:changed`**，只对本次相对 `origin/main` 变更的、Biome 支持的文件跑 `biome check`；无变更时成功退出。
+- **PR 门禁使用 `pnpm lint:changed`**，默认相对 `origin/main`（可用 `--base` 或 `LINT_BASE_REF` 指定，fork 场景传 `upstream/main`），只对变更的、Biome 支持的文件跑 `biome check`；无变更时成功退出。
 - 全量 `pnpm lint` 仍然保留，用于债务清理；清理工作另开 issue，不与功能修复混在一起。
 - 新增 `.gitattributes`（`* text=auto eol=lf`）只影响**后续检出**，不承诺一次性修完历史 CRLF 文件，也不执行全库 renormalize。
 - `biome.json` 只新增 `files.ignore`（第三方/内嵌代码、构建产物、`target`），不调整规则、不批量改代码。
+- Linux CI 检出为 LF；Windows 本地若因 `core.autocrlf` 出现 CRLF，**本地全量 lint 红 ≠ CI 红**，以 `lint:changed` 和 CI 结果为准。
 
 ## 7. 与 upstream 同步
 

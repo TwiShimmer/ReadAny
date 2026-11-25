@@ -16,8 +16,9 @@ Closes #
 | --- | --- |
 | `pnpm lint:changed` | |
 | `pnpm --filter @readany/core test` | |
+| `pnpm --filter @readany/cli test` | |
 | `pnpm --filter app exec tsc --noEmit` | |
-| `cargo check --manifest-path packages/app/src-tauri/Cargo.toml` | N/A / 通过 |
+| `pnpm --filter @readany/cli build` + `pnpm --filter app build` + `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` | N/A / 通过 |
 
 回归测试（先红后绿）：
 
@@ -39,7 +40,8 @@ Closes #
 - [ ] `pnpm lint:changed` 通过（Biome 只检查本次变更文件）
 - [ ] `pnpm --filter app exec tsc --noEmit` 通过
 - [ ] `pnpm --filter @readany/core test` 通过
-- [ ] 涉及 Rust 时 `cargo check` 通过（前置 `pnpm --filter @readany/cli build`）
+- [ ] `pnpm --filter @readany/cli test` 通过
+- [ ] 涉及 Rust 时 `cargo check --features tauri/custom-protocol` 通过（前置 `pnpm --filter @readany/cli build` 与 `pnpm --filter app build`）
 - [ ] 回归测试先红后绿，测试证据已写入本文
 - [ ] 无真实 WebDAV 密码、token、内网地址、个人路径
 - [ ] 文档已同步（行为、配置、错误语义有变化时）
