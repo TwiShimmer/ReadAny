@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { type FetchOptions, type IPlatformService, setPlatformService } from "../services/platform";
+import {
+  type FetchOptions,
+  FileTransferError,
+  type FileTransferOptions,
+  type IPlatformService,
+  setPlatformService,
+} from "../services/platform";
 import { DEFAULT_WEBDAV_REMOTE_ROOT, type WebDavConfig } from "./sync-backend";
 import { WebDavBackend } from "./webdav-backend";
+import { WebDavClient, WebDavError } from "./webdav-client";
 
 function installFetchStub(
   handler: (url: string, options?: FetchOptions) => Response | Promise<Response>,
@@ -12,6 +19,19 @@ function installFetchStub(
     isMobile: false,
     isDesktop: false,
     fetch: handler,
+  } as unknown as IPlatformService);
+}
+
+function installTransferStub(options: {
+  fetch: (url: string, options?: FetchOptions) => Response | Promise<Response>;
+  uploadFile?: (url: string, filePath: string, options?: FileTransferOptions) => Promise<void>;
+}): void {
+  setPlatformService({
+    platformType: "web",
+    isMobile: false,
+    isDesktop: false,
+    fetch: options.fetch,
+    uploadFile: options.uploadFile,
   } as unknown as IPlatformService);
 }
 
@@ -68,7 +88,72 @@ describe("WebDavBackend directory healing", () => {
     ).toBe(true);
   });
 
-  it("ensureDirectories creates the legacy file/cover collections through ensureDirectory", async () => {
+  it("putFile ensures the parent collection and retries once after a 409", async () => {
+    const calls: { method: string; url: string }[] = [];
+    let uploads = 0;
+    installTransferStub({
+      fetch: (url, options) => {
+        const method = String(options?.method ?? "GET");
+        calls.push({ method, url });
+        if (method === "PROPFIND") return new Response("", { status: 404 });
+        if (method === "MKCOL") return new Response("", { status: 201 });
+        return new Response("", { status: 404 });
+      },
+      uploadFile: async (url) => {
+        uploads++;
+        if (uploads === 1) {
+          throw new FileTransferError("File upload failed: 409", { status: 409, url });
+        }
+      },
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const backend = new WebDavBackend(webDavConfig(), "secret");
+      await backend.putFile("/readany/data/books/Book-1/Book.epub", "/tmp/book.epub");
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+
+    expect(uploads).toBe(2);
+    expect(
+      calls.some(
+        (call) =>
+          call.method === "MKCOL" && call.url.endsWith("/readany/data/books/Book-1/"),
+      ),
+    ).toBe(true);
+  });
+
+  it("heals a localized 409 error by status instead of matching the message text", async () => {
+    const backend = new WebDavBackend(webDavConfig(), "secret");
+    const putSpy = vi
+      .spyOn(WebDavClient.prototype, "put")
+      .mockRejectedValueOnce(
+        new WebDavError("http", "WebDAV 请求失败（409 Conflict），父集合不存在。", { status: 409 }),
+      )
+      .mockResolvedValueOnce(undefined);
+    const ensureSpy = vi
+      .spyOn(WebDavClient.prototype, "ensureDirectory")
+      .mockResolvedValueOnce(undefined);
+
+    let ensuredPath: string | undefined;
+    let putCalls = 0;
+    try {
+      await backend.put("/readany/sync/device-abc.json", new Uint8Array([1]));
+      ensuredPath = ensureSpy.mock.calls[0]?.[0];
+      putCalls = putSpy.mock.calls.length;
+    } finally {
+      putSpy.mockRestore();
+      ensureSpy.mockRestore();
+    }
+
+    expect(ensuredPath).toBe("/readany/sync");
+    expect(putCalls).toBe(2);
+  });
+
+  it("does not create legacy file/cover collections during ensureDirectories", async () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       const method = String(options?.method ?? "GET");
@@ -91,8 +176,6 @@ describe("WebDavBackend directory healing", () => {
       "https://dav.example.com/dav/readany/sync/",
       "https://dav.example.com/dav/readany/data/",
       "https://dav.example.com/dav/readany/data/books/",
-      "https://dav.example.com/dav/readany/data/file/",
-      "https://dav.example.com/dav/readany/data/cover/",
     ]);
   });
 });

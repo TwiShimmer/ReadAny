@@ -60,6 +60,7 @@ describe("sync-files", () => {
     vi.clearAllMocks();
     mockSelect.mockResolvedValue([]);
     mockAdapter.listFiles.mockResolvedValue([]);
+    mockAdapter.getFileSize.mockResolvedValue(null);
     mockAdapter.maxBufferedTransferBytes = undefined;
   });
 
@@ -149,6 +150,32 @@ describe("sync-files", () => {
       mockAdapter.fileExists.mockResolvedValue(true);
       mockAdapter.getFileSize.mockResolvedValue(20 * 1024 * 1024);
       mockAdapter.maxBufferedTransferBytes = 16 * 1024 * 1024;
+
+      const backend = createMockBackend({
+        listDir: vi.fn().mockResolvedValue([]),
+      });
+
+      const result = await syncFiles(backend);
+      expect(result.filesUploaded).toBe(0);
+      expect(result.filesUploadFailed).toBe(1);
+      expect(mockAdapter.readFileBytes).not.toHaveBeenCalled();
+      expect(backend.put).not.toHaveBeenCalled();
+    });
+
+    it("refuses to buffer an oversized upload when the platform sets no explicit limit", async () => {
+      mockSelect.mockResolvedValue([
+        {
+          id: "book-1",
+          file_path: "books/book-1.pdf",
+          file_hash: "h1",
+          cover_url: null,
+          title: "Huge PDF",
+        },
+      ]);
+
+      mockAdapter.fileExists.mockResolvedValue(true);
+      mockAdapter.getFileSize.mockResolvedValue(262 * 1024 * 1024);
+      mockAdapter.maxBufferedTransferBytes = undefined;
 
       const backend = createMockBackend({
         listDir: vi.fn().mockResolvedValue([]),

@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { type FetchOptions, type IPlatformService, setPlatformService } from "../services/platform";
-import { WebDavClient, sanitizeWebDavRemoteRoot } from "./webdav-client";
+import {
+  type FetchOptions,
+  FileTransferError,
+  type FileTransferOptions,
+  type IPlatformService,
+  setPlatformService,
+} from "../services/platform";
+import { WebDavClient, WebDavError, sanitizeWebDavRemoteRoot } from "./webdav-client";
 
 function installFetchStub(
   handler: (url: string, options?: FetchOptions) => Response | Promise<Response>,
@@ -11,6 +17,19 @@ function installFetchStub(
     isMobile: false,
     isDesktop: false,
     fetch: handler,
+  } as unknown as IPlatformService);
+}
+
+function installTransferStub(options: {
+  fetch: (url: string, options?: FetchOptions) => Response | Promise<Response>;
+  uploadFile?: (url: string, filePath: string, options?: FileTransferOptions) => Promise<void>;
+}): void {
+  setPlatformService({
+    platformType: "web",
+    isMobile: false,
+    isDesktop: false,
+    fetch: options.fetch,
+    uploadFile: options.uploadFile,
   } as unknown as IPlatformService);
 }
 
@@ -293,6 +312,106 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       "https://dav.example.com/dav/readany/sync/",
       "https://dav.example.com/dav/readany/sync",
     ]);
+  });
+
+  it("ensures the parent collection before a file upload and retries a 409 once", async () => {
+    const calls: { method: string; url: string }[] = [];
+    let uploadAttempts = 0;
+    installTransferStub({
+      fetch: (url, options) => {
+        const method = String(options?.method ?? "GET");
+        calls.push({ method, url });
+        if (method === "PROPFIND") {
+          return new Response("", { status: 404 });
+        }
+        if (method === "MKCOL") {
+          return new Response("", { status: 201 });
+        }
+        return new Response("", { status: 404 });
+      },
+      uploadFile: async (url) => {
+        uploadAttempts++;
+        calls.push({ method: "UPLOAD", url });
+        if (uploadAttempts === 1) {
+          // Localized message without the status digits: only `status` may
+          // drive the recovery branch.
+          throw new FileTransferError("文件上传失败（父目录不存在）", { status: 409, url });
+        }
+      },
+    });
+
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+      const remotePath = "/readany/data/books/这里是 终末 (1)/正文.epub";
+      await client.putFile(remotePath, "/tmp/正文.epub");
+    } finally {
+      logSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+
+    const encodedParent = "/readany/data/books/%E8%BF%99%E9%87%8C%E6%98%AF%20%E7%BB%88%E6%9C%AB%20(1)/";
+    const encodedFile = `${encodedParent}%E6%AD%A3%E6%96%87.epub`;
+    const mkcolUrls = calls.filter((call) => call.method === "MKCOL").map((call) => call.url);
+    const uploadUrls = calls.filter((call) => call.method === "UPLOAD").map((call) => call.url);
+
+    expect(mkcolUrls).toContain(`https://dav.example.com/dav${encodedParent}`);
+    expect(uploadAttempts).toBe(2);
+    expect(uploadUrls).toEqual([
+      `https://dav.example.com/dav${encodedFile}`,
+      `https://dav.example.com/dav${encodedFile}`,
+    ]);
+    // The parent was ensured before the first upload attempt.
+    expect(calls.findIndex((call) => call.method === "MKCOL")).toBeLessThan(
+      calls.findIndex((call) => call.method === "UPLOAD"),
+    );
+  });
+
+  it("treats a 405 or 301 MKCOL response as an existing collection", async () => {
+    const calls: { method: string; url: string }[] = [];
+    installFetchStub((url, options) => {
+      const method = String(options?.method ?? "GET");
+      calls.push({ method, url });
+      if (method === "PROPFIND") return new Response("", { status: 404 });
+      if (method === "MKCOL") {
+        return new Response("", { status: url.endsWith("/readany/") ? 301 : 405 });
+      }
+      return new Response("", { status: 404 });
+    });
+
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBeUndefined();
+
+    expect(calls.filter((call) => call.method === "MKCOL")).toHaveLength(3);
+  });
+
+  it("handles a localized 404 by status instead of matching the message text", async () => {
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    vi.spyOn(client, "propfind").mockRejectedValueOnce(
+      new WebDavError("not-found", "WebDAV 地址或路径不存在，请检查服务器地址和根路径。", {
+        status: 404,
+      }),
+    );
+    const ensureSpy = vi.spyOn(client, "ensureDirectory").mockResolvedValueOnce();
+
+    await expect(client.safeReadDir("/readany/sync")).resolves.toEqual([]);
+    expect(ensureSpy).toHaveBeenCalledWith("/readany/sync/");
+  });
+
+  it("does not treat an unrelated localized error containing 404 as a missing collection", async () => {
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    vi.spyOn(client, "propfind").mockRejectedValueOnce(
+      new WebDavError("server", "服务器返回 404 之外的异常（500）", { status: 500 }),
+    );
+
+    await expect(client.safeReadDir("/readany/sync")).rejects.toMatchObject({ status: 500 });
+  });
+
+  it("getJSON returns null for a localized 404 response by status", async () => {
+    installFetchStub(() => new Response("", { status: 404 }));
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.getJSON("/readany/sync/missing.json")).resolves.toBeNull();
   });
 
   it("getJSON returns null for 404 by status and rethrows other failures", async () => {
