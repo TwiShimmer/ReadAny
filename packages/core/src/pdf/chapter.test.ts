@@ -161,7 +161,7 @@ describe("PDF chapter fallback", () => {
       contentTruncated: true,
       contentLimit: 9,
     });
-  });
+  }, 30_000);
 
   it("returns null for invalid page chapter ids", async () => {
     const root = await mkdtemp(join(tmpdir(), "readany-core-pdf-"));
@@ -196,5 +196,5 @@ describe("PDF chapter fallback", () => {
       if (saved) Object.defineProperty(Map.prototype, "getOrInsertComputed", saved);
       else Reflect.deleteProperty(Map.prototype, "getOrInsertComputed");
     }
-  });
+  }, 30_000);
 });

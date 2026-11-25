@@ -1,7 +1,3 @@
-/**
- * pdf.js ships the worker without type declarations. The app imports it only
- * from the bundled worker entry, which re-exports WorkerMessageHandler.
- */
-declare module "pdfjs-dist/build/pdf.worker.mjs" {
-  export const WorkerMessageHandler: unknown;
-}
+// Side-effect only import: the worker entry loads pdf.worker.mjs to install
+// pdf.js's worker-side message handler. No exports are consumed by the app.
+declare module "pdfjs-dist/build/pdf.worker.mjs";

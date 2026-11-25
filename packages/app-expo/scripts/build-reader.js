@@ -16,19 +16,34 @@ const TEMPLATE = path.resolve(ASSETS_DIR, "reader.template.html");
 const OUTPUT = path.resolve(ASSETS_DIR, "reader.html");
 
 async function buildReader() {
-  // Resolve the worker from foliate-js's own dependency tree so the mobile
-  // reader never mixes pdf.js API and worker versions (the root workspace has
-  // a newer pdfjs-dist than foliate-js).
+  // Resolve pdf.js from foliate-js's own dependency tree. The root workspace
+  // has a newer major version; silently falling back to it would produce a
+  // reader bundle without the Map-upsert polyfills required by 5.x.
   const foliateRequire = createRequire(path.join(FOLIATE_DIR, "package.json"));
+  let pdfjsPackagePath;
   let workerModulePath;
   try {
+    pdfjsPackagePath = foliateRequire.resolve("pdfjs-dist/package.json");
     workerModulePath = foliateRequire.resolve("pdfjs-dist/build/pdf.worker.mjs");
   } catch (error) {
-    throw new Error("Unable to resolve pdfjs-dist worker from packages/foliate-js", {
-      cause: error,
-    });
+    throw new Error(
+      "Unable to resolve pdfjs-dist from packages/foliate-js. Run `pnpm install` so the nested dependency exists.",
+      { cause: error },
+    );
+  }
+
+  const pdfjsVersion = JSON.parse(fs.readFileSync(pdfjsPackagePath, "utf8")).version;
+  const pdfjsMajor = Number.parseInt(String(pdfjsVersion).split(".")[0], 10);
+  console.log(`[build-reader] pdfjs-dist ${pdfjsVersion} (${path.dirname(pdfjsPackagePath)})`);
+  if (pdfjsMajor !== 4) {
+    throw new Error(
+      `[build-reader] expected foliate-js to use pdfjs-dist 4.x, got ${pdfjsVersion}. Refusing to emit a reader bundle that may miss the Map upsert polyfills. Restore the nested 4.x dependency or explicitly add/verify the polyfill before raising this guard.`,
+    );
   }
   const normalizedWorkerPath = workerModulePath.replace(/\\/g, "/");
+  const normalizedModernMapPath = path
+    .resolve(__dirname, "../../core/src/utils/modern-map")
+    .replace(/\\/g, "/");
 
   // Create a temporary entry point
   const entryContent = `
@@ -58,6 +73,11 @@ async function buildReader() {
     import { EPUB } from "${FOLIATE_DIR.replace(/\\/g, "/")}/epub.js";
     import { configurePDFWorker, extractPDFChapters, makePDFFromURL } from "${FOLIATE_DIR.replace(/\\/g, "/")}/pdf.js";
     import { WorkerMessageHandler } from "${normalizedWorkerPath}";
+    import { installModernMapPolyfills } from "${normalizedModernMapPath}";
+
+    // The build guard pins pdf.js 4.x, but installing this keeps the mobile
+    // reader safe if the dependency is deliberately raised to 5.x later.
+    installModernMapPolyfills();
 
     // Mobile has no server-side worker bundle: configure pdf.js explicitly
     // with the fake-worker handler instead of relying on vendored globals.
@@ -93,7 +113,7 @@ async function buildReader() {
       target: "es2020",
       minify: true,
       write: false,
-      resolveExtensions: [".js", ".mjs"],
+      resolveExtensions: [".js", ".mjs", ".ts"],
     });
 
     const bundledJS = result.outputFiles[0].text;

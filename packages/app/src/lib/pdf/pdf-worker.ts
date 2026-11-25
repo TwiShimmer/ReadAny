@@ -20,8 +20,15 @@ let configured = false;
 
 export function ensurePdfWorker(): void {
   if (configured) return;
-  configured = true;
-  // `configurePDFWorker` also deletes any stale main-thread fake worker so
-  // this real worker cannot be shadowed.
-  configurePDFWorker({ workerSrc: pdfWorkerUrl });
+  try {
+    // `configurePDFWorker` also deletes any stale main-thread fake worker so
+    // this real worker cannot be shadowed.
+    configurePDFWorker({ workerSrc: pdfWorkerUrl });
+    configured = true;
+  } catch (error) {
+    // Leave `configured` false so the next PDF open retries instead of
+    // permanently falling back to the CDN/workerSrc-less path.
+    console.error("[pdf-worker] Failed to configure the bundled PDF worker:", error);
+    throw error;
+  }
 }

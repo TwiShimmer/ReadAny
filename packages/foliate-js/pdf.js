@@ -18,11 +18,14 @@ import * as pdfjsLib from "pdfjs-dist";
  * previously configured fake worker cannot shadow the real one.
  */
 export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => {
+  // One mode per process: a real workerSrc and a main-thread fake worker must
+  // not be active at the same time.
   if (workerSrc) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
     // biome-ignore lint/performance/noDelete: remove the fake-worker hook entirely
     delete globalThis.pdfjsWorker;
   } else if (workerMessageHandler) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "";
     globalThis.pdfjsWorker ??= { WorkerMessageHandler: workerMessageHandler };
   }
 };

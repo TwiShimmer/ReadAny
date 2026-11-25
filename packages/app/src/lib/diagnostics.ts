@@ -19,7 +19,8 @@ function truncate(value: string, limit: number): string {
 /** Coarse path/token scrubbing; diagnostics are copied deliberately, not logged. */
 function scrubSensitiveText(value: string): string {
   return value
-    .replace(/\b(?:file|asset|https?):\/\/\S+/gi, "<url>")
+    .replace(/\b(?:file|asset|tauri|https?):\/\/\S+/gi, "<url>")
+    .replace(/\b(?:blob|data):\S+/gi, "<url>")
     .replace(/\b[A-Za-z]:\\[^\s]*/g, "<path>")
     .replace(/\/(?:[^\s/]+\/)+[^\s/]+/g, "<path>")
     .replace(/\b(?:sk|ghp|gho|github_pat)_[A-Za-z0-9_]+\b/g, "<redacted>")
@@ -63,8 +64,8 @@ export async function buildDiagnostics(
     webviewLabel ? `WebView: ${webviewLabel}` : "",
     `Map upserts: ${missingMapApis.length ? `missing (${missingMapApis.join(", ")})` : "ok"}`,
     userAgent ? `User-Agent: ${userAgent}` : "",
-    details.scope ? `Scope: ${details.scope}` : "",
-    details.context ? `Context: ${details.context}` : "",
+    details.scope ? `Scope: ${scrubSensitiveText(details.scope)}` : "",
+    details.context ? `Context: ${scrubSensitiveText(details.context)}` : "",
     `Error: ${summarizeError(error)}`,
     `Time: ${new Date().toISOString()}`,
   ]
