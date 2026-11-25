@@ -85,6 +85,13 @@ function isDirectFileTransferUnsupported(error: unknown): boolean {
   return /does not support direct file|Platform does not support direct file/i.test(message);
 }
 
+/**
+ * Hard cap when a platform does not declare its own buffered-transfer limit.
+ * Mobile declares 16 MB; desktop can buffer more but still must not try to
+ * expand a >2^31-byte array in JS (the RangeError from issue #1).
+ */
+const DEFAULT_MAX_BUFFERED_TRANSFER_BYTES = 256 * 1024 * 1024;
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
@@ -121,13 +128,16 @@ async function uploadFileToRemote(
     }
   }
 
-  if (adapter.maxBufferedTransferBytes != null) {
-    const fileSize = await adapter.getFileSize(localPath);
-    if (fileSize != null && fileSize > adapter.maxBufferedTransferBytes) {
-      throw new Error(
-        `Buffered upload would exceed platform memory limit for ${remotePath}: ${formatBytes(fileSize)} > ${formatBytes(adapter.maxBufferedTransferBytes)}`,
-      );
-    }
+  // Never read a whole large file into the JS heap. Direct/native streaming
+  // upload is preferred above; if that path is unavailable, fail with an
+  // actionable size error instead of risking RangeError: Invalid array length
+  // when the buffer is expanded.
+  const bufferedLimit = adapter.maxBufferedTransferBytes ?? DEFAULT_MAX_BUFFERED_TRANSFER_BYTES;
+  const fileSize = await adapter.getFileSize(localPath);
+  if (fileSize != null && fileSize > bufferedLimit) {
+    throw new Error(
+      `File is too large for buffered upload: ${remotePath} is ${formatBytes(fileSize)}, which exceeds the ${formatBytes(bufferedLimit)} limit. Use the desktop app or a streaming/chunked upload instead.`,
+    );
   }
 
   const data = await adapter.readFileBytes(localPath);

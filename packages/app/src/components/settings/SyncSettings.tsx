@@ -547,6 +547,17 @@ export function SyncSettings() {
             onCheckedChange={(checked) => setWebdavAllowInsecure(checked)}
           />
         </div>
+        {webdavAllowInsecure ? (
+          <p
+            role="alert"
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-700 dark:text-amber-300"
+          >
+            {t(
+              "settings.syncAllowInsecureWarning",
+              "已关闭 TLS 证书校验，HTTPS 也可能被降级为 HTTP。仅在你信任的网络和服务器上使用，否则可能被中间人窃听或篡改。",
+            )}
+          </p>
+        ) : null}
         <div className="space-y-2 pt-1">
           <div className="flex flex-wrap items-center gap-2">
             <button

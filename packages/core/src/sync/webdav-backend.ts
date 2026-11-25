@@ -9,8 +9,8 @@ import {
   type RemoteFile,
   type WebDavConfig,
 } from "./sync-backend";
-import { REMOTE_BOOKS_ROOT, REMOTE_COVERS, REMOTE_DATA, REMOTE_FILES } from "./sync-types";
-import { WebDavClient, sanitizeWebDavRemoteRoot } from "./webdav-client";
+import { REMOTE_BOOKS_ROOT, REMOTE_DATA } from "./sync-types";
+import { WebDavClient, WebDavError, sanitizeWebDavRemoteRoot } from "./webdav-client";
 
 /**
  * WebDAV backend implementation.
@@ -75,13 +75,9 @@ export class WebDavBackend implements ISyncBackend {
     // Create directories for the new simple sync (JSON-based)
     await this.client.ensureDirectory(this.resolvePath("/readany/sync"));
     await this.client.ensureDirectory(this.resolvePath(REMOTE_DATA));
-    // New per-book layout root
+    // New per-book layout root. Legacy /data/file and /data/cover are only
+    // read for migration; creating them on every sync is unnecessary.
     await this.client.ensureDirectory(this.resolvePath(REMOTE_BOOKS_ROOT));
-    // Legacy directories kept ensured during the transition window (cheap & safe).
-    // ensureDirectory (not bare mkcol): some servers answer 409 to MKCOL when
-    // an intermediate collection is missing, which must not be read as success.
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_FILES));
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_COVERS));
     this.directoriesEnsured = true;
   }
 
@@ -100,8 +96,10 @@ export class WebDavBackend implements ISyncBackend {
     try {
       await write(resolved);
     } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      if (!/\b(403|404|409)\b/.test(message)) throw e;
+      // Branch on the structured status; message text is localized and may
+      // also contain unrelated numbers (e.g. a path called "/404").
+      const status = e instanceof WebDavError ? e.status : undefined;
+      if (status !== 403 && status !== 404 && status !== 409) throw e;
       const parent = resolved.substring(0, resolved.lastIndexOf("/"));
       if (!parent || parent === "/") throw e;
       await this.client.ensureDirectory(parent);
