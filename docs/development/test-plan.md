@@ -25,7 +25,7 @@
 | 检查 | 结果 | 说明 |
 | --- | --- | --- |
 | `pnpm --filter @readany/core test` | **通过** | 85 个测试文件 / 628 个用例全部通过 |
-| `pnpm --filter @readany/cli test` | **本地 Windows 失败（平台限制，预存）** | 7 个测试文件：12 failed / 116 passed。`build-smoke` 已不再超时（`hookTimeout: 120_000`、`testTimeout: 30_000`，real-sample 用例显式 120s）；剩余失败为 `symlink EPERM`、Unix 路径断言、argv 路径解析等 Windows 平台限制。CLI 测试以 Linux CI 为准 |
+| `pnpm --filter @readany/cli test` | **本地 Windows 失败（平台限制，预存）** | 7 个测试文件：11 failed / 117 passed。`build-smoke` 已不再超时（`hookTimeout: 120_000`、`testTimeout: 30_000`，real-sample 用例显式 120s）；vector RAG fixture 已补 `vector_index_provenance`；剩余失败为 `symlink EPERM`、Unix 路径断言（Windows 平台限制）。CLI 测试以 Linux CI 为准 |
 | `pnpm --filter app exec tsc --noEmit` | **通过** | 无输出，退出码 0 |
 | `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` | **通过** | 前置：`pnpm --filter @readany/cli build` 与 `pnpm --filter app build`；本地 Windows 冷缓存约 5m50s。缺少 `packages/cli/dist` 时 Tauri build script 会报 `resource path ../../cli/dist doesn't exist` |
 | `pnpm lint`（全量） | **失败（预存债务）** | 默认 20 条诊断：1661 errors / 288 warnings；全量诊断：2628 errors / 575 warnings |
@@ -112,11 +112,11 @@
 
 | 场景 | 操作 | 期望 | 实际 |
 | --- | --- | --- | --- |
-| 重命名 | `git mv a.ts b.ts` | 新路径 `b.ts` 被检查（`--no-renames`，重命名视为 A+D） | |
+| 重命名 | `git mv a.ts b.ts` | 新路径 `b.ts` 被检查（`--no-renames`，重命名视为 A+D） | 已验证：`git mv scripts/invert-svg.js "scripts/invert svg 测试.js"` 后新路径被检查 |
 | 删除 | `git rm c.ts` | 删除文件不参与 lint，脚本不报错 | |
-| 中文名 | 新建 `测试 文件.ts` | 路径原样传给 Biome，不被转义或丢弃 | |
-| 空格名 | 新建 `lint path test.ts` | 不被拆参，作为一个完整参数处理 | |
-| 被忽略目录 | 在 `packages/foliate-js/` 新建 `.js` | Biome 跳过，脚本退出 0（`--no-errors-on-unmatched`） | |
+| 中文名 | 新建 `测试 文件.ts` | 路径原样传给 Biome，不被转义或丢弃 | 已验证：临时文件被计入并通过 |
+| 空格名 | 新建 `lint path test.ts` | 不被拆参，作为一个完整参数处理 | 已验证：`lint path 测试.ts` 被计入并通过 |
+| 被忽略目录 | 在 `packages/foliate-js/` 新建 `.js` | Biome 跳过，脚本退出 0（`--no-errors-on-unmatched`） | 已验证：退出 0 |
 
 
 - 目录：`packages/core/src/sync/__fixtures__/`（按需创建），小型 JSON fixture 可提交；**大二进制不提交**，在测试运行时生成。
