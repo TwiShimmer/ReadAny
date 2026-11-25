@@ -16,7 +16,7 @@
   ReadAny helps you ask questions about books, find ideas by meaning, and build a private reading knowledge base with RAG chat, semantic search, highlights, TTS, and WebDAV sync.
 </p>
 
-> **ReadAny is a client-side reader and does not include a cloud service or WebDAV server.** Cross-device sync requires storage you provide: a WebDAV server (Nextcloud, Nutstore/Jianguoyun, or a self-hosted server such as wsgidav) or S3-compatible storage. See [WebDAV Sync](https://codedogqby.github.io/ReadAny/support/sync/webdav/) and [System Requirements & Known Limitations](https://codedogqby.github.io/ReadAny/support/requirements/).
+> **ReadAny is a client-side reader and does not include a cloud service or WebDAV server.** Cross-device sync requires storage you provide: a WebDAV server (Nextcloud, Nutstore/Jianguoyun, or a self-hosted server such as wsgidav) or S3-compatible storage. You can also transfer directly between devices on the same local network, without a cloud account. See [WebDAV Sync](https://codedogqby.github.io/ReadAny/support/sync/webdav/) and [System Requirements & Known Limitations](https://codedogqby.github.io/ReadAny/support/requirements/).
 
 <p align="center">
   <a href="https://github.com/codedogQBY/ReadAny/releases/latest">

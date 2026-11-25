@@ -9,7 +9,7 @@ description: Sync reading data and book files with WebDAV storage you provide.
 ReadAny is a client-side reader. It does **not** host a cloud service or run a WebDAV server for you. Cross-device sync works with storage you already have:
 
 - **WebDAV** — Nextcloud, Nutstore (坚果云 / Jianguoyun), Box, or a self-hosted server such as wsgidav
-- **S3-compatible storage** — configured separately under **Settings → Sync**
+- **S3-compatible storage** — configured separately under **Settings → Sync**; see [S3 Sync](/ReadAny/support/sync/s3/)
 
 Every device must connect to the same server, account, and **Remote Folder**. ReadAny does not merge two different remote folders into one library.
 
@@ -53,10 +53,12 @@ With the default Remote Folder (`readany`), ReadAny writes:
     │   └── <sanitized-title>-<bookId>/
     │       ├── <sanitized-title>.<book-ext>
     │       └── <sanitized-title>.<cover-ext>
+    ├── file/                          # legacy compatibility; created during setup
+    ├── cover/                         # legacy compatibility; created during setup
     └── file-manifest.json            # lightweight index of remote book files
 ```
 
-`index.json` is the shared change index. `file-manifest.json` lets ReadAny avoid a full directory scan; if it is missing or stale, ReadAny falls back to scanning the folders.
+`index.json` is the shared change index. `file-manifest.json` lets ReadAny avoid a full directory scan; if it is missing or stale, ReadAny falls back to scanning the folders. The `file/` and `cover/` folders are created for compatibility with older layouts and are not used for new book uploads.
 
 ### Book Folder Names
 
@@ -71,7 +73,7 @@ Three-Body Problem-3f2a9c1e-8b7d-4c2a-9f10-1d2e3f4a5b6c
 - The trailing UUID is the stable book ID. ReadAny uses it to match the folder to the book even if the display title changes.
 - Renaming a book changes the folder name. ReadAny moves the files to the new folder on the next sync, so do not rename folders by hand.
 
-Older versions and LAN sync used a per-device snapshot layout:
+Older versions used a per-device snapshot layout with flat book and cover folders:
 
 ```text
 <Remote Folder>/sync/device-<deviceId>.json
@@ -79,7 +81,7 @@ Older versions and LAN sync used a per-device snapshot layout:
 <Remote Folder>/data/cover/<bookId>.<ext>
 ```
 
-Current cloud sync reads those files for migration and moves book files into the per-book layout. You may still see them after upgrading, or while LAN sync is in use. Do not delete them manually during a migration.
+Current cloud sync reads those files for migration and moves book files into the per-book layout. LAN transfer still writes `sync/device-<deviceId>.json` for its device snapshot, while book files use the same per-book layout. You may still see the old `file/` and `cover/` folders after upgrading; do not delete them manually during a migration.
 
 ## What Gets Synced
 
@@ -93,11 +95,14 @@ Book files **are** synced per book. Metadata and book files are separate phases,
 
 ## New Devices and Bulk Downloads
 
-A normal sync does **not** download every remote book file. ReadAny pulls the metadata first, so remote books appear in the library with a remote/download state, but `downloadRemoteBooks` defaults to `false`.
+On WebDAV and S3, a normal sync does **not** download every remote book file. ReadAny pulls the metadata first, so remote books appear in the library with a remote/download state, but the default is not to download book files during a normal sync.
 
 - **Open a remote book** to download that book file on demand.
-- To fetch everything at once, use **Settings → Sync → Advanced → Full Download**. This overwrites this device's database and downloads remote books and covers again, so use it deliberately.
+- To fetch all remote book files at once, use **Settings → Sync → Advanced Options → Full Download**. This overwrites this device's database and downloads remote books and covers again, so use it deliberately.
 - A normal sync still uploads local books that are missing on the remote.
+- Covers are handled separately: a missing remote cover is downloaded during a normal sync even when book files are not.
+
+LAN transfer behaves differently: **Import From Device** receives the other device's snapshot and downloads missing books and covers, so it can pull a whole library over the local network without a cloud account.
 
 ## When a File Fails
 
@@ -106,7 +111,7 @@ The sync result reports metadata and file transfers separately:
 - A sync can finish with metadata applied and some book or cover files failed.
 - The sync details show how many files were uploaded/downloaded and how many failed.
 - A failed file does not abort the rest of the batch; the status message looks like “Some files didn't sync (N upload failures, M download failures).”
-- The next sync retries missing files automatically.
+- Failed **book-file uploads** are retried on the next sync. Failed **book-file downloads** are not: open that book again, or run **Full Download**.
 
 If the same file keeps failing, check the server's write permission, free space, path length, proxy body-size limit, and whether the file is unusually large. Then retry. If the remote copy is wrong, use **Full Upload** from the device that has the correct file.
 
@@ -114,7 +119,7 @@ If the same file keeps failing, check the server's write permission, free space,
 
 These limits apply to the current 1.3.x line. Fixes are tracked, but this page does not promise a release date.
 
-- **Very large books can fail.** Reports of 200 MB+ book files failing on some setups are known. The desktop upload path reads the file into memory before PUT, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and prefer splitting very large PDFs or comic archives.
+- **Very large books can fail.** User reports and the tracked large-file transport issue ([#1](https://github.com/TwiShimmer/ReadAny/issues/1)) describe failures at 200 MB and above on some setups; this is not an official size limit. The desktop upload path reads the file into memory before PUT, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and prefer splitting very large PDFs or comic archives.
 - **Older WebView2 runtimes may fail to render PDFs.** On Windows, update the Microsoft Edge WebView2 Runtime through Windows Update or the official installer.
 - **Weak servers dislike bursts.** Some NAS and consumer WebDAV gateways throttle or return 401/429 under parallel load. Lower **Concurrent transfers** to 1–2 in sync settings.
 - **The server stores plain files.** ReadAny does not add end-to-end encryption. Your WebDAV provider can read synced JSON and book files, so choose a provider you trust. **Allow Insecure Connection** weakens this further: desktop skips TLS verification, and mobile can downgrade `https://` to `http://`.
@@ -170,7 +175,7 @@ Then configure ReadAny with:
 - **Remote Folder**: `readany`
 - **Username / Password**: the credentials enforced by your proxy or wsgidav
 
-The proxy must pass WebDAV methods such as `PROPFIND`, `MKCOL`, `PUT`, `GET`, `MOVE`, and `DELETE`. nginx does this by default, but some WAFs and CDNs block non-GET/HEAD methods.
+The proxy must pass WebDAV methods such as `PROPFIND`, `MKCOL`, `HEAD`, `PUT`, `GET`, `MOVE`, and `DELETE`. ReadAny uses `HEAD` for existence checks and falls back to `PROPFIND` when the server does not allow it. nginx passes these methods by default, but some WAFs and CDNs block non-GET/HEAD methods.
 
 ## Troubleshooting
 
@@ -179,7 +184,7 @@ The proxy must pass WebDAV methods such as `PROPFIND`, `MKCOL`, `PUT`, `GET`, `M
 | `401` / authentication failed | Username and app password; some providers require an app password instead of the account password |
 | `403` / access denied | Folder permissions; the account must be allowed to create and delete files in the Remote Folder |
 | `404` / not found | Server URL path, Remote Folder spelling, and whether the WebDAV endpoint is enabled |
-| `405` / method not allowed | WebDAV is disabled on the server, or a proxy/WAF blocks `PROPFIND`, `MKCOL`, or `MOVE` |
+| `405` / method not allowed | WebDAV is disabled on the server, or a proxy/WAF blocks `PROPFIND`, `MKCOL`, `HEAD`, or `MOVE` |
 | Timeout | Network reachability, port, proxy timeout, and the 300-second book file transfer limit |
 | TLS certificate error | Certificate chain/hostname, or use a trusted certificate; only use **Allow Insecure Connection** on a trusted LAN |
 

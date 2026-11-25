@@ -49,28 +49,29 @@ ReadAny does not include a cloud service or a WebDAV server. To sync, you need o
 - A WebDAV account or self-hosted server, reachable over HTTPS
 - An S3-compatible bucket
 
-See [WebDAV Sync](/ReadAny/support/sync/webdav/) for setup, the remote layout, and a minimal wsgidav deployment. Use an app-specific password where your provider supports one.
+See [WebDAV Sync](/ReadAny/support/sync/webdav/) for WebDAV setup, the remote layout, and a minimal wsgidav deployment, or [S3 Sync](/ReadAny/support/sync/s3/) for S3-compatible storage. Use an app-specific password where your provider supports one.
 
 Network guidance:
 
 - Prefer a stable connection for the first sync and for uploading large books.
 - Book file transfers time out after 300 seconds; metadata requests use a shorter timeout.
 - On weak NAS or consumer WebDAV gateways, lower **Concurrent transfers** to 1–2.
-- The WebDAV server must accept `PROPFIND`, `MKCOL`, `PUT`, `GET`, `MOVE`, and `DELETE`.
+- The WebDAV server must accept `PROPFIND`, `MKCOL`, `HEAD`, `PUT`, `GET`, `MOVE`, and `DELETE`.
 
 ## Known Limitations
 
 ### Sync and Book Files
 
 - Metadata sync and book-file sync are separate phases. A successful metadata sync can still leave book files failed; the sync details report the failure counts.
-- A normal sync does not bulk-download remote book files. Open a remote book to download it, or use **Full Download** to fetch everything.
+- On WebDAV and S3, a normal sync does not bulk-download remote book files. Open a remote book to download it, or use **Full Download** to fetch everything. Covers are downloaded whenever they are missing, even when book files are not.
+- LAN transfer is different: **Import From Device** receives the other device's snapshot and downloads missing books and covers over the local network.
 - A successful `Test Connection` verifies authentication and directory creation, not that every later upload will fit the server's quota or proxy limits.
 
 ### Large Files
 
-Book files of 200 MB or more are known to fail on some setups. The desktop upload path reads the file into memory before sending it, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and split very large PDFs or comic archives.
+User reports and the tracked large-file transport issue ([#1](https://github.com/TwiShimmer/ReadAny/issues/1)) describe failures at 200 MB and above on some setups. This is not an official size limit. The desktop upload path reads the file into memory before sending it, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and split very large PDFs or comic archives.
 
-This is a known limitation under investigation, not a fixed behavior.
+This is a known limitation under investigation and is not fixed yet.
 
 ### PDF Rendering
 
