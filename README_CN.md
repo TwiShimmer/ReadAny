@@ -16,7 +16,7 @@
   ReadAny 帮你向书籍提问、按语义寻找观点，并用 RAG 对话、语义搜索、高亮笔记、TTS 与 WebDAV 同步构建私有阅读知识库。
 </p>
 
-> **ReadAny 是客户端阅读器，不包含云服务，也不提供 WebDAV 服务端。** 跨设备同步需要你自备存储：WebDAV 服务（Nextcloud、坚果云，或 wsgidav 等自建服务）或 S3 兼容存储；也可以在同一局域网内直接传输，无需云账号。详见 [WebDAV 同步](https://codedogqby.github.io/ReadAny/zh/support/sync/webdav/) 与 [系统要求与已知限制](https://codedogqby.github.io/ReadAny/zh/support/requirements/)。
+> **ReadAny 是客户端阅读器，不包含云服务，也不提供 WebDAV 服务端。** 跨设备同步需要你自备存储：WebDAV 服务（Nextcloud、坚果云，或 wsgidav 等自建服务）或 S3 兼容存储；也可以在同一局域网内直接传输，无需云账号。详见 [WebDAV 同步](https://codedogqby.github.io/ReadAny/zh/support/sync/webdav/)、[S3 同步](https://codedogqby.github.io/ReadAny/zh/support/sync/s3/) 与 [系统要求与已知限制](https://codedogqby.github.io/ReadAny/zh/support/requirements/)。
 
 <p align="center">
   <a href="https://github.com/codedogQBY/ReadAny/releases/latest">

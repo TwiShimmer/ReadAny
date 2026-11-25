@@ -56,7 +56,7 @@ Network guidance:
 - Prefer a stable connection for the first sync and for uploading large books.
 - Book file transfers time out after 300 seconds; metadata requests use a shorter timeout.
 - On weak NAS or consumer WebDAV gateways, lower **Concurrent transfers** to 1–2.
-- The WebDAV server must accept `PROPFIND`, `MKCOL`, `HEAD`, `PUT`, `GET`, `MOVE`, and `DELETE`.
+- The WebDAV server must accept `PROPFIND`, `MKCOL`, `HEAD`, `PUT`, `GET`, `MOVE`, and `DELETE`. `HEAD` is used for existence checks; if the server does not allow it, ReadAny falls back to `PROPFIND`.
 
 ## Known Limitations
 
@@ -65,11 +65,11 @@ Network guidance:
 - Metadata sync and book-file sync are separate phases. A successful metadata sync can still leave book files failed; the sync details report the failure counts.
 - On WebDAV and S3, a normal sync does not bulk-download remote book files. Open a remote book to download it, or use **Full Download** to fetch everything. Covers are downloaded whenever they are missing, even when book files are not.
 - LAN transfer is different: **Import From Device** receives the other device's snapshot and downloads missing books and covers over the local network.
-- A successful `Test Connection` verifies authentication and directory creation, not that every later upload will fit the server's quota or proxy limits.
+- A successful **Test Connection** on WebDAV also creates the sync folders. On S3 it only verifies that the configured prefix can be listed; write, delete, and copy permissions are exercised on the first sync. See [S3 Sync](/ReadAny/support/sync/s3/).
 
 ### Large Files
 
-User reports and the tracked large-file transport issue ([#1](https://github.com/TwiShimmer/ReadAny/issues/1)) describe failures at 200 MB and above on some setups. This is not an official size limit. The desktop upload path reads the file into memory before sending it, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and split very large PDFs or comic archives.
+User reports describe failures at 200 MB and above on some setups. This is not an official size limit. The desktop upload path reads the file into memory before sending it, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and split very large PDFs or comic archives.
 
 This is a known limitation under investigation and is not fixed yet.
 
@@ -100,4 +100,5 @@ This is a known limitation under investigation and is not fixed yet.
 
 - [Installation](/ReadAny/support/installation/)
 - [WebDAV Sync](/ReadAny/support/sync/webdav/)
+- [S3 Sync](/ReadAny/support/sync/s3/)
 - [FAQ](/ReadAny/support/faq/)

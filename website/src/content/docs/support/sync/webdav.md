@@ -119,7 +119,7 @@ If the same file keeps failing, check the server's write permission, free space,
 
 These limits apply to the current 1.3.x line. Fixes are tracked, but this page does not promise a release date.
 
-- **Very large books can fail.** User reports and the tracked large-file transport issue ([#1](https://github.com/TwiShimmer/ReadAny/issues/1)) describe failures at 200 MB and above on some setups; this is not an official size limit. The desktop upload path reads the file into memory before PUT, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and prefer splitting very large PDFs or comic archives.
+- **Very large books can fail.** User reports describe failures at 200 MB and above on some setups; this is not an official size limit. The desktop upload path reads the file into memory before PUT, and book file transfers time out after 300 seconds. Keep individual books well under 200 MB where possible, and prefer splitting very large PDFs or comic archives.
 - **Older WebView2 runtimes may fail to render PDFs.** On Windows, update the Microsoft Edge WebView2 Runtime through Windows Update or the official installer.
 - **Weak servers dislike bursts.** Some NAS and consumer WebDAV gateways throttle or return 401/429 under parallel load. Lower **Concurrent transfers** to 1–2 in sync settings.
 - **The server stores plain files.** ReadAny does not add end-to-end encryption. Your WebDAV provider can read synced JSON and book files, so choose a provider you trust. **Allow Insecure Connection** weakens this further: desktop skips TLS verification, and mobile can downgrade `https://` to `http://`.
