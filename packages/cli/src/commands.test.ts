@@ -1,19 +1,17 @@
 import {
   access,
-  appendFile,
   lstat,
-  mkdtemp,
   mkdir,
+  mkdtemp,
   readFile,
   readlink,
   symlink,
-  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type ZipEntry, buildStoreOnlyZip } from "@readany/core/utils/store-only-zip";
 import Database from "better-sqlite3";
-import { buildStoreOnlyZip, type ZipEntry } from "@readany/core/utils/store-only-zip";
 import { describe, expect, it } from "vitest";
 import { parseCommand, runCommand } from "./commands.js";
 import { ensureCoreInitialized, resetCoreForTests } from "./data.js";
@@ -241,6 +239,12 @@ async function seedVectorLibrary(dataRoot: string): Promise<void> {
       10, 'epubcfi(/6/22)', 'epubcfi(/6/24)', '["epubcfi(/6/22)"]',
       x'0000803f0000000000000000', 6000
     );
+
+    INSERT INTO vector_index_provenance (
+      book_id, model_kind, model_id, endpoint, dimensions, created_at
+    ) VALUES (
+      'vector-book', 'remote', 'test-embedding', 'http://localhost:1234/v1', 3, 6000
+    );
   `);
   localDb.close();
 }
@@ -423,12 +427,19 @@ describe("commands", () => {
     const pathBinDir = join(workspace.root, "path-bin");
     const pathShim = join(pathBinDir, "readany");
     await mkdir(join(workspace.root, "dist", "bin"), { recursive: true });
-    await mkdir(join(workspace.root, "global", "lib", "node_modules", "@readany", "cli", "dist", "bin"), {
-      recursive: true,
-    });
+    await mkdir(
+      join(workspace.root, "global", "lib", "node_modules", "@readany", "cli", "dist", "bin"),
+      {
+        recursive: true,
+      },
+    );
     await mkdir(pathBinDir, { recursive: true });
     await writeFile(cliBinPath, "#!/usr/bin/env node\n", "utf8");
-    await writeFile(oldCliBinPath, "#!/usr/bin/env node\nconst marker = 'readany-cli-managed';\n", "utf8");
+    await writeFile(
+      oldCliBinPath,
+      "#!/usr/bin/env node\nconst marker = 'readany-cli-managed';\n",
+      "utf8",
+    );
     await symlink(oldCliBinPath, pathShim);
 
     const uninstall = await runCommand(
@@ -2169,7 +2180,6 @@ describe("commands", () => {
       ok: false,
       error: { code: "command_failed" },
     });
-
   });
 
   it("refuses to export an invalid EPUB draft without writing output", async () => {
@@ -2848,5 +2858,4 @@ describe("commands", () => {
       error: { code: "unsupported_rag_mode" },
     });
   });
-
 });
