@@ -33,8 +33,8 @@ ReadAny 是一款 AI 驱动的电子书阅读器，支持 EPUB、PDF、MOBI、AZ
 | macOS (Intel) | 已发布 |
 | Windows | 已发布 |
 | Linux | 已发布 |
-| iOS | 即将上线 |
-| Android | 即将上线 |
+| iOS | 已发布（TestFlight） |
+| Android | 已发布（`.apk`） |
 
 ## 下一步
 

@@ -16,6 +16,8 @@
   ReadAny 帮你向书籍提问、按语义寻找观点，并用 RAG 对话、语义搜索、高亮笔记、TTS 与 WebDAV 同步构建私有阅读知识库。
 </p>
 
+> **ReadAny 是客户端阅读器，不包含云服务，也不提供 WebDAV 服务端。** 跨设备同步需要你自备存储：WebDAV 服务（Nextcloud、坚果云，或 wsgidav 等自建服务）或 S3 兼容存储；也可以在同一局域网内直接传输，无需云账号。详见 [WebDAV 同步](https://codedogqby.github.io/ReadAny/zh/support/sync/webdav/)、[S3 同步](https://codedogqby.github.io/ReadAny/zh/support/sync/s3/) 与 [系统要求与已知限制](https://codedogqby.github.io/ReadAny/zh/support/requirements/)。
+
 <p align="center">
   <a href="https://github.com/codedogQBY/ReadAny/releases/latest">
     <img src="https://img.shields.io/github/v/release/codedogQBY/ReadAny?color=blue&label=Download" alt="Release">
@@ -266,6 +268,10 @@ cd ReadAny
 
 # 安装依赖
 pnpm install
+
+# 先构建内置 CLI。Tauri 会将 packages/cli/dist 作为运行时资源打包，
+# 而全新检出的仓库没有 dist/（该目录被 gitignore）。
+pnpm cli:build
 
 # 开发模式（桌面端）
 pnpm tauri dev

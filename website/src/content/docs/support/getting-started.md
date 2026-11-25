@@ -33,8 +33,8 @@ ReadAny is an AI-powered e-book reader that supports EPUB, PDF, MOBI, AZW, AZW3,
 | macOS (Intel) | Available |
 | Windows | Available |
 | Linux | Available |
-| iOS | Coming soon |
-| Android | Coming soon |
+| iOS | Available (TestFlight) |
+| Android | Available (`.apk`) |
 
 ## Next Steps
 
