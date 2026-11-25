@@ -190,7 +190,12 @@ export function parseLANQRData(data: string): LANQRData | null {
       return null;
     }
     const parsed = JSON.parse(data);
-    if (parsed && typeof parsed === "object" && parsed.type === "readany-lan-sync" && parsed.v === 1) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed.type === "readany-lan-sync" &&
+      parsed.v === 1
+    ) {
       return parsed as LANQRData;
     }
     return null;

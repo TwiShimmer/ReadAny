@@ -462,354 +462,344 @@ export default function SyncSettingsScreen() {
         style={styles.scroll}
         contentContainerStyle={[styles.scrollContent, { alignItems: "center" }]}
       >
-          <View
-            style={[styles.contentColumn, { width: "100%", maxWidth: layout.centeredContentWidth }]}
-          >
-            <Text style={styles.layoutNotice}>{t("settings.syncLayoutMigrationNotice")}</Text>
+        <View
+          style={[styles.contentColumn, { width: "100%", maxWidth: layout.centeredContentWidth }]}
+        >
+          <Text style={styles.layoutNotice}>{t("settings.syncLayoutMigrationNotice")}</Text>
 
-            {/* Backend Type Selector */}
-            <View style={styles.section}>
-              <Text style={styles.sectionTitle}>{t("settings.syncBackendType")}</Text>
-              <View style={styles.backendSelector}>
-                {(["webdav", "s3", "lan"] as const).map((backend) => (
-                  <TouchableOpacity
-                    key={backend}
-                    style={[
-                      styles.backendBtn,
-                      selectedBackend === backend && styles.backendBtnActive,
-                    ]}
-                    onPress={() => setSelectedBackend(backend)}
-                  >
-                    <Text
-                      style={[
-                        styles.backendBtnText,
-                        selectedBackend === backend && styles.backendBtnTextActive,
-                      ]}
-                    >
-                      {backend === "webdav" ? "WebDAV" : backend === "s3" ? "S3" : "LAN"}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-            </View>
-
-            {selectedBackend === "webdav" && (
-              <WebDavForm
-                url={url}
-                username={username}
-                password={password}
-                remoteRoot={remoteRoot}
-                allowInsecure={allowInsecure}
-                testing={testing}
-                testResult={testResult}
-                testError={testError}
-                saving={saving}
-                onChangeUrl={setUrl}
-                onChangeUsername={setUsername}
-                onChangePassword={setPassword}
-                onChangeRemoteRoot={setRemoteRoot}
-                onToggleAllowInsecure={() => setAllowInsecure(!allowInsecure)}
-                onTest={handleTest}
-                onSave={handleSave}
-              />
-            )}
-
-            {selectedBackend === "s3" && (
-              <S3Form
-                s3Endpoint={s3Endpoint}
-                s3Region={s3Region}
-                s3Bucket={s3Bucket}
-                s3RemoteRoot={s3RemoteRoot}
-                s3AccessKeyId={s3AccessKeyId}
-                s3SecretAccessKey={s3SecretAccessKey}
-                s3PathStyle={s3PathStyle}
-                testing={testing}
-                testResult={testResult}
-                testError={testError}
-                saving={saving}
-                onChangeEndpoint={setS3Endpoint}
-                onChangeRegion={setS3Region}
-                onChangeBucket={setS3Bucket}
-                onChangeRemoteRoot={setS3RemoteRoot}
-                onChangeAccessKeyId={setS3AccessKeyId}
-                onChangeSecretAccessKey={setS3SecretAccessKey}
-                onTogglePathStyle={() => setS3PathStyle(!s3PathStyle)}
-                onTest={handleTest}
-                onSave={handleSave}
-              />
-            )}
-
-            {selectedBackend === "lan" && (
-              <LanSection
-                isBusy={isBusy}
-                progress={progress}
-                pulseAnim={pulseAnim}
-                progressLabel={progressLabel}
-                onSyncWithBackend={syncWithBackend}
-              />
-            )}
-
-            {/* Conflict Resolution */}
-            {pendingDirection === "conflict" && (
-              <View style={[styles.section, styles.sectionSpaced]}>
-                <View style={styles.conflictCard}>
-                  <Text style={styles.conflictTitle}>{t("settings.syncConflictTitle")}</Text>
-                  <Text style={styles.conflictDesc}>{t("settings.syncConflictDesc")}</Text>
-                  <View style={styles.btnRow}>
-                    <TouchableOpacity
-                      style={styles.uploadBtn}
-                      onPress={() => handleConflict("upload")}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={styles.uploadBtnText}>{t("settings.syncConflictUpload")}</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity
-                      style={styles.downloadBtn}
-                      onPress={() => handleConflict("download")}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={styles.downloadBtnText}>
-                        {t("settings.syncConflictDownload")}
-                      </Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              </View>
-            )}
-
-            {/* Sync Status */}
-            {selectedBackend !== "lan" && (isConfigured || isBusy || lastSyncAt) && (
-              <View style={[styles.section, styles.sectionSpaced]}>
-                <Text style={styles.sectionTitle}>
-                  {isLanContext ? t("settings.syncLANImportStatus") : t("settings.syncStatus")}
-                </Text>
-                <View style={styles.card}>
-                  <View style={styles.syncRow}>
-                    <View style={styles.syncInfo}>
-                      <Text style={styles.syncLabel}>
-                        {isLanContext
-                          ? t("settings.syncLANLastImport")
-                          : t("settings.syncLastSync")}
-                      </Text>
-                      <Text style={styles.syncValue}>{formatLastSync(lastSyncAt)}</Text>
-                      {statusLabel() && <Text style={styles.statusText}>{statusLabel()}</Text>}
-                    </View>
-                    {!isLanContext && (
-                      <TouchableOpacity
-                        style={[styles.syncBtn, isBusy && styles.btnDisabled]}
-                        onPress={handleSync}
-                        disabled={isBusy}
-                        activeOpacity={0.7}
-                      >
-                        {isBusy && (
-                          <ActivityIndicator size="small" color={colors.primaryForeground} />
-                        )}
-                        <Text style={styles.syncBtnText}>
-                          {isBusy ? t("settings.syncSyncing") : t("settings.syncNow")}
-                        </Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                  {isBusy && progress && (
-                    <View style={styles.progressContainer}>
-                      <View style={styles.progressTrack}>
-                        {progress.phase === "database" ? (
-                          <Animated.View
-                            style={[styles.progressFill, { width: "100%", opacity: pulseAnim }]}
-                          />
-                        ) : (
-                          <View
-                            style={[
-                              styles.progressFill,
-                              {
-                                width: `${progressPercent() ?? 0}%`,
-                              },
-                            ]}
-                          />
-                        )}
-                      </View>
-                      <Text style={styles.progressText}>{progressLabel()}</Text>
-                    </View>
-                  )}
-
-                  {lastResult && (
-                    <View style={styles.resultCard}>
-                      {lastResult.success ? (
-                        <>
-                          <Text style={styles.resultText}>
-                            {isLanContext
-                              ? t("settings.syncLANImportComplete")
-                              : t("settings.syncDirection", { direction: lastResult.direction })}
-                          </Text>
-                          {lastResult.filesUploaded > 0 && (
-                            <Text style={styles.resultText}>
-                              {t("settings.syncFilesUp", { count: lastResult.filesUploaded })}
-                            </Text>
-                          )}
-                          {lastResult.filesDownloaded > 0 && (
-                            <Text style={styles.resultText}>
-                              {isLanContext
-                                ? t("settings.syncLANImportedFiles", {
-                                    count: lastResult.filesDownloaded,
-                                  })
-                                : t("settings.syncFilesDown", {
-                                    count: lastResult.filesDownloaded,
-                                  })}
-                            </Text>
-                          )}
-                          {(lastResult.filesUploadFailed > 0 ||
-                            lastResult.filesDownloadFailed > 0) && (
-                            <Text style={styles.errorText}>
-                              {t("settings.syncFilesPartialFailed", {
-                                uploadFailed: lastResult.filesUploadFailed,
-                                downloadFailed: lastResult.filesDownloadFailed,
-                              })}
-                            </Text>
-                          )}
-                          {lastResult.fileFailures?.[0] && (
-                            <Text style={styles.errorText}>
-                              {lastResult.fileFailures[0].path}:{" "}
-                              {lastResult.fileFailures[0].message}
-                            </Text>
-                          )}
-                        </>
-                      ) : (
-                        <Text style={styles.errorText}>
-                          {t("settings.syncFailed", { error: lastResult.error })}
-                        </Text>
-                      )}
-                    </View>
-                  )}
-
-                  {error && !lastResult && <Text style={styles.errorText}>{error}</Text>}
-
-                  {showScheduledSyncSettings && (
-                    <>
-                      <View style={styles.autoSyncRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.autoSyncLabel}>{t("settings.syncAutoSync")}</Text>
-                          <Text style={styles.autoSyncDesc}>{t("settings.syncAutoSyncDesc")}</Text>
-                        </View>
-                        <TouchableOpacity
-                          style={[styles.toggle, autoSyncEnabled && styles.toggleActive]}
-                          onPress={() => setAutoSync(!autoSyncEnabled)}
-                        >
-                          <View
-                            style={[
-                              styles.toggleThumb,
-                              autoSyncEnabled && styles.toggleThumbActive,
-                            ]}
-                          />
-                        </TouchableOpacity>
-                      </View>
-                      <View style={styles.intervalRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.autoSyncLabel}>{t("settings.syncInterval")}</Text>
-                          <Text style={styles.autoSyncDesc}>{t("settings.syncIntervalDesc")}</Text>
-                        </View>
-                        <View style={styles.intervalInputWrap}>
-                          <TextInput
-                            style={styles.intervalInput}
-                            value={syncIntervalInput}
-                            onChangeText={setSyncIntervalInput}
-                            onBlur={() => void handleSyncIntervalBlur()}
-                            keyboardType="number-pad"
-                            returnKeyType="done"
-                          />
-                          <Text style={styles.intervalSuffix}>
-                            {t("settings.syncIntervalMinutes", {
-                              count: Number.parseInt(syncIntervalInput || "30", 10) || 30,
-                            })}
-                          </Text>
-                        </View>
-                      </View>
-                    </>
-                  )}
-                </View>
-              </View>
-            )}
-
-            {/* Advanced */}
-            {isConfigured && selectedBackend !== "lan" && (
-              <View style={[styles.section, styles.sectionSpaced]}>
+          {/* Backend Type Selector */}
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>{t("settings.syncBackendType")}</Text>
+            <View style={styles.backendSelector}>
+              {(["webdav", "s3", "lan"] as const).map((backend) => (
                 <TouchableOpacity
-                  style={styles.advancedHeader}
-                  onPress={() => setShowAdvanced(!showAdvanced)}
+                  key={backend}
+                  style={[
+                    styles.backendBtn,
+                    selectedBackend === backend && styles.backendBtnActive,
+                  ]}
+                  onPress={() => setSelectedBackend(backend)}
                 >
-                  <Text style={styles.sectionTitle}>{t("settings.syncAdvanced")}</Text>
-                  <Text style={styles.chevron}>{showAdvanced ? "▲" : "▼"}</Text>
+                  <Text
+                    style={[
+                      styles.backendBtnText,
+                      selectedBackend === backend && styles.backendBtnTextActive,
+                    ]}
+                  >
+                    {backend === "webdav" ? "WebDAV" : backend === "s3" ? "S3" : "LAN"}
+                  </Text>
                 </TouchableOpacity>
-                {showAdvanced && (
-                  <View style={styles.card}>
-                    <View style={styles.btnRow}>
-                      <TouchableOpacity
-                        style={[styles.uploadBtn, isBusy && styles.btnDisabled]}
-                        onPress={() => handleForceFullSync("upload")}
-                        disabled={isBusy}
-                        activeOpacity={0.7}
-                      >
-                        <Text style={styles.uploadBtnText}>{t("settings.syncForceUpload")}</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity
-                        style={[styles.downloadBtn, isBusy && styles.btnDisabled]}
-                        onPress={() => handleForceFullSync("download")}
-                        disabled={isBusy}
-                        activeOpacity={0.7}
-                      >
-                        <Text style={styles.downloadBtnText}>
-                          {t("settings.syncForceDownload")}
-                        </Text>
-                      </TouchableOpacity>
-                    </View>
-                    <Text style={styles.resetDesc}>{t("settings.syncForceUploadDesc")}</Text>
-                    <Text style={styles.resetDesc}>{t("settings.syncForceDownloadDesc")}</Text>
-                    <TouchableOpacity
-                      style={styles.resetBtn}
-                      onPress={handleReset}
-                      activeOpacity={0.7}
-                    >
-                      <Text style={styles.resetBtnText}>{t("settings.syncReset")}</Text>
-                    </TouchableOpacity>
-                    <Text style={styles.resetDesc}>{t("settings.syncResetDesc")}</Text>
-                  </View>
-                )}
-              </View>
-            )}
-
-            {/* Transfer sync config */}
-            <View style={[styles.section, { marginTop: spacing.lg }]}>
-              <Text style={styles.sectionTitle}>{t("settings.transferConfig", "配置迁移")}</Text>
-              <ConfigTransfer
-                label={t("settings.syncConfig", "同步配置")}
-                getData={() => {
-                  const base = { backendType, config };
-                  if (backendType === "webdav") {
-                    return { ...base, password };
-                  }
-                  if (backendType === "s3") {
-                    return { ...base, secretAccessKey: s3SecretAccessKey };
-                  }
-                  return base;
-                }}
-                applyData={(data) => {
-                  const d = data as Record<string, unknown>;
-                  if (d.backendType === "webdav" && d.config) {
-                    const cfg = d.config as Record<string, unknown>;
-                    saveWebDavConfig(
-                      cfg.url as string,
-                      cfg.username as string,
-                      (d.password as string) || "",
-                      cfg.allowInsecure as boolean,
-                      cfg.remoteRoot as string,
-                    );
-                  } else if (d.backendType === "s3" && d.config) {
-                    saveS3Config(d.config as never, (d.secretAccessKey as string) || "");
-                  }
-                }}
-                validate={(d) => typeof d === "object" && d !== null && "backendType" in d}
-              />
+              ))}
             </View>
           </View>
+
+          {selectedBackend === "webdav" && (
+            <WebDavForm
+              url={url}
+              username={username}
+              password={password}
+              remoteRoot={remoteRoot}
+              allowInsecure={allowInsecure}
+              testing={testing}
+              testResult={testResult}
+              testError={testError}
+              saving={saving}
+              onChangeUrl={setUrl}
+              onChangeUsername={setUsername}
+              onChangePassword={setPassword}
+              onChangeRemoteRoot={setRemoteRoot}
+              onToggleAllowInsecure={() => setAllowInsecure(!allowInsecure)}
+              onTest={handleTest}
+              onSave={handleSave}
+            />
+          )}
+
+          {selectedBackend === "s3" && (
+            <S3Form
+              s3Endpoint={s3Endpoint}
+              s3Region={s3Region}
+              s3Bucket={s3Bucket}
+              s3RemoteRoot={s3RemoteRoot}
+              s3AccessKeyId={s3AccessKeyId}
+              s3SecretAccessKey={s3SecretAccessKey}
+              s3PathStyle={s3PathStyle}
+              testing={testing}
+              testResult={testResult}
+              testError={testError}
+              saving={saving}
+              onChangeEndpoint={setS3Endpoint}
+              onChangeRegion={setS3Region}
+              onChangeBucket={setS3Bucket}
+              onChangeRemoteRoot={setS3RemoteRoot}
+              onChangeAccessKeyId={setS3AccessKeyId}
+              onChangeSecretAccessKey={setS3SecretAccessKey}
+              onTogglePathStyle={() => setS3PathStyle(!s3PathStyle)}
+              onTest={handleTest}
+              onSave={handleSave}
+            />
+          )}
+
+          {selectedBackend === "lan" && (
+            <LanSection
+              isBusy={isBusy}
+              progress={progress}
+              pulseAnim={pulseAnim}
+              progressLabel={progressLabel}
+              onSyncWithBackend={syncWithBackend}
+            />
+          )}
+
+          {/* Conflict Resolution */}
+          {pendingDirection === "conflict" && (
+            <View style={[styles.section, styles.sectionSpaced]}>
+              <View style={styles.conflictCard}>
+                <Text style={styles.conflictTitle}>{t("settings.syncConflictTitle")}</Text>
+                <Text style={styles.conflictDesc}>{t("settings.syncConflictDesc")}</Text>
+                <View style={styles.btnRow}>
+                  <TouchableOpacity
+                    style={styles.uploadBtn}
+                    onPress={() => handleConflict("upload")}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.uploadBtnText}>{t("settings.syncConflictUpload")}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.downloadBtn}
+                    onPress={() => handleConflict("download")}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.downloadBtnText}>{t("settings.syncConflictDownload")}</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          )}
+
+          {/* Sync Status */}
+          {selectedBackend !== "lan" && (isConfigured || isBusy || lastSyncAt) && (
+            <View style={[styles.section, styles.sectionSpaced]}>
+              <Text style={styles.sectionTitle}>
+                {isLanContext ? t("settings.syncLANImportStatus") : t("settings.syncStatus")}
+              </Text>
+              <View style={styles.card}>
+                <View style={styles.syncRow}>
+                  <View style={styles.syncInfo}>
+                    <Text style={styles.syncLabel}>
+                      {isLanContext ? t("settings.syncLANLastImport") : t("settings.syncLastSync")}
+                    </Text>
+                    <Text style={styles.syncValue}>{formatLastSync(lastSyncAt)}</Text>
+                    {statusLabel() && <Text style={styles.statusText}>{statusLabel()}</Text>}
+                  </View>
+                  {!isLanContext && (
+                    <TouchableOpacity
+                      style={[styles.syncBtn, isBusy && styles.btnDisabled]}
+                      onPress={handleSync}
+                      disabled={isBusy}
+                      activeOpacity={0.7}
+                    >
+                      {isBusy && (
+                        <ActivityIndicator size="small" color={colors.primaryForeground} />
+                      )}
+                      <Text style={styles.syncBtnText}>
+                        {isBusy ? t("settings.syncSyncing") : t("settings.syncNow")}
+                      </Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+                {isBusy && progress && (
+                  <View style={styles.progressContainer}>
+                    <View style={styles.progressTrack}>
+                      {progress.phase === "database" ? (
+                        <Animated.View
+                          style={[styles.progressFill, { width: "100%", opacity: pulseAnim }]}
+                        />
+                      ) : (
+                        <View
+                          style={[
+                            styles.progressFill,
+                            {
+                              width: `${progressPercent() ?? 0}%`,
+                            },
+                          ]}
+                        />
+                      )}
+                    </View>
+                    <Text style={styles.progressText}>{progressLabel()}</Text>
+                  </View>
+                )}
+
+                {lastResult && (
+                  <View style={styles.resultCard}>
+                    {lastResult.success ? (
+                      <>
+                        <Text style={styles.resultText}>
+                          {isLanContext
+                            ? t("settings.syncLANImportComplete")
+                            : t("settings.syncDirection", { direction: lastResult.direction })}
+                        </Text>
+                        {lastResult.filesUploaded > 0 && (
+                          <Text style={styles.resultText}>
+                            {t("settings.syncFilesUp", { count: lastResult.filesUploaded })}
+                          </Text>
+                        )}
+                        {lastResult.filesDownloaded > 0 && (
+                          <Text style={styles.resultText}>
+                            {isLanContext
+                              ? t("settings.syncLANImportedFiles", {
+                                  count: lastResult.filesDownloaded,
+                                })
+                              : t("settings.syncFilesDown", {
+                                  count: lastResult.filesDownloaded,
+                                })}
+                          </Text>
+                        )}
+                        {(lastResult.filesUploadFailed > 0 ||
+                          lastResult.filesDownloadFailed > 0) && (
+                          <Text style={styles.errorText}>
+                            {t("settings.syncFilesPartialFailed", {
+                              uploadFailed: lastResult.filesUploadFailed,
+                              downloadFailed: lastResult.filesDownloadFailed,
+                            })}
+                          </Text>
+                        )}
+                        {lastResult.fileFailures?.[0] && (
+                          <Text style={styles.errorText}>
+                            {lastResult.fileFailures[0].path}: {lastResult.fileFailures[0].message}
+                          </Text>
+                        )}
+                      </>
+                    ) : (
+                      <Text style={styles.errorText}>
+                        {t("settings.syncFailed", { error: lastResult.error })}
+                      </Text>
+                    )}
+                  </View>
+                )}
+
+                {error && !lastResult && <Text style={styles.errorText}>{error}</Text>}
+
+                {showScheduledSyncSettings && (
+                  <>
+                    <View style={styles.autoSyncRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.autoSyncLabel}>{t("settings.syncAutoSync")}</Text>
+                        <Text style={styles.autoSyncDesc}>{t("settings.syncAutoSyncDesc")}</Text>
+                      </View>
+                      <TouchableOpacity
+                        style={[styles.toggle, autoSyncEnabled && styles.toggleActive]}
+                        onPress={() => setAutoSync(!autoSyncEnabled)}
+                      >
+                        <View
+                          style={[styles.toggleThumb, autoSyncEnabled && styles.toggleThumbActive]}
+                        />
+                      </TouchableOpacity>
+                    </View>
+                    <View style={styles.intervalRow}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.autoSyncLabel}>{t("settings.syncInterval")}</Text>
+                        <Text style={styles.autoSyncDesc}>{t("settings.syncIntervalDesc")}</Text>
+                      </View>
+                      <View style={styles.intervalInputWrap}>
+                        <TextInput
+                          style={styles.intervalInput}
+                          value={syncIntervalInput}
+                          onChangeText={setSyncIntervalInput}
+                          onBlur={() => void handleSyncIntervalBlur()}
+                          keyboardType="number-pad"
+                          returnKeyType="done"
+                        />
+                        <Text style={styles.intervalSuffix}>
+                          {t("settings.syncIntervalMinutes", {
+                            count: Number.parseInt(syncIntervalInput || "30", 10) || 30,
+                          })}
+                        </Text>
+                      </View>
+                    </View>
+                  </>
+                )}
+              </View>
+            </View>
+          )}
+
+          {/* Advanced */}
+          {isConfigured && selectedBackend !== "lan" && (
+            <View style={[styles.section, styles.sectionSpaced]}>
+              <TouchableOpacity
+                style={styles.advancedHeader}
+                onPress={() => setShowAdvanced(!showAdvanced)}
+              >
+                <Text style={styles.sectionTitle}>{t("settings.syncAdvanced")}</Text>
+                <Text style={styles.chevron}>{showAdvanced ? "▲" : "▼"}</Text>
+              </TouchableOpacity>
+              {showAdvanced && (
+                <View style={styles.card}>
+                  <View style={styles.btnRow}>
+                    <TouchableOpacity
+                      style={[styles.uploadBtn, isBusy && styles.btnDisabled]}
+                      onPress={() => handleForceFullSync("upload")}
+                      disabled={isBusy}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={styles.uploadBtnText}>{t("settings.syncForceUpload")}</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.downloadBtn, isBusy && styles.btnDisabled]}
+                      onPress={() => handleForceFullSync("download")}
+                      disabled={isBusy}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={styles.downloadBtnText}>{t("settings.syncForceDownload")}</Text>
+                    </TouchableOpacity>
+                  </View>
+                  <Text style={styles.resetDesc}>{t("settings.syncForceUploadDesc")}</Text>
+                  <Text style={styles.resetDesc}>{t("settings.syncForceDownloadDesc")}</Text>
+                  <TouchableOpacity
+                    style={styles.resetBtn}
+                    onPress={handleReset}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.resetBtnText}>{t("settings.syncReset")}</Text>
+                  </TouchableOpacity>
+                  <Text style={styles.resetDesc}>{t("settings.syncResetDesc")}</Text>
+                </View>
+              )}
+            </View>
+          )}
+
+          {/* Transfer sync config */}
+          <View style={[styles.section, { marginTop: spacing.lg }]}>
+            <Text style={styles.sectionTitle}>{t("settings.transferConfig", "配置迁移")}</Text>
+            <ConfigTransfer
+              label={t("settings.syncConfig", "同步配置")}
+              getData={() => {
+                const base = { backendType, config };
+                if (backendType === "webdav") {
+                  return { ...base, password };
+                }
+                if (backendType === "s3") {
+                  return { ...base, secretAccessKey: s3SecretAccessKey };
+                }
+                return base;
+              }}
+              applyData={(data) => {
+                const d = data as Record<string, unknown>;
+                if (d.backendType === "webdav" && d.config) {
+                  const cfg = d.config as Record<string, unknown>;
+                  saveWebDavConfig(
+                    cfg.url as string,
+                    cfg.username as string,
+                    (d.password as string) || "",
+                    cfg.allowInsecure as boolean,
+                    cfg.remoteRoot as string,
+                  );
+                } else if (d.backendType === "s3" && d.config) {
+                  saveS3Config(d.config as never, (d.secretAccessKey as string) || "");
+                }
+              }}
+              validate={(d) => typeof d === "object" && d !== null && "backendType" in d}
+            />
+          </View>
+        </View>
       </KeyboardAwareScrollView>
     </SafeAreaView>
   );

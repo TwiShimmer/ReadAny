@@ -121,8 +121,7 @@ describe("WebDavBackend directory healing", () => {
     expect(uploads).toBe(2);
     expect(
       calls.some(
-        (call) =>
-          call.method === "MKCOL" && call.url.endsWith("/readany/data/books/Book-1/"),
+        (call) => call.method === "MKCOL" && call.url.endsWith("/readany/data/books/Book-1/"),
       ),
     ).toBe(true);
     expect(calls.findIndex((call) => call.method === "MKCOL")).toBeLessThan(

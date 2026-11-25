@@ -45,10 +45,7 @@ export class FileTransferError extends Error {
   readonly url?: string;
   readonly cause?: unknown;
 
-  constructor(
-    message: string,
-    options?: { status?: number; url?: string; cause?: unknown },
-  ) {
+  constructor(message: string, options?: { status?: number; url?: string; cause?: unknown }) {
     super(message);
     this.name = "FileTransferError";
     this.status = options?.status;

@@ -739,18 +739,13 @@ export class WebDavClient {
    */
   private createStatusError(method: string, path: string, resp: Response): WebDavError {
     const url = this.buildUrl(path);
-    if (
-      resp.status === 401 ||
-      resp.status === 403 ||
-      resp.status === 404 ||
-      resp.status === 405
-    ) {
+    if (resp.status === 401 || resp.status === 403 || resp.status === 404 || resp.status === 405) {
       const httpError = createHttpWebDavError(resp.status, resp.statusText, method, url);
-      return new WebDavError(
-        httpError.kind,
-        `${httpError.message} (${method} ${path})`,
-        { status: resp.status, method, url },
-      );
+      return new WebDavError(httpError.kind, `${httpError.message} (${method} ${path})`, {
+        status: resp.status,
+        method,
+        url,
+      });
     }
 
     const kind: WebDavErrorKind = resp.status >= 500 ? "server" : "http";

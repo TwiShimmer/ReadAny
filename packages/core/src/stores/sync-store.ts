@@ -601,8 +601,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
       const runSync = backend.type === "lan" ? runSimpleSync : runPerBookSync;
 
       const receiveOnly = backend.type === "lan" || resolvedDirection === "download";
-      const configConcurrency = (state.config as { concurrency?: number } | undefined)
-        ?.concurrency;
+      const configConcurrency = (state.config as { concurrency?: number } | undefined)?.concurrency;
       const uploadOnly = resolvedDirection === "upload";
       const result = await runSync(
         backend,

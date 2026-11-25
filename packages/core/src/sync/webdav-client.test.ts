@@ -350,7 +350,8 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       warnSpy.mockRestore();
     }
 
-    const encodedParent = "/readany/data/books/%E8%BF%99%E9%87%8C%E6%98%AF%20%E7%BB%88%E6%9C%AB%20(1)/";
+    const encodedParent =
+      "/readany/data/books/%E8%BF%99%E9%87%8C%E6%98%AF%20%E7%BB%88%E6%9C%AB%20(1)/";
     const encodedFile = `${encodedParent}%E6%AD%A3%E6%96%87.epub`;
     const mkcolUrls = calls.filter((call) => call.method === "MKCOL").map((call) => call.url);
     const uploadUrls = calls.filter((call) => call.method === "UPLOAD").map((call) => call.url);

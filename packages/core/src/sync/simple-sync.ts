@@ -140,7 +140,10 @@ async function filterRecordToExistingColumns(
   );
 }
 
-export async function withDatabaseLockRetry<T>(operation: () => Promise<T>, label: string): Promise<T> {
+export async function withDatabaseLockRetry<T>(
+  operation: () => Promise<T>,
+  label: string,
+): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= DB_LOCK_MAX_RETRIES; attempt++) {
@@ -272,7 +275,8 @@ export async function collectChanges(since: number): Promise<DeviceSyncPayload> 
       for (const t of tombstones) {
         deletedTimestamps[t.id] = t.deleted_at;
         if (t.book_id) {
-          (deletedBookIds ??= {})[t.id] = t.book_id;
+          deletedBookIds ??= {};
+          deletedBookIds[t.id] = t.book_id;
         }
       }
     } catch {

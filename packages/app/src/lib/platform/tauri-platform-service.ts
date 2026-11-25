@@ -212,10 +212,10 @@ export class TauriPlatformService implements IPlatformService {
       ...fetchOptions
     } = options ?? {};
     const tauriOptions = allowInsecure
-      ? {
+      ? ({
           ...fetchOptions,
           danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-        } as any
+        } as any)
       : fetchOptions;
     try {
       return await tauriFetch(url, tauriOptions);
@@ -245,11 +245,7 @@ export class TauriPlatformService implements IPlatformService {
    * multi-megabyte payloads never cross the webview main thread
    * (plugin-http serializes bodies as JS number arrays, which froze sync).
    */
-  async uploadFile(
-    url: string,
-    filePath: string,
-    options?: FileTransferOptions,
-  ): Promise<void> {
+  async uploadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const { invoke } = await import("@tauri-apps/api/core");
     try {
       await invoke("webdav_upload_file", {
@@ -264,11 +260,7 @@ export class TauriPlatformService implements IPlatformService {
   }
 
   /** Native streaming download to a local path, with progress via channel. */
-  async downloadFile(
-    url: string,
-    filePath: string,
-    options?: FileTransferOptions,
-  ): Promise<void> {
+  async downloadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
     const onProgress = options?.onProgress;
     const channel = new Channel<{ loaded: number; total: number }>();

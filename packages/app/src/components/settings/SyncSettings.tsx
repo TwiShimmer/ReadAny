@@ -901,9 +901,7 @@ export function SyncSettings() {
             </div>
             <div className="flex items-center justify-between gap-3 border-t border-border/40 pt-3">
               <div>
-                <span className="text-sm text-foreground">
-                  {t("settings.syncConcurrency")}
-                </span>
+                <span className="text-sm text-foreground">{t("settings.syncConcurrency")}</span>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {t("settings.syncConcurrencyDesc")}
                 </p>
