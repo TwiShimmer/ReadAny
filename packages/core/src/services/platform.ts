@@ -35,6 +35,28 @@ export interface FileTransferOptions {
   onProgress?: (loaded: number, total: number) => void;
 }
 
+/**
+ * Structured failure for native file transfers. `status` carries the HTTP
+ * status when the transfer reached the server, so callers can branch on
+ * 403/404/409 without matching localized message text.
+ */
+export class FileTransferError extends Error {
+  readonly status?: number;
+  readonly url?: string;
+  readonly cause?: unknown;
+
+  constructor(
+    message: string,
+    options?: { status?: number; url?: string; cause?: unknown },
+  ) {
+    super(message);
+    this.name = "FileTransferError";
+    this.status = options?.status;
+    this.url = options?.url;
+    this.cause = options?.cause;
+  }
+}
+
 export interface UpdateInfo {
   version: string;
   notes?: string;

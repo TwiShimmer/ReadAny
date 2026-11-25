@@ -6,10 +6,11 @@
  *
  * All Tauri imports are dynamic so the module graph stays clean in SSR/test contexts.
  */
+import { FileTransferError } from "@readany/core/services";
 import type {
-  FileTransferOptions,
   FetchOptions,
   FilePickerOptions,
+  FileTransferOptions,
   IDatabase,
   IPlatformService,
   IWebSocket,
@@ -28,6 +29,21 @@ function ensureTauriRuntimeForLAN(): void {
   if (!isTauriRuntimeAvailable()) {
     throw new Error(TAURI_LAN_RUNTIME_ERROR);
   }
+}
+
+/**
+ * Tauri commands reject with the serialized Rust error. Preserve its HTTP
+ * status so the sync layer can branch without parsing message text.
+ */
+function toFileTransferError(error: unknown, url: string): FileTransferError {
+  if (error instanceof FileTransferError) return error;
+  if (typeof error === "object" && error !== null) {
+    const record = error as { status?: unknown; message?: unknown };
+    const status = typeof record.status === "number" ? record.status : undefined;
+    const message = typeof record.message === "string" ? record.message : String(error);
+    return new FileTransferError(message, { status, url });
+  }
+  return new FileTransferError(String(error), { url });
 }
 
 /** Adapter: wraps Tauri SQL plugin instance as IDatabase */
@@ -243,9 +259,7 @@ export class TauriPlatformService implements IPlatformService {
         allowInsecure: options?.allowInsecure ?? false,
       });
     } catch (error) {
-      // Surface the server status inside the message — the sync layer's
-      // directory-heal retry matches on 403/404/409 in the message text.
-      throw new Error(error instanceof Error ? error.message : String(error));
+      throw toFileTransferError(error, url);
     }
   }
 
@@ -270,7 +284,7 @@ export class TauriPlatformService implements IPlatformService {
         onProgress: channel,
       });
     } catch (error) {
-      throw new Error(error instanceof Error ? error.message : String(error));
+      throw toFileTransferError(error, url);
     }
   }
 

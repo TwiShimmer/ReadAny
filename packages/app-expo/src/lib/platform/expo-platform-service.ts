@@ -11,6 +11,7 @@ import i18n from "@readany/core/i18n";
  * - expo-sharing + expo-file-system for file sharing
  * - expo-constants for app version
  */
+import { FileTransferError } from "@readany/core/services";
 import type {
   FetchOptions,
   FilePickerOptions,
@@ -323,7 +324,10 @@ export class ExpoPlatformService implements IPlatformService {
       throw new Error(`File download cancelled: ${effectiveUrl}`);
     }
     if (result.status < 200 || result.status >= 300) {
-      throw new Error(`File download failed: ${result.status}`);
+      throw new FileTransferError(`File download failed: ${result.status}`, {
+        status: result.status,
+        url: effectiveUrl,
+      });
     }
   }
 
@@ -348,7 +352,10 @@ export class ExpoPlatformService implements IPlatformService {
       throw new Error(`File upload cancelled: ${effectiveUrl}`);
     }
     if (result.status < 200 || result.status >= 300) {
-      throw new Error(`File upload failed: ${result.status}`);
+      throw new FileTransferError(`File upload failed: ${result.status}`, {
+        status: result.status,
+        url: effectiveUrl,
+      });
     }
   }
 
