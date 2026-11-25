@@ -46,6 +46,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Verify version consistency
+        run: pnpm version:check
+
       - name: Lint changed files
         # Full-repo lint has pre-existing debt (vendored code + CRLF history).
         # PR gate checks only files changed against the base branch.
@@ -76,6 +79,11 @@ jobs:
       - name: Run core tests
         run: pnpm --filter @readany/core test
 
+      - name: Run CLI tests
+        # The CLI bundle ships inside the desktop app; its tests are part of
+        # the same regression gate as core.
+        run: pnpm --filter @readany/cli test
+
   typecheck-app:
     name: Typecheck app
     runs-on: ubuntu-latest
@@ -102,9 +110,11 @@ jobs:
         run: pnpm --filter app exec tsc --noEmit
 
   cargo-check:
-    name: Cargo check
+    name: Cargo check (release features)
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    # Frontend build + custom-protocol feature check is slower than a dev-only
+    # cargo check; 45 minutes leaves room for a cold Rust cache.
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -143,5 +153,13 @@ jobs:
         # "resource path ../../cli/dist doesn't exist".
         run: pnpm --filter @readany/cli build
 
+      - name: Build frontend assets
+        # release-only failures (frontendDist embedding, resource paths) only
+        # show up when the dist directory exists and custom-protocol is on.
+        run: pnpm --filter app build
+
       - name: Cargo check
-        run: cargo check --manifest-path packages/app/src-tauri/Cargo.toml
+        run: >-
+          cargo check
+          --manifest-path packages/app/src-tauri/Cargo.toml
+          --features tauri/custom-protocol

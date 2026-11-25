@@ -7,9 +7,11 @@
  * touch, so this script diffs against the base branch and runs Biome on the
  * changed, lintable files only.
  *
- * Base branch resolution:
- *   - CI pull_request: GITHUB_BASE_REF (e.g. "main")
- *   - otherwise: origin/main
+ * Base branch resolution, in order:
+ *   - `--base <ref>` / `--base=<ref>`
+ *   - LINT_BASE_REF (e.g. "upstream/main" for fork PRs)
+ *   - GITHUB_BASE_REF (CI pull_request)
+ *   - origin/main
  *
  * No changed files => exit 0.
  */
@@ -39,6 +41,15 @@ const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
   encoding: "utf8",
 }).trim();
 
+function argBase(argv) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--base") return argv[index + 1];
+    if (arg.startsWith("--base=")) return arg.slice("--base=".length);
+  }
+  return undefined;
+}
+
 function refExists(ref) {
   return (
     spawnSync("git", ["rev-parse", "--verify", "--quiet", ref], {
@@ -48,33 +59,49 @@ function refExists(ref) {
   );
 }
 
-function resolveBaseRef() {
-  const baseBranch = process.env.GITHUB_BASE_REF?.trim() || "main";
-  const remoteRef = `origin/${baseBranch}`;
-
-  if (refExists(remoteRef)) return remoteRef;
+function fetchRef(base) {
+  const separator = base.indexOf("/");
+  const remote = separator > 0 ? base.slice(0, separator) : "origin";
+  const branch = separator > 0 ? base.slice(separator + 1) : base;
 
   try {
-    execFileSync("git", ["fetch", "--quiet", "--no-tags", "origin", baseBranch], {
+    execFileSync("git", ["fetch", "--quiet", "--no-tags", remote, branch], {
       cwd: repoRoot,
       stdio: "ignore",
     });
   } catch {
     // Fall through to the explicit error below with the original ref name.
   }
+}
 
-  if (refExists(remoteRef)) return remoteRef;
+function resolveBaseRef() {
+  const explicit = argBase(process.argv.slice(2))?.trim() || process.env.LINT_BASE_REF?.trim();
+  const base = explicit || process.env.GITHUB_BASE_REF?.trim() || "main";
+  const refs = base.includes("/") ? [base] : [`origin/${base}`, base];
+
+  for (const ref of refs) {
+    if (refExists(ref)) return ref;
+  }
+
+  fetchRef(base);
+
+  for (const ref of refs) {
+    if (refExists(ref)) return ref;
+  }
 
   throw new Error(
-    `[lint:changed] Cannot resolve base ref "${remoteRef}". ` +
-      `Fetch it first: git fetch origin ${baseBranch}`,
+    `[lint:changed] Cannot resolve base ref "${refs.join('" / "')}". Fetch it first, or pass --base / LINT_BASE_REF.`,
   );
 }
 
 function gitFileList(args) {
-  return execFileSync("git", args, { cwd: repoRoot, encoding: "utf8" })
-    .split(/\r?\n/)
-    .map((file) => file.trim())
+  // -z keeps paths verbatim (spaces, Chinese, newlines); quotePath=false stops
+  // Git from escaping non-ASCII characters into "\344\270\255" form.
+  return execFileSync("git", ["-c", "core.quotePath=false", ...args], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  })
+    .split("\0")
     .filter(Boolean);
 }
 
@@ -83,9 +110,9 @@ function changedFiles(baseRef) {
   // untracked files so the same script works before committing.
   return [
     ...new Set([
-      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", `${baseRef}...HEAD`]),
-      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", "HEAD"]),
-      ...gitFileList(["ls-files", "--others", "--exclude-standard"]),
+      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", "-z", `${baseRef}...HEAD`]),
+      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"]),
+      ...gitFileList(["ls-files", "-z", "--others", "--exclude-standard"]),
     ]),
   ];
 }
@@ -97,9 +124,8 @@ function lintableFiles(files) {
   });
 }
 
-function biomeBinary() {
-  const name = process.platform === "win32" ? "biome.cmd" : "biome";
-  return path.join(repoRoot, "node_modules", ".bin", name);
+function biomeEntryPoint() {
+  return path.join(repoRoot, "node_modules", "@biomejs", "biome", "bin", "biome");
 }
 
 const baseRef = resolveBaseRef();
@@ -110,21 +136,25 @@ if (files.length === 0) {
   process.exit(0);
 }
 
-const biome = biomeBinary();
+const biome = biomeEntryPoint();
 if (!existsSync(biome)) {
-  throw new Error("[lint:changed] Biome binary not found. Run `pnpm install` first.");
+  throw new Error("[lint:changed] Biome entry point not found. Run `pnpm install` first.");
 }
 
 console.log(`[lint:changed] Checking ${files.length} changed file(s) against ${baseRef}.`);
 
 for (let index = 0; index < files.length; index += CHUNK_SIZE) {
   const chunk = files.slice(index, index + CHUNK_SIZE);
-  const result = spawnSync(biome, ["check", ...chunk], {
-    cwd: repoRoot,
-    stdio: "inherit",
-    // .cmd shims on Windows need a shell; Linux binaries do not.
-    shell: process.platform === "win32",
-  });
+  // Run Biome's JS entry point with Node directly: no shell, so paths with
+  // spaces or non-ASCII characters stay single arguments on every platform.
+  const result = spawnSync(
+    process.execPath,
+    [biome, "check", "--no-errors-on-unmatched", ...chunk],
+    {
+      cwd: repoRoot,
+      stdio: "inherit",
+    },
+  );
 
   if (result.error) throw result.error;
 
