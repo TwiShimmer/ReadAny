@@ -16,6 +16,7 @@ import {
   getDeviceId as getLocalDeviceId,
 } from "../db/database";
 import { runSerializedDbTask } from "../db/write-retry";
+import i18n from "../i18n";
 import { getPlatformService } from "../services/platform";
 import { canonicalBookCoverPath, canonicalBookFilePath } from "./local-book-paths";
 import type { ISyncBackend } from "./sync-backend";
@@ -953,11 +954,19 @@ export async function runSimpleSync(
           `${filesUploadFailed} upload-failed, ${filesDownloadFailed} download-failed`,
       );
     } catch (e) {
-      console.warn("[SimpleSync] File sync failed (non-fatal):", e);
+      console.warn("[SimpleSync] File sync phase failed", e instanceof Error ? e.name : typeof e);
       // Don't fail the whole sync if file sync fails — but flag it so the UI
       // can surface why the file-sync phase didn't complete cleanly.
       filesUploadFailed = Math.max(filesUploadFailed, 1);
-      fileFailures = [{ path: "file-sync", message: e instanceof Error ? e.message : String(e) }];
+      fileFailures = [
+        {
+          path: "file-sync",
+          message: i18n.t("settings.syncFilePhaseFailure", {
+            defaultValue:
+              "File sync could not complete. Check the storage connection and try again.",
+          }),
+        },
+      ];
     }
 
     // 5. Update last sync timestamp

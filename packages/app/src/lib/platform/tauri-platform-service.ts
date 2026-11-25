@@ -38,10 +38,12 @@ function ensureTauriRuntimeForLAN(): void {
 function toFileTransferError(error: unknown, url: string): FileTransferError {
   if (error instanceof FileTransferError) return error;
   if (typeof error === "object" && error !== null) {
-    const record = error as { status?: unknown; message?: unknown };
+    const record = error as { status?: unknown; message?: unknown; redirectLocation?: unknown };
     const status = typeof record.status === "number" ? record.status : undefined;
     const message = typeof record.message === "string" ? record.message : String(error);
-    return new FileTransferError(message, { status, url });
+    const redirectLocation =
+      typeof record.redirectLocation === "string" ? record.redirectLocation : undefined;
+    return new FileTransferError(message, { status, url, redirectLocation, cause: error });
   }
   return new FileTransferError(String(error), { url });
 }
@@ -206,20 +208,29 @@ export class TauriPlatformService implements IPlatformService {
     const { fetch: tauriFetch } = await import("@tauri-apps/plugin-http");
     const {
       allowInsecure,
-      timeoutMs: _timeoutMs,
+      timeoutMs,
       responseType: _responseType,
       onDownloadProgress: _onDownloadProgress,
       ...fetchOptions
     } = options ?? {};
-    const tauriOptions = allowInsecure
-      ? ({
-          ...fetchOptions,
-          danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-        } as any)
-      : fetchOptions;
+    const rejectRedirects = fetchOptions.redirect === "error";
+    const timeoutSignal = rejectRedirects && timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+    const signal =
+      timeoutSignal && fetchOptions.signal
+        ? AbortSignal.any([timeoutSignal, fetchOptions.signal])
+        : (timeoutSignal ?? fetchOptions.signal);
+    const tauriOptions: Parameters<typeof tauriFetch>[1] = {
+      ...fetchOptions,
+      signal,
+      ...(rejectRedirects ? { maxRedirections: 0, connectTimeout: timeoutMs } : {}),
+      ...(allowInsecure
+        ? { danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true } }
+        : {}),
+    };
     try {
       return await tauriFetch(url, tauriOptions);
     } catch (error: unknown) {
+      if (timeoutSignal?.aborted) throw timeoutSignal.reason;
       // Tauri's fetch (Chromium-based) rejects when the server sends response
       // headers containing characters outside the ISO-8859-1 range (e.g.
       // Chinese filenames in Content-Disposition from WebDAV servers like dufs).
@@ -227,14 +238,15 @@ export class TauriPlatformService implements IPlatformService {
       // behaviour with the mobile (XHR) implementation.
       const msg = (error as { message?: string })?.message ?? "";
       if (
-        msg.includes("ISO-8859-1") ||
-        msg.includes("non ISO") ||
-        msg.includes("Failed to construct 'Headers'")
+        (!rejectRedirects || fetchOptions.method === "GET") &&
+        (msg.includes("ISO-8859-1") ||
+          msg.includes("non ISO") ||
+          msg.includes("Failed to construct 'Headers'"))
       ) {
         console.warn(
           "[TauriPlatform] tauriFetch failed due to non-ASCII response headers; falling back to native fetch",
         );
-        return globalThis.fetch(url, fetchOptions);
+        return globalThis.fetch(url, { ...fetchOptions, signal });
       }
       throw error;
     }

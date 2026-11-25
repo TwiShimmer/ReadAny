@@ -32,6 +32,7 @@ export interface FetchOptions extends RequestInit {
 export interface FileTransferOptions {
   headers?: Record<string, string>;
   allowInsecure?: boolean;
+  rejectRedirects?: boolean;
   onProgress?: (loaded: number, total: number) => void;
 }
 
@@ -44,13 +45,18 @@ export class FileTransferError extends Error {
   readonly status?: number;
   readonly url?: string;
   readonly cause?: unknown;
+  readonly redirectLocation?: string;
 
-  constructor(message: string, options?: { status?: number; url?: string; cause?: unknown }) {
+  constructor(
+    message: string,
+    options?: { status?: number; url?: string; cause?: unknown; redirectLocation?: string },
+  ) {
     super(message);
     this.name = "FileTransferError";
     this.status = options?.status;
     this.url = options?.url;
     this.cause = options?.cause;
+    this.redirectLocation = options?.redirectLocation;
   }
 }
 

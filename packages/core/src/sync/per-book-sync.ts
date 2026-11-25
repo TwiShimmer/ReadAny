@@ -44,6 +44,7 @@ import {
   getDeviceId as getLocalDeviceId,
 } from "../db/database";
 type Row = Record<string, unknown>;
+import i18n from "../i18n";
 import { getPlatformService } from "../services/platform";
 import {
   applyChanges,
@@ -1034,9 +1035,17 @@ export async function runPerBookSync(
       filesDownloadFailed = fileResult.filesDownloadFailed;
       fileFailures = fileResult.failures;
     } catch (e) {
-      console.warn("[PerBookSync] File sync failed (non-fatal):", e);
+      console.warn("[PerBookSync] File sync phase failed", e instanceof Error ? e.name : typeof e);
       filesUploadFailed = Math.max(filesUploadFailed, 1);
-      fileFailures = [{ path: "file-sync", message: e instanceof Error ? e.message : String(e) }];
+      fileFailures = [
+        {
+          path: "file-sync",
+          message: i18n.t("settings.syncFilePhaseFailure", {
+            defaultValue:
+              "File sync could not complete. Check the storage connection and try again.",
+          }),
+        },
+      ];
     }
 
     await setLastSyncTimestamp(Date.now());

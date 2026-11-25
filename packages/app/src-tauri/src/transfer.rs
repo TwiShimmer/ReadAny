@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use tauri::ipc::Channel;
 use tauri_plugin_http::reqwest;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
 const TRANSFER_TIMEOUT_SECS: u64 = 300;
@@ -18,6 +19,7 @@ const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
 /// (401 or directory heal), so this bounds the combined worst case.
 const UPLOAD_MAX_ATTEMPTS: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
+const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Serialized to the webview as `{ status, message }` so the JS layer can
 /// branch on the HTTP status without matching message text.
@@ -25,6 +27,8 @@ const BASE_DELAY_MS: u64 = 500;
 pub struct TransferError {
     status: Option<u16>,
     message: String,
+    #[serde(rename = "redirectLocation", skip_serializing_if = "Option::is_none")]
+    redirect_location: Option<String>,
 }
 
 impl TransferError {
@@ -32,6 +36,7 @@ impl TransferError {
         Self {
             status: None,
             message: message.into(),
+            redirect_location: None,
         }
     }
 
@@ -39,6 +44,7 @@ impl TransferError {
         Self {
             status: Some(status),
             message: message.into(),
+            redirect_location: None,
         }
     }
 }
@@ -55,6 +61,7 @@ fn build_client(allow_insecure: Option<bool>) -> Result<reqwest::Client, Transfe
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .retry(reqwest::retry::never())
         // WebDAV gateways redirect to login pages; following a redirect on PUT
         // can turn a rejected upload into a 200 text/html "success".
         .redirect(reqwest::redirect::Policy::none());
@@ -95,23 +102,21 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
 
-fn redirect_error(
-    method: &reqwest::Method,
-    url: &str,
-    response: &reqwest::Response,
-) -> TransferError {
+fn redirect_error(method: &reqwest::Method, response: &reqwest::Response) -> TransferError {
     let status = response.status();
     let location = response
         .headers()
         .get(reqwest::header::LOCATION)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("<no Location header>");
-    TransferError::with_status(
+        .and_then(|value| response.url().join(value).ok())
+        .filter(|target| matches!(target.scheme(), "https" | "http"))
+        .map(|target| format!("{}{}", target.origin().ascii_serialization(), target.path()));
+    let mut error = TransferError::with_status(
         status.as_u16(),
-        format!(
-            "WebDAV {method} for {url} was redirected to {location} ({status}); refusing to follow a redirect because the request body may be dropped"
-        ),
-    )
+        format!("WebDAV {method} redirect refused ({status})"),
+    );
+    error.redirect_location = location;
+    error
 }
 
 /// Same retry policy as the JS layer: retry transient failures (network
@@ -122,8 +127,9 @@ async fn send_with_retry(
     url: &str,
     headers: reqwest::header::HeaderMap,
 ) -> Result<reqwest::Response, TransferError> {
-    let mut last_error =
-        TransferError::new(format!("WebDAV {method} failed for {url}: no attempt was made"));
+    let mut last_error = TransferError::new(format!(
+        "WebDAV {method} failed for {url}: no attempt was made"
+    ));
 
     for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
         if attempt > 0 {
@@ -146,7 +152,7 @@ async fn send_with_retry(
             return Ok(response);
         }
         if status.is_redirection() {
-            return Err(redirect_error(&method, url, &response));
+            return Err(redirect_error(&method, &response));
         }
         let error = TransferError::with_status(
             status.as_u16(),
@@ -181,19 +187,29 @@ async fn upload_file_with_retry(
 
         let file = tokio::fs::File::open(file_path)
             .await
-            .map_err(|e| TransferError::new(format!("failed to open {file_path}: {e}")))?;
+            .map_err(|e| TransferError::new(format!("Failed to open upload file: {}", e.kind())))?;
         let total = file
             .metadata()
             .await
-            .map_err(|e| TransferError::new(format!("failed to stat {file_path}: {e}")))?
+            .map_err(|e| {
+                TransferError::new(format!(
+                    "Failed to determine upload file size: {}",
+                    e.kind()
+                ))
+            })?
             .len();
+        if total > MAX_UPLOAD_BYTES {
+            return Err(TransferError::new(format!(
+                "Upload file is {total} bytes, exceeding the 2 GiB streaming limit"
+            )));
+        }
 
         let response = client
             .put(url)
             .headers(headers.clone())
             .header(reqwest::header::CONTENT_LENGTH, total)
             .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
-                file,
+                file.take(total),
                 64 * 1024,
             )))
             .send()
@@ -210,10 +226,24 @@ async fn upload_file_with_retry(
 
         let status = response.status();
         if status.is_success() {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let mime_type = content_type.split(';').next().unwrap_or_default().trim();
+            if mime_type.eq_ignore_ascii_case("text/html")
+                || mime_type.eq_ignore_ascii_case("application/xhtml+xml")
+            {
+                return Err(TransferError::with_status(
+                    status.as_u16(),
+                    "WebDAV upload received an HTML page",
+                ));
+            }
             return Ok(());
         }
         if status.is_redirection() {
-            return Err(redirect_error(&reqwest::Method::PUT, url, &response));
+            return Err(redirect_error(&reqwest::Method::PUT, &response));
         }
         let error = TransferError::with_status(
             status.as_u16(),
@@ -253,13 +283,8 @@ pub async fn webdav_download_file(
     on_progress: Channel<TransferProgress>,
 ) -> Result<(), TransferError> {
     let client = build_client(allow_insecure)?;
-    let mut response = send_with_retry(
-        &client,
-        reqwest::Method::GET,
-        &url,
-        to_header_map(&headers),
-    )
-    .await?;
+    let mut response =
+        send_with_retry(&client, reqwest::Method::GET, &url, to_header_map(&headers)).await?;
 
     let total = response.content_length().unwrap_or(0);
     if let Some(parent) = std::path::Path::new(&file_path).parent() {

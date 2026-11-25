@@ -5,9 +5,9 @@ export async function parallelLimit<T>(tasks: (() => Promise<T>)[], limit: numbe
   const results: T[] = [];
   const executing: Promise<void>[] = [];
 
-  for (const task of tasks) {
+  for (const [index, task] of tasks.entries()) {
     const p = task().then((result) => {
-      results.push(result);
+      results[index] = result;
       executing.splice(executing.indexOf(p), 1);
     });
     executing.push(p);

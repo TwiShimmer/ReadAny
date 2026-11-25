@@ -29,6 +29,8 @@ import * as LegacyFS from "expo-file-system/legacy";
 import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
 import * as Sharing from "expo-sharing";
+import { fetch as expoFetch } from "expo/fetch";
+import { Platform } from "react-native";
 
 /** Simple KV storage keys tracking (SecureStore doesn't have getAllKeys) */
 const KV_KEYS_INDEX = "__readany_kv_keys__";
@@ -288,6 +290,24 @@ export class ExpoPlatformService implements IPlatformService {
       options ?? {};
     const effectiveUrl = allowInsecure ? url.replace(/^https:\/\//i, "http://") : url;
     const method = fetchOptions?.method?.toUpperCase() || "GET";
+    if (fetchOptions.redirect === "error" && method !== "GET") {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs ?? 15_000);
+      try {
+        // Manual mode exposes the original 3xx and Location to WebDavClient.
+        return await expoFetch(effectiveUrl, {
+          ...fetchOptions,
+          body: fetchOptions.body ?? undefined,
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) throw new Error("WebDAV request timed out");
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
 
     // Always use XHR for WebDAV to handle large binary files properly
     // React Native's fetch has issues with large arrayBuffer responses
@@ -333,6 +353,50 @@ export class ExpoPlatformService implements IPlatformService {
 
   async uploadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const effectiveUrl = options?.allowInsecure ? url.replace(/^https:\/\//i, "http://") : url;
+    if (options?.rejectRedirects) {
+      // Expo's legacy upload task does not expose the final URL. RN's Android
+      // networking accepts a file URI body and exposes the response URL.
+      // The iOS URI implementation buffers the file, so use the bounded fallback.
+      if (Platform.OS !== "android") {
+        throw new Error("Platform does not support direct file upload with redirect checks");
+      }
+      const file = new File(filePath);
+      const size = file.size;
+      if (!file.exists || size > 2 * 1024 ** 3) {
+        throw new FileTransferError(`Cannot upload file (${size} bytes, limit 2 GiB)`);
+      }
+      const response = await this._fetchWithXHR(
+        effectiveUrl,
+        { method: "PUT", headers: options.headers, redirect: "error" },
+        "text",
+        300_000,
+        undefined,
+        { uri: file.uri, onProgress: options.onProgress },
+      );
+      if (
+        response.redirected ||
+        !response.url ||
+        (response.status >= 300 && response.status < 400)
+      ) {
+        throw new FileTransferError("Unable to verify the WebDAV upload target", {
+          status: response.status,
+          redirectLocation: response.headers.get("Location") ?? (response.url || undefined),
+        });
+      }
+      if (
+        !response.ok ||
+        /^(text\/html|application\/xhtml\+xml)\b/i.test(
+          response.headers.get("Content-Type") ?? "",
+        ) ||
+        (response.status === 200 &&
+          /^\s*(?:<!doctype\s+html\b|<html\b|<form\b)/i.test(await response.text()))
+      ) {
+        throw new FileTransferError("Unexpected WebDAV upload response", {
+          status: response.status,
+        });
+      }
+      return;
+    }
     const task = LegacyFS.createUploadTask(
       effectiveUrl,
       filePath,
@@ -365,6 +429,7 @@ export class ExpoPlatformService implements IPlatformService {
     responseType: XMLHttpRequestResponseType = "arraybuffer",
     timeoutMs = 120000,
     onDownloadProgress?: (loaded: number, total: number) => void,
+    upload?: { uri: string; onProgress?: (loaded: number, total: number) => void },
   ): Promise<Response> {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -381,6 +446,11 @@ export class ExpoPlatformService implements IPlatformService {
       if (onDownloadProgress) {
         xhr.onprogress = (event) => {
           onDownloadProgress(event.loaded, event.lengthComputable ? event.total : 0);
+        };
+      }
+      if (upload?.onProgress) {
+        xhr.upload.onprogress = (event) => {
+          upload.onProgress?.(event.loaded, event.lengthComputable ? event.total : 0);
         };
       }
 
@@ -415,12 +485,25 @@ export class ExpoPlatformService implements IPlatformService {
             textResponse = typeof xhr.responseText === "string" ? xhr.responseText : "";
           }
 
-          // Create a Response-like object
+          const responseHeaders = new Headers();
+          for (const line of xhr.getAllResponseHeaders().split(/\r?\n/)) {
+            const separator = line.indexOf(":");
+            if (separator > 0) {
+              try {
+                responseHeaders.append(line.slice(0, separator), line.slice(separator + 1).trim());
+              } catch {
+                // Some native servers return non-Latin-1 Content-Disposition.
+              }
+            }
+          }
+          const responseUrl = xhr.responseURL || "";
           const response = {
             status: xhr.status,
             statusText: xhr.statusText,
             ok: xhr.status >= 200 && xhr.status < 300,
-            headers: new Headers(),
+            headers: responseHeaders,
+            url: responseUrl,
+            redirected: !!responseUrl && new URL(responseUrl).href !== new URL(url).href,
             text: async () => {
               if (responseType !== "arraybuffer") {
                 return textResponse;
@@ -488,7 +571,10 @@ export class ExpoPlatformService implements IPlatformService {
       };
 
       // Send request
-      if (options?.body) {
+      if (upload) {
+        // React Native's XMLHttpRequest accepts a native file URI descriptor.
+        xhr.send({ uri: upload.uri } as unknown as XMLHttpRequestBodyInit);
+      } else if (options?.body) {
         if (typeof options.body === "string") {
           xhr.send(options.body);
         } else if (options.body instanceof ArrayBuffer) {
