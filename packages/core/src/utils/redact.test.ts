@@ -3,9 +3,9 @@ import { scrubSensitiveText } from "./redact";
 
 describe("scrubSensitiveText", () => {
   it("redacts Windows paths containing spaces", () => {
-    expect(
-      scrubSensitiveText("Failed to open C:\\Users\\Jane Doe\\Private Book.pdf: ENOENT"),
-    ).toBe("Failed to open <path>: ENOENT");
+    expect(scrubSensitiveText("Failed to open C:\\Users\\Jane Doe\\Private Book.pdf: ENOENT")).toBe(
+      "Failed to open <path>: ENOENT",
+    );
   });
 
   it("redacts POSIX paths containing spaces", () => {
@@ -22,9 +22,7 @@ describe("scrubSensitiveText", () => {
   });
 
   it("redacts common credentials", () => {
-    expect(scrubSensitiveText("token ghp_abcdefghijklmnopqrstuvwxyz")).toBe(
-      "token <redacted>",
-    );
+    expect(scrubSensitiveText("token ghp_abcdefghijklmnopqrstuvwxyz")).toBe("token <redacted>");
     expect(scrubSensitiveText("Authorization: Bearer abc.def.ghi")).toBe(
       "Authorization: Bearer <redacted>",
     );

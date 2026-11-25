@@ -191,6 +191,19 @@ describe("installMapUpsertPolyfill", () => {
 });
 
 describe("installWeakMapUpsertPolyfill", () => {
+  it("rejects an invalid key before calling the callback", () => {
+    const FakeWeakMap = createWeakMapClass();
+    installWeakMapUpsertPolyfill(ctorOf(FakeWeakMap));
+    const map = new FakeWeakMap<object, number>();
+    let calls = 0;
+    const callback = () => ++calls;
+
+    for (const key of [42, null, undefined, Symbol.for("registered")]) {
+      expect(() => Reflect.apply(map.getOrInsertComputed, map, [key, callback])).toThrow(TypeError);
+    }
+    expect(calls).toBe(0);
+  });
+
   it("installs both methods and reuses existing values", () => {
     const FakeWeakMap = createWeakMapClass();
     installWeakMapUpsertPolyfill(ctorOf(FakeWeakMap));
