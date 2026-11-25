@@ -24,6 +24,7 @@ import {
 } from "./sync-naming";
 import { parallelLimit } from "./sync-transfer";
 import {
+  type FileSyncFailure,
   REMOTE_BOOKS_ROOT,
   REMOTE_COVERS,
   REMOTE_FILES,
@@ -92,6 +93,13 @@ function isDirectFileTransferUnsupported(error: unknown): boolean {
  */
 const DEFAULT_MAX_BUFFERED_TRANSFER_BYTES = 256 * 1024 * 1024;
 
+/**
+ * A platform that can stream from a file path never expands the file into the
+ * JS heap, so the buffered cap must not apply to it. This 2 GB ceiling only
+ * catches obviously unsupported payloads and gives a diagnosable error.
+ */
+const MAX_STREAMING_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024;
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
@@ -116,7 +124,18 @@ async function uploadFileToRemote(
   onProgress?: (loaded: number, total: number) => void,
 ): Promise<number | null> {
   const adapter = getSyncAdapter();
+  const fileSize = await adapter.getFileSize(localPath);
+
+  // Path-based upload (Tauri/Expo native streaming): the file never enters
+  // the JS heap, so only the much higher streaming ceiling applies.
   if (backend.putFile) {
+    if (fileSize != null && fileSize > MAX_STREAMING_TRANSFER_BYTES) {
+      throw new Error(
+        `文件超过流式上传上限：${remotePath}（${formatBytes(fileSize)}），上限 ${formatBytes(
+          MAX_STREAMING_TRANSFER_BYTES,
+        )}。`,
+      );
+    }
     try {
       await backend.putFile(remotePath, localPath, onProgress);
       return null;
@@ -128,15 +147,15 @@ async function uploadFileToRemote(
     }
   }
 
-  // Never read a whole large file into the JS heap. Direct/native streaming
-  // upload is preferred above; if that path is unavailable, fail with an
-  // actionable size error instead of risking RangeError: Invalid array length
-  // when the buffer is expanded.
+  // Buffered fallback: never read a whole large file into the JS heap. Fail
+  // with an actionable size error instead of risking
+  // RangeError: Invalid array length when the buffer is expanded.
   const bufferedLimit = adapter.maxBufferedTransferBytes ?? DEFAULT_MAX_BUFFERED_TRANSFER_BYTES;
-  const fileSize = await adapter.getFileSize(localPath);
   if (fileSize != null && fileSize > bufferedLimit) {
     throw new Error(
-      `File is too large for buffered upload: ${remotePath} is ${formatBytes(fileSize)}, which exceeds the ${formatBytes(bufferedLimit)} limit. Use the desktop app or a streaming/chunked upload instead.`,
+      `文件超过缓冲上传上限：${remotePath}（${formatBytes(fileSize)}），上限 ${formatBytes(
+        bufferedLimit,
+      )}。请改用支持流式上传的存储后端。`,
     );
   }
 
@@ -257,11 +276,33 @@ type RemoteFileManifest = {
   books: Record<string, RemoteFileManifestEntry>;
 };
 
+type FileTaskResult = { ok: true } | { ok: false; error: unknown };
+
 type FileTask = {
   label: string;
+  path: string;
   sizeBytes?: number | null;
-  run: (onProgress?: (loaded: number, total: number) => void) => Promise<boolean>;
+  run: (onProgress?: (loaded: number, total: number) => void) => Promise<FileTaskResult>;
 };
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function errorStatus(error: unknown): number | undefined {
+  const status = (error as { status?: unknown } | null)?.status;
+  return typeof status === "number" && status > 0 ? status : undefined;
+}
+
+function failureFromResult(task: FileTask, result: FileTaskResult): FileSyncFailure | null {
+  if (result.ok) return null;
+  const status = errorStatus(result.error);
+  return {
+    path: task.path,
+    message: errorMessage(result.error),
+    ...(status !== undefined ? { status } : {}),
+  };
+}
 
 function isPositiveFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -269,6 +310,19 @@ function isPositiveFiniteNumber(value: unknown): value is number {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Existence is only actionable when the backend can answer. A 401/403/network
+ * failure is "unknown", so callers must not delete or overwrite remote data.
+ */
+async function remoteExistsSafe(backend: ISyncBackend, path: string): Promise<boolean> {
+  try {
+    return await backend.exists(path);
+  } catch (e) {
+    console.warn(`[Sync] Cannot determine remote existence for ${path}: ${errorMessage(e)}`);
+    return false;
+  }
 }
 
 async function hashFileSafe(filePath: string): Promise<string | null> {
@@ -287,7 +341,7 @@ async function runFileTasks(
   operation: "upload" | "download",
   concurrency: number,
   onProgress?: (progress: SyncProgress) => void,
-): Promise<boolean[]> {
+): Promise<FileTaskResult[]> {
   let completed = 0;
   const total = tasks.length;
   const operationLabel = operation === "upload" ? "Uploading" : "Downloading";
@@ -352,11 +406,12 @@ async function runFileTasks(
     const finalTotal =
       taskTotalBytes.get(index) ??
       (isPositiveFiniteNumber(task.sizeBytes) ? task.sizeBytes : undefined);
-    if (result && finalTotal) {
+    if (result.ok && finalTotal) {
       taskTotalBytes.set(index, finalTotal);
       taskLoadedBytes.set(index, finalTotal);
     }
     const totalTransferBytes = getTotalTransferBytes();
+    const failed = !result.ok;
     onProgress?.({
       phase: "files",
       operation,
@@ -366,7 +421,10 @@ async function runFileTasks(
       ...(finalTotal !== undefined ? { currentBytes: finalTotal, totalBytes: finalTotal } : {}),
       ...(taskLoadedBytes.size > 0 ? { totalCurrentBytes: getTotalCurrentBytes() } : {}),
       ...(totalTransferBytes !== undefined ? { totalTransferBytes } : {}),
-      message: `${operationLabel} file ${Math.min(completed + 1, total)}/${total}...`,
+      message: failed
+        ? `${operationLabel} failed: ${task.path}: ${errorMessage(result.error)}`
+        : `${operationLabel} file ${Math.min(completed + 1, total)}/${total}...`,
+      ...(failed ? { failure: failureFromResult(task, result) ?? undefined } : {}),
     });
     return result;
   });
@@ -386,6 +444,7 @@ export async function syncFiles(
   filesDownloaded: number;
   filesUploadFailed: number;
   filesDownloadFailed: number;
+  failures: FileSyncFailure[];
 }> {
   const syncFilesStart = Date.now();
   console.log("[Sync] 📁 Starting file sync...");
@@ -410,6 +469,7 @@ export async function syncFiles(
   let filesDownloaded = 0;
   let filesUploadFailed = 0;
   let filesDownloadFailed = 0;
+  const failures: FileSyncFailure[] = [];
 
   const books = await db.select<BookRow>(
     "SELECT id, file_path, format, file_hash, cover_url, title, sync_status FROM books WHERE deleted_at IS NULL",
@@ -539,13 +599,14 @@ export async function syncFiles(
         const sizeBytes = localSizeMap.get(info.localFilePath) ?? null;
         uploadTasks.push({
           label: task.label,
+          path: task.path,
           sizeBytes,
           run: async (onProgress) => {
-            const ok = await task.run(onProgress);
-            if (ok) remoteFileAtNew.set(book.id, true);
-            if (ok && isPositiveFiniteNumber(sizeBytes))
+            const outcome = await task.run(onProgress);
+            if (outcome.ok) remoteFileAtNew.set(book.id, true);
+            if (outcome.ok && isPositiveFiniteNumber(sizeBytes))
               remoteFileSizeAtNew.set(book.id, sizeBytes);
-            return ok;
+            return outcome;
           },
         });
       }
@@ -624,20 +685,21 @@ export async function syncFiles(
         const sizeBytes = localSize;
         uploadTasks.push({
           label: task.label,
+          path: task.path,
           sizeBytes,
           run: async (onProgress) => {
-            const ok = await task.run(onProgress);
-            if (ok) remoteCoverAtNew.set(book.id, true);
-            if (ok && isPositiveFiniteNumber(sizeBytes)) {
+            const outcome = await task.run(onProgress);
+            if (outcome.ok) remoteCoverAtNew.set(book.id, true);
+            if (outcome.ok && isPositiveFiniteNumber(sizeBytes)) {
               remoteCoverSizeAtNew.set(book.id, sizeBytes);
             }
-            if (ok && localHash) {
+            if (outcome.ok && localHash) {
               remoteCoverHashAtNew.set(book.id, localHash);
             }
-            if (ok) {
+            if (outcome.ok) {
               remoteCoverSourcePathAtNew.set(book.id, info.book.cover_url);
             }
-            return ok;
+            return outcome;
           },
         });
       }
@@ -662,11 +724,27 @@ export async function syncFiles(
     );
     const uploadStart = Date.now();
     const uploadResults = await runFileTasks(uploadTasks, "upload", uploadConcurrency, onProgress);
-    filesUploaded = uploadResults.filter((r) => r).length;
+    filesUploaded = uploadResults.filter((r) => r.ok).length;
     filesUploadFailed = uploadResults.length - filesUploaded;
+    uploadTasks.forEach((task, index) => {
+      const failure = failureFromResult(task, uploadResults[index] ?? { ok: true });
+      if (failure) failures.push(failure);
+    });
     console.log(
       `[Sync] ✅ Upload completed: ${filesUploaded} succeeded, ${filesUploadFailed} failed in ${Date.now() - uploadStart}ms`,
     );
+    const firstUploadFailure = failures[0];
+    if (firstUploadFailure) {
+      console.warn(`[Sync] First upload failure: ${firstUploadFailure.message}`);
+      onProgress?.({
+        phase: "files",
+        operation: "upload",
+        completedFiles: uploadResults.length,
+        totalFiles: uploadTasks.length,
+        failure: firstUploadFailure,
+        message: `上传失败：${firstUploadFailure.path}：${firstUploadFailure.message}`,
+      });
+    }
   }
 
   if (downloadTasks.length > 0) {
@@ -680,8 +758,12 @@ export async function syncFiles(
       downloadConcurrency,
       onProgress,
     );
-    filesDownloaded = downloadResults.filter((r) => r).length;
+    filesDownloaded = downloadResults.filter((r) => r.ok).length;
     filesDownloadFailed = downloadResults.length - filesDownloaded;
+    downloadTasks.forEach((task, index) => {
+      const failure = failureFromResult(task, downloadResults[index] ?? { ok: true });
+      if (failure) failures.push(failure);
+    });
     console.log(
       `[Sync] ✅ Download completed: ${filesDownloaded} succeeded, ${filesDownloadFailed} failed in ${Date.now() - downloadStart}ms`,
     );
@@ -706,7 +788,7 @@ export async function syncFiles(
   );
 
   console.log(`[Sync] ✅ File sync completed in ${Date.now() - syncFilesStart}ms`);
-  return { filesUploaded, filesDownloaded, filesUploadFailed, filesDownloadFailed };
+  return { filesUploaded, filesDownloaded, filesUploadFailed, filesDownloadFailed, failures };
 }
 
 /* ─────────────────────────  helpers  ───────────────────────── */
@@ -1020,7 +1102,7 @@ async function migrateBookRemoteState(
           }
         } catch (e) {
           console.warn(`[Sync] Folder-rename MOVE failed for ${book.id} (${f.name}):`, e);
-          if (await backend.exists(target)) {
+          if (await remoteExistsSafe(backend, target)) {
             try {
               await backend.delete(`${oldDir}/${f.name}`);
             } catch {}
@@ -1082,7 +1164,7 @@ async function migrateBookRemoteState(
       console.log(`[Sync] 🔁 Migrated legacy file → ${info.remoteFilePath}`);
     } catch (e) {
       console.warn(`[Sync] Legacy file MOVE failed for ${book.id}:`, e);
-      if (await backend.exists(info.remoteFilePath)) {
+      if (await remoteExistsSafe(backend, info.remoteFilePath)) {
         try {
           await backend.delete(legacy);
           fileAtNew = true;
@@ -1102,7 +1184,7 @@ async function migrateBookRemoteState(
       console.log(`[Sync] 🔁 Migrated legacy cover → ${info.remoteCoverPath}`);
     } catch (e) {
       console.warn(`[Sync] Legacy cover MOVE failed for ${book.id}:`, e);
-      if (await backend.exists(info.remoteCoverPath)) {
+      if (await remoteExistsSafe(backend, info.remoteCoverPath)) {
         try {
           await backend.delete(legacy);
           coverAtNew = true;
@@ -1120,6 +1202,7 @@ function buildUploadFileTask(backend: ISyncBackend, info: BookInfo): FileTask {
   const bookTitle = info.book.title || "未知书籍";
   return {
     label: bookTitle,
+    path: info.remoteFilePath,
     run: async (onProgress) => {
       const taskStart = Date.now();
       try {
@@ -1132,10 +1215,10 @@ function buildUploadFileTask(backend: ISyncBackend, info: BookInfo): FileTask {
         );
         const size = bytes === null ? "" : ` (${(bytes / 1024 / 1024).toFixed(2)} MB)`;
         console.log(`[Sync] ✓ Uploaded "${bookTitle}"${size} in ${Date.now() - taskStart}ms`);
-        return true;
+        return { ok: true };
       } catch (e) {
-        console.log(`[Sync] ✗ Failed to upload "${bookTitle}": ${e}`);
-        return false;
+        console.log(`[Sync] ✗ Failed to upload "${bookTitle}": ${errorMessage(e)}`);
+        return { ok: false, error: e };
       }
     },
   };
@@ -1149,6 +1232,7 @@ function buildDownloadFileTask(
   const bookTitle = info.book.title || "未知书籍";
   return {
     label: bookTitle,
+    path: info.remoteFilePath,
     run: async (onProgress) => {
       const taskStart = Date.now();
       try {
@@ -1162,10 +1246,10 @@ function buildDownloadFileTask(
         await setBookSyncStatus(info.book.id, "local");
         const size = bytes === null ? "" : ` (${(bytes / 1024 / 1024).toFixed(2)} MB)`;
         console.log(`[Sync] ✓ Downloaded "${bookTitle}"${size} in ${Date.now() - taskStart}ms`);
-        return true;
+        return { ok: true };
       } catch (e) {
-        console.log(`[Sync] ✗ Failed to download "${bookTitle}": ${e}`);
-        return false;
+        console.log(`[Sync] ✗ Failed to download "${bookTitle}": ${errorMessage(e)}`);
+        return { ok: false, error: e };
       }
     },
   };
@@ -1175,6 +1259,7 @@ function buildUploadCoverTask(backend: ISyncBackend, info: BookInfo): FileTask {
   const bookTitle = info.book.title || "未知书籍";
   return {
     label: `${bookTitle} cover`,
+    path: info.remoteCoverPath,
     run: async (onProgress) => {
       const taskStart = Date.now();
       try {
@@ -1187,10 +1272,10 @@ function buildUploadCoverTask(backend: ISyncBackend, info: BookInfo): FileTask {
         );
         const size = bytes === null ? "" : ` (${(bytes / 1024).toFixed(2)} KB)`;
         console.log(`[Sync] ✓ Uploaded cover "${bookTitle}"${size} in ${Date.now() - taskStart}ms`);
-        return true;
+        return { ok: true };
       } catch (e) {
-        console.log(`[Sync] ✗ Failed to upload cover "${bookTitle}": ${e}`);
-        return false;
+        console.log(`[Sync] ✗ Failed to upload cover "${bookTitle}": ${errorMessage(e)}`);
+        return { ok: false, error: e };
       }
     },
   };
@@ -1200,6 +1285,7 @@ function buildDownloadCoverTask(backend: ISyncBackend, info: BookInfo): FileTask
   const bookTitle = info.book.title || "未知书籍";
   return {
     label: `${bookTitle} cover`,
+    path: info.remoteCoverPath,
     run: async (onProgress) => {
       const taskStart = Date.now();
       try {
@@ -1214,10 +1300,10 @@ function buildDownloadCoverTask(backend: ISyncBackend, info: BookInfo): FileTask
         console.log(
           `[Sync] ✓ Downloaded cover "${bookTitle}"${size} in ${Date.now() - taskStart}ms`,
         );
-        return true;
+        return { ok: true };
       } catch (e) {
-        console.log(`[Sync] ✗ Failed to download cover "${bookTitle}": ${e}`);
-        return false;
+        console.log(`[Sync] ✗ Failed to download cover "${bookTitle}": ${errorMessage(e)}`);
+        return { ok: false, error: e };
       }
     },
   };

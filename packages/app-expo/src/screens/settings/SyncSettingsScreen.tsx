@@ -666,6 +666,12 @@ export default function SyncSettingsScreen() {
                               })}
                             </Text>
                           )}
+                          {lastResult.fileFailures?.[0] && (
+                            <Text style={styles.errorText}>
+                              {lastResult.fileFailures[0].path}:{" "}
+                              {lastResult.fileFailures[0].message}
+                            </Text>
+                          )}
                         </>
                       ) : (
                         <Text style={styles.errorText}>

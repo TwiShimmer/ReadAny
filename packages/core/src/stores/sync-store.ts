@@ -643,6 +643,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
             filesDownloaded: result.filesDownloaded,
             filesUploadFailed: result.filesUploadFailed,
             filesDownloadFailed: result.filesDownloadFailed,
+            fileFailures: result.fileFailures,
             durationMs: 0,
           },
           error: null,
@@ -659,6 +660,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
             filesDownloaded: result.filesDownloaded,
             filesUploadFailed: result.filesUploadFailed,
             filesDownloadFailed: result.filesDownloadFailed,
+            fileFailures: result.fileFailures,
             durationMs: 0,
           },
         });
@@ -700,6 +702,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
         filesDownloaded: result.filesDownloaded,
         filesUploadFailed: result.filesUploadFailed,
         filesDownloadFailed: result.filesDownloadFailed,
+        fileFailures: result.fileFailures,
         durationMs: 0,
         error: result.error,
       };
@@ -855,6 +858,7 @@ export const useSyncStore = create<SyncState>((set, get) => ({
           filesDownloaded: simpleResult.filesDownloaded,
           filesUploadFailed: simpleResult.filesUploadFailed,
           filesDownloadFailed: simpleResult.filesDownloadFailed,
+          fileFailures: simpleResult.fileFailures,
           durationMs: Date.now() - startTime,
           error: simpleResult.error,
         };

@@ -830,6 +830,11 @@ export function SyncSettings() {
                     })}
                   </p>
                 )}
+                {lastResult.fileFailures?.[0] && (
+                  <p className="break-all text-red-500/80">
+                    {lastResult.fileFailures[0].path}: {lastResult.fileFailures[0].message}
+                  </p>
+                )}
                 <p className="text-muted-foreground/60">
                   {t("settings.syncDuration", { ms: lastResult.durationMs })}
                 </p>

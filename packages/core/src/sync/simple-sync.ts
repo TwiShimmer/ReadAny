@@ -20,7 +20,7 @@ import { getPlatformService } from "../services/platform";
 import { canonicalBookCoverPath, canonicalBookFilePath } from "./local-book-paths";
 import type { ISyncBackend } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
-import type { SyncProgress } from "./sync-types";
+import type { FileSyncFailure, SyncProgress } from "./sync-types";
 
 interface SyncTableConfig {
   name: string;
@@ -743,6 +743,7 @@ export async function runSimpleSync(
   filesDownloaded: number;
   filesUploadFailed: number;
   filesDownloadFailed: number;
+  fileFailures: FileSyncFailure[];
   error?: string;
 }> {
   try {
@@ -903,6 +904,7 @@ export async function runSimpleSync(
     let filesDownloaded = 0;
     let filesUploadFailed = 0;
     let filesDownloadFailed = 0;
+    let fileFailures: FileSyncFailure[] = [];
     onProgress?.({
       phase: "files",
       operation: receiveOnly ? "download" : "upload",
@@ -930,6 +932,18 @@ export async function runSimpleSync(
       filesDownloaded = fileResult.filesDownloaded;
       filesUploadFailed = fileResult.filesUploadFailed;
       filesDownloadFailed = fileResult.filesDownloadFailed;
+      fileFailures = fileResult.failures;
+      if (fileFailures.length > 0) {
+        const first = fileFailures[0];
+        onProgress?.({
+          phase: "files",
+          operation: "upload",
+          completedFiles: filesUploaded,
+          totalFiles: filesUploaded + filesUploadFailed,
+          failure: first,
+          message: `文件同步失败：${first.path}：${first.message}`,
+        });
+      }
       console.log(
         `[SimpleSync] File sync: ${filesUploaded} uploaded, ${filesDownloaded} downloaded, ` +
           `${filesUploadFailed} upload-failed, ${filesDownloadFailed} download-failed`,
@@ -937,8 +951,9 @@ export async function runSimpleSync(
     } catch (e) {
       console.warn("[SimpleSync] File sync failed (non-fatal):", e);
       // Don't fail the whole sync if file sync fails — but flag it so the UI
-      // can surface that the file-sync phase didn't complete cleanly.
+      // can surface why the file-sync phase didn't complete cleanly.
       filesUploadFailed = Math.max(filesUploadFailed, 1);
+      fileFailures = [{ path: "file-sync", message: e instanceof Error ? e.message : String(e) }];
     }
 
     // 5. Update last sync timestamp
@@ -949,7 +964,10 @@ export async function runSimpleSync(
       operation: receiveOnly ? "download" : "upload",
       completedFiles: 0,
       totalFiles: 0,
-      message: "同步完成",
+      ...(fileFailures[0] ? { failure: fileFailures[0] } : {}),
+      message: fileFailures[0]
+        ? `同步完成，但有 ${fileFailures.length} 个文件失败：${fileFailures[0].message}`
+        : "同步完成",
     });
     return {
       success: true,
@@ -958,6 +976,7 @@ export async function runSimpleSync(
       filesDownloaded,
       filesUploadFailed,
       filesDownloadFailed,
+      fileFailures,
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
@@ -969,6 +988,7 @@ export async function runSimpleSync(
       filesDownloaded: 0,
       filesUploadFailed: 0,
       filesDownloadFailed: 0,
+      fileFailures: [],
       error,
     };
   }

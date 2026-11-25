@@ -58,7 +58,7 @@ import {
 import type { DeviceSyncPayload } from "./simple-sync";
 import type { ISyncBackend, RemoteFile } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
-import type { SyncProgress } from "./sync-types";
+import type { FileSyncFailure, SyncProgress } from "./sync-types";
 
 export interface PerBookSyncOptions {
   receiveOnly?: boolean;
@@ -571,6 +571,7 @@ export async function runPerBookSync(
   filesDownloaded: number;
   filesUploadFailed: number;
   filesDownloadFailed: number;
+  fileFailures: FileSyncFailure[];
   error?: string;
 }> {
   const { receiveOnly = false, forceApply = false } = options;
@@ -1026,6 +1027,7 @@ export async function runPerBookSync(
     let filesDownloaded = 0;
     let filesUploadFailed = 0;
     let filesDownloadFailed = 0;
+    let fileFailures: FileSyncFailure[] = [];
     progress("同步书籍和封面文件...");
     try {
       const { syncFiles } = await import("./sync-files");
@@ -1047,9 +1049,11 @@ export async function runPerBookSync(
       filesDownloaded = fileResult.filesDownloaded;
       filesUploadFailed = fileResult.filesUploadFailed;
       filesDownloadFailed = fileResult.filesDownloadFailed;
+      fileFailures = fileResult.failures;
     } catch (e) {
       console.warn("[PerBookSync] File sync failed (non-fatal):", e);
       filesUploadFailed = Math.max(filesUploadFailed, 1);
+      fileFailures = [{ path: "file-sync", message: e instanceof Error ? e.message : String(e) }];
     }
 
     await setLastSyncTimestamp(Date.now());
@@ -1059,7 +1063,10 @@ export async function runPerBookSync(
       operation: receiveOnly ? "download" : "upload",
       completedFiles: 0,
       totalFiles: 0,
-      message: "同步完成",
+      ...(fileFailures[0] ? { failure: fileFailures[0] } : {}),
+      message: fileFailures[0]
+        ? `同步完成，但有 ${fileFailures.length} 个文件失败：${fileFailures[0].message}`
+        : "同步完成",
     });
     return {
       success: true,
@@ -1068,6 +1075,7 @@ export async function runPerBookSync(
       filesDownloaded,
       filesUploadFailed,
       filesDownloadFailed,
+      fileFailures,
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
@@ -1079,6 +1087,7 @@ export async function runPerBookSync(
       filesDownloaded: 0,
       filesUploadFailed: 0,
       filesDownloadFailed: 0,
+      fileFailures: [],
       error,
     };
   }
