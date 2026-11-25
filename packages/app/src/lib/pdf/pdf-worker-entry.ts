@@ -7,8 +7,4 @@
  * evaluates and calls `getOrInsertComputed`.
  */
 import "./pdf-worker-polyfills";
-
-// The export keeps pdf.js's fake-worker fallback working: if a real Worker
-// cannot be constructed, pdf.js dynamically imports this same URL and looks
-// for `WorkerMessageHandler`.
-export { WorkerMessageHandler } from "pdfjs-dist/build/pdf.worker.mjs";
+import "pdfjs-dist/build/pdf.worker.mjs";

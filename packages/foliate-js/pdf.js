@@ -5,18 +5,49 @@
  */
 import * as pdfjsLib from "pdfjs-dist";
 
-// The host app configures a bundled, polyfilled worker via
-// `lib/pdf/pdf-worker.ts` before calling makePDF(). Do not install a
-// main-thread fake worker here: it would shadow the real worker and re-expose
-// old WebView2 builds to pdf.js's modern Map APIs.
-const PDFJS_CDN_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}`;
-const PDFJS_DOCUMENT_OPTIONS = {
-  useWorkerFetch: false,
-  isEvalSupported: false,
-  useSystemFonts: true,
-  cMapUrl: `${PDFJS_CDN_BASE}/cmaps/`,
-  cMapPacked: true,
-  standardFontDataUrl: `${PDFJS_CDN_BASE}/standard_fonts/`,
+/**
+ * Explicit host contract for pdf.js runtime configuration.
+ *
+ * foliate-js is bundled by different hosts (Vite app, esbuild React Native
+ * reader). It must not guess a worker or asset location at import time:
+ *  - desktop passes `workerSrc` for the bundled, polyfilled worker;
+ *  - the React Native reader passes `workerMessageHandler` for its main-thread
+ *    fake worker (and may leave workerSrc unset).
+ *
+ * Passing `workerSrc` also removes any stale `globalThis.pdfjsWorker` so a
+ * previously configured fake worker cannot shadow the real one.
+ */
+export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => {
+  if (workerSrc) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+    // biome-ignore lint/performance/noDelete: remove the fake-worker hook entirely
+    delete globalThis.pdfjsWorker;
+  } else if (workerMessageHandler) {
+    globalThis.pdfjsWorker ??= { WorkerMessageHandler: workerMessageHandler };
+  }
+};
+
+const DEFAULT_PDFJS_ASSET_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/`;
+
+// Runtime-injected asset base: the desktop app points this at its bundled
+// `vendor/pdfjs/` copy. Do not use import.meta.env here because this module is also
+// bundled into an esbuild IIFE for the mobile reader.
+const getPDFJSAssetBase = () => {
+  const configured = globalThis.__READANY_PDF_ASSET_BASE__;
+  if (typeof configured !== "string" || !configured) return DEFAULT_PDFJS_ASSET_BASE;
+  return configured.endsWith("/") ? configured : `${configured}/`;
+};
+
+const getPDFJSDocumentOptions = () => {
+  const assetBase = getPDFJSAssetBase();
+  return {
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+    cMapUrl: `${assetBase}cmaps/`,
+    cMapPacked: true,
+    standardFontDataUrl: `${assetBase}standard_fonts/`,
+  };
 };
 
 // Inline text_layer_builder CSS
@@ -602,11 +633,17 @@ const createPageTextDocument = async (page, pageNumber) => {
 
 const fakePageCfi = (pageIndex) => `epubcfi(/6/${(pageIndex + 1) * 2})`;
 
-// PDF pages can be large (a single page may hold a full-page image or a big
-// text layer). Keep these caches bounded so a 100+ MB PDF cannot pin every
-// rendered page/iframe document in memory for the whole session.
+// Bounded because each cached HTML skeleton owns a Blob URL and each section
+// closure keeps a pdf.js page proxy alive. This does NOT cache iframe
+// documents, canvases, or rendered bitmaps; those are owned by the renderer.
 const PAGE_HTML_CACHE_LIMIT = 8;
 const PAGE_TEXT_CACHE_LIMIT = 16;
+
+const disposeCachedPage = (value) => {
+  if (value && typeof value.src === "string" && value.src.startsWith("blob:")) {
+    URL.revokeObjectURL(value.src);
+  }
+};
 
 const readCachedPage = (cache, key) => {
   const cached = cache.get(key);
@@ -617,27 +654,33 @@ const readCachedPage = (cache, key) => {
   return cached;
 };
 
-const writeCachedPage = (cache, key, value, limit) => {
-  cache.delete(key);
+const writeCachedPage = (cache, key, value, limit, onEvict) => {
+  if (cache.has(key)) {
+    const previous = cache.get(key);
+    cache.delete(key);
+    if (previous !== value) onEvict?.(previous);
+  }
   cache.set(key, value);
   while (cache.size > limit) {
     const oldest = cache.keys().next().value;
     if (oldest === undefined) break;
+    const evicted = cache.get(oldest);
     cache.delete(oldest);
+    onEvict?.(evicted);
   }
 };
 
 const loadPDFFromFile = async (file) => {
   const arrayBuffer = await file.arrayBuffer();
   return pdfjsLib.getDocument({
-    ...PDFJS_DOCUMENT_OPTIONS,
+    ...getPDFJSDocumentOptions(),
     data: new Uint8Array(arrayBuffer),
   }).promise;
 };
 
 const loadPDFFromURL = async (url) =>
   pdfjsLib.getDocument({
-    ...PDFJS_DOCUMENT_OPTIONS,
+    ...getPDFJSDocumentOptions(),
     url,
     rangeChunkSize: 65536,
     disableAutoFetch: true,
@@ -758,7 +801,7 @@ async function _buildPDFBook(pdf, fileName) {
       const cached = readCachedPage(cache, i);
       if (cached !== undefined) return cached;
       const result = await renderPage(await pdf.getPage(i + 1));
-      writeCachedPage(cache, i, result, PAGE_HTML_CACHE_LIMIT);
+      writeCachedPage(cache, i, result, PAGE_HTML_CACHE_LIMIT, disposeCachedPage);
       return result;
     },
     createDocument: async () => {
@@ -809,7 +852,12 @@ async function _buildPDFBook(pdf, fileName) {
   };
   book.getTOCFragment = (doc) => doc.documentElement;
   book.getCover = async () => renderPageAsBlob(await pdf.getPage(1));
-  book.destroy = () => pdf.destroy();
+  book.destroy = () => {
+    for (const value of cache.values()) disposeCachedPage(value);
+    cache.clear();
+    textDocumentCache.clear();
+    return pdf.destroy();
+  };
 
   return book;
 }

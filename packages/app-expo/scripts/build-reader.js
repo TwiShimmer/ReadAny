@@ -6,6 +6,7 @@
  */
 const esbuild = require("esbuild");
 const fs = require("node:fs");
+const { createRequire } = require("node:module");
 const path = require("node:path");
 
 const FOLIATE_DIR = path.resolve(__dirname, "../../foliate-js");
@@ -15,6 +16,20 @@ const TEMPLATE = path.resolve(ASSETS_DIR, "reader.template.html");
 const OUTPUT = path.resolve(ASSETS_DIR, "reader.html");
 
 async function buildReader() {
+  // Resolve the worker from foliate-js's own dependency tree so the mobile
+  // reader never mixes pdf.js API and worker versions (the root workspace has
+  // a newer pdfjs-dist than foliate-js).
+  const foliateRequire = createRequire(path.join(FOLIATE_DIR, "package.json"));
+  let workerModulePath;
+  try {
+    workerModulePath = foliateRequire.resolve("pdfjs-dist/build/pdf.worker.mjs");
+  } catch (error) {
+    throw new Error("Unable to resolve pdfjs-dist worker from packages/foliate-js", {
+      cause: error,
+    });
+  }
+  const normalizedWorkerPath = workerModulePath.replace(/\\/g, "/");
+
   // Create a temporary entry point
   const entryContent = `
     // Report the WebView's own UA (plus the full build via Client Hints —
@@ -41,7 +56,12 @@ async function buildReader() {
     import * as CFI from "${FOLIATE_DIR.replace(/\\/g, "/")}/epubcfi.js";
     import { configure, ZipReader, BlobReader, TextWriter, BlobWriter } from "${FOLIATE_DIR.replace(/\\/g, "/")}/vendor/zip.js";
     import { EPUB } from "${FOLIATE_DIR.replace(/\\/g, "/")}/epub.js";
-    import { extractPDFChapters, makePDFFromURL } from "${FOLIATE_DIR.replace(/\\/g, "/")}/pdf.js";
+    import { configurePDFWorker, extractPDFChapters, makePDFFromURL } from "${FOLIATE_DIR.replace(/\\/g, "/")}/pdf.js";
+    import { WorkerMessageHandler } from "${normalizedWorkerPath}";
+
+    // Mobile has no server-side worker bundle: configure pdf.js explicitly
+    // with the fake-worker handler instead of relying on vendored globals.
+    configurePDFWorker({ workerMessageHandler: WorkerMessageHandler });
 
     window.makeBook = makeBook;
     window.Overlayer = Overlayer;

@@ -13,7 +13,7 @@
  * Worker per document from `workerSrc` (rather than sharing a single
  * `workerPort`, which pdf.js destroys together with the first document).
  */
-import { GlobalWorkerOptions } from "pdfjs-dist";
+import { configurePDFWorker } from "foliate-js/pdf.js";
 import pdfWorkerUrl from "./pdf-worker-entry.ts?worker&url";
 
 let configured = false;
@@ -21,5 +21,7 @@ let configured = false;
 export function ensurePdfWorker(): void {
   if (configured) return;
   configured = true;
-  GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+  // `configurePDFWorker` also deletes any stale main-thread fake worker so
+  // this real worker cannot be shadowed.
+  configurePDFWorker({ workerSrc: pdfWorkerUrl });
 }
