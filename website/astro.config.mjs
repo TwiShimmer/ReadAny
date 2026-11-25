@@ -46,6 +46,7 @@ export default defineConfig({
           items: [
             { slug: "support/getting-started" },
             { slug: "support/installation" },
+            { slug: "support/requirements" },
             { slug: "support/import-books" },
           ],
         },

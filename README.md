@@ -16,6 +16,8 @@
   ReadAny helps you ask questions about books, find ideas by meaning, and build a private reading knowledge base with RAG chat, semantic search, highlights, TTS, and WebDAV sync.
 </p>
 
+> **ReadAny is a client-side reader and does not include a cloud service or WebDAV server.** Cross-device sync requires storage you provide: a WebDAV server (Nextcloud, Nutstore/Jianguoyun, or a self-hosted server such as wsgidav) or S3-compatible storage. See [WebDAV Sync](https://codedogqby.github.io/ReadAny/support/sync/webdav/) and [System Requirements & Known Limitations](https://codedogqby.github.io/ReadAny/support/requirements/).
+
 <p align="center">
   <a href="https://github.com/codedogQBY/ReadAny/releases/latest">
     <img src="https://img.shields.io/github/v/release/codedogQBY/ReadAny?color=blue&label=Download" alt="Release">
@@ -267,6 +269,10 @@ cd ReadAny
 
 # Install
 pnpm install
+
+# Build the bundled CLI first. Tauri packages packages/cli/dist as a runtime
+# resource, and a fresh checkout has no dist/ because it is gitignored.
+pnpm cli:build
 
 # Dev (Desktop)
 pnpm tauri dev
