@@ -19,6 +19,10 @@ concurrency:
 env:
   NODE_VERSION: "22"
   PNPM_VERSION: "9.15.0"
+  # onnxruntime-node's postinstall otherwise tries to download CUDA binaries
+  # from a URL that 404s on GitHub-hosted runners (no nvcc -> assumes CUDA 12).
+  # CPU inference does not need the CUDA execution provider.
+  ONNXRUNTIME_NODE_INSTALL_CUDA: skip
 
 jobs:
   lint:
