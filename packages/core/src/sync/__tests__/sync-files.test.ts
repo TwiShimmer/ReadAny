@@ -79,6 +79,7 @@ describe("sync-files", () => {
         filesDownloaded: 0,
         filesUploadFailed: 0,
         filesDownloadFailed: 0,
+        failures: [],
       });
     });
 
@@ -136,6 +137,34 @@ describe("sync-files", () => {
       expect(backend.put).not.toHaveBeenCalled();
     });
 
+    it("lets a streaming platform upload a 262 MB file without the buffered cap", async () => {
+      mockSelect.mockResolvedValue([
+        {
+          id: "book-1",
+          file_path: "books/book-1.pdf",
+          file_hash: "h1",
+          cover_url: null,
+          title: "Huge PDF",
+        },
+      ]);
+
+      mockAdapter.fileExists.mockResolvedValue(true);
+      mockAdapter.getFileSize.mockResolvedValue(262 * 1024 * 1024);
+
+      const backend = createMockBackend({
+        listDir: vi.fn().mockResolvedValue([]),
+        putFile: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const result = await syncFiles(backend);
+      expect(result.filesUploaded).toBe(1);
+      expect(result.filesUploadFailed).toBe(0);
+      expect(result.failures).toEqual([]);
+      expect(backend.putFile).toHaveBeenCalledTimes(1);
+      expect(mockAdapter.readFileBytes).not.toHaveBeenCalled();
+      expect(backend.put).not.toHaveBeenCalled();
+    });
+
     it("does not buffer oversized uploads when the platform sets a transfer limit", async () => {
       mockSelect.mockResolvedValue([
         {
@@ -158,6 +187,9 @@ describe("sync-files", () => {
       const result = await syncFiles(backend);
       expect(result.filesUploaded).toBe(0);
       expect(result.filesUploadFailed).toBe(1);
+      expect(result.failures[0]?.path).toContain("Huge Book.epub");
+      expect(result.failures[0]?.message).toContain("20.00 MB");
+      expect(result.failures[0]?.message).toContain("16.00 MB");
       expect(mockAdapter.readFileBytes).not.toHaveBeenCalled();
       expect(backend.put).not.toHaveBeenCalled();
     });
@@ -184,8 +216,40 @@ describe("sync-files", () => {
       const result = await syncFiles(backend);
       expect(result.filesUploaded).toBe(0);
       expect(result.filesUploadFailed).toBe(1);
+      expect(result.failures[0]?.path).toContain("Huge PDF.pdf");
+      expect(result.failures[0]?.message).toContain("262.00 MB");
+      expect(result.failures[0]?.message).toContain("256.00 MB");
       expect(mockAdapter.readFileBytes).not.toHaveBeenCalled();
       expect(backend.put).not.toHaveBeenCalled();
+    });
+
+    it("reports the first upload failure with path, message and status", async () => {
+      mockSelect.mockResolvedValue([
+        {
+          id: "book-1",
+          file_path: "books/book-1.epub",
+          file_hash: "h1",
+          cover_url: null,
+          title: "Denied Book",
+        },
+      ]);
+
+      mockAdapter.fileExists.mockResolvedValue(true);
+      const denied = Object.assign(new Error("WebDAV 访问被拒绝"), { status: 403 });
+      const backend = createMockBackend({
+        listDir: vi.fn().mockResolvedValue([]),
+        put: vi.fn().mockRejectedValue(denied),
+      });
+
+      const result = await syncFiles(backend);
+      expect(result.filesUploadFailed).toBe(1);
+      expect(result.failures).toEqual([
+        {
+          path: `${REMOTE_BOOKS_ROOT}/Denied Book-book-1/Denied Book.epub`,
+          message: "WebDAV 访问被拒绝",
+          status: 403,
+        },
+      ]);
     });
 
     it("migrates legacy files to the new layout via MOVE", async () => {

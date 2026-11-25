@@ -101,6 +101,7 @@ describe("WebDavBackend directory healing", () => {
       },
       uploadFile: async (url) => {
         uploads++;
+        calls.push({ method: "UPLOAD", url });
         if (uploads === 1) {
           throw new FileTransferError("File upload failed: 409", { status: 409, url });
         }
@@ -124,33 +125,32 @@ describe("WebDavBackend directory healing", () => {
           call.method === "MKCOL" && call.url.endsWith("/readany/data/books/Book-1/"),
       ),
     ).toBe(true);
+    expect(calls.findIndex((call) => call.method === "MKCOL")).toBeLessThan(
+      calls.findIndex((call) => call.method === "UPLOAD"),
+    );
   });
 
-  it("heals a localized 409 error by status instead of matching the message text", async () => {
+  it("does not add a second directory-heal layer on top of the client", async () => {
     const backend = new WebDavBackend(webDavConfig(), "secret");
     const putSpy = vi
       .spyOn(WebDavClient.prototype, "put")
       .mockRejectedValueOnce(
         new WebDavError("http", "WebDAV 请求失败（409 Conflict），父集合不存在。", { status: 409 }),
-      )
-      .mockResolvedValueOnce(undefined);
-    const ensureSpy = vi
-      .spyOn(WebDavClient.prototype, "ensureDirectory")
-      .mockResolvedValueOnce(undefined);
+      );
 
-    let ensuredPath: string | undefined;
+    let thrown: unknown;
     let putCalls = 0;
     try {
-      await backend.put("/readany/sync/device-abc.json", new Uint8Array([1]));
-      ensuredPath = ensureSpy.mock.calls[0]?.[0];
+      await backend.put("/readany/sync/device-abc.json", new Uint8Array([1])).catch((e) => {
+        thrown = e;
+      });
       putCalls = putSpy.mock.calls.length;
     } finally {
       putSpy.mockRestore();
-      ensureSpy.mockRestore();
     }
 
-    expect(ensuredPath).toBe("/readany/sync");
-    expect(putCalls).toBe(2);
+    expect(putCalls).toBe(1);
+    expect((thrown as WebDavError).status).toBe(409);
   });
 
   it("does not create legacy file/cover collections during ensureDirectories", async () => {
