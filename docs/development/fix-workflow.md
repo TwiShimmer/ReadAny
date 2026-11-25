@@ -30,6 +30,7 @@
 | `ci` | CI / workflow |
 | `chore` | 构建、脚本、依赖、规范 |
 | `refactor` | 不改变行为的重构 |
+| `style` | 纯格式化（仅用于预存债务文件） |
 
 常用 scope：`webdav`、`sync`、`pdf`、`onboarding`、`docs`、`release`、`dev`。
 
@@ -137,7 +138,7 @@ ci: add lint test typecheck gates
 `.github/workflows/ci.yml` 的四个 job 显示名固定为：
 
 1. `Lint (changed files)`
-2. `Test core`
+2. `Test core`（job 内同时运行 `pnpm --filter @readany/cli test`）
 3. `Typecheck app`
 4. `Cargo check (release features)`
 

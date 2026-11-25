@@ -84,6 +84,16 @@
 | 版本文案一致 | `pnpm version:check` | 仓库版本文件 | `lint`（发布前也手动跑） |
 | 文档链接与命令真实存在 | `docs/development/*` | 人工检查 | PR review |
 
+### 变更门禁手工验证记录（每次改 `lint-changed.mjs` 时填写）
+
+| 场景 | 操作 | 期望 | 实际 |
+| --- | --- | --- | --- |
+| 重命名 | `git mv a.ts b.ts` | 新路径 `b.ts` 被检查（`--no-renames`，重命名视为 A+D） | 已验证：`git mv scripts/invert-svg.js "scripts/invert svg 测试.js"` 后新路径被检查 |
+| 删除 | `git rm c.ts` | 删除文件不参与 lint，脚本不报错 | 已验证：`git rm scripts/bump-version.js` 后脚本退出 0（D 被 ACMR 过滤），随后已恢复文件 |
+| 中文名 | 新建 `测试 文件.ts` | 路径原样传给 Biome，不被转义或丢弃 | 已验证：临时文件被计入并通过 |
+| 空格名 | 新建 `lint path test.ts` | 不被拆参，作为一个完整参数处理 | 已验证：`lint path 测试.ts` 被计入并通过 |
+| 被忽略目录 | 在 `packages/foliate-js/` 新建 `.js` | Biome 跳过，脚本退出 0（`--no-errors-on-unmatched`） | 已验证：退出 0 |
+
 ### T6 增量同步与结构
 
 | 测什么 | 测试文件 | fixture / mock | CI job |
@@ -107,17 +117,6 @@
 8. **错误边界不暴露原始异常**：页面只显示本地化提示，DOM 不含堆栈、内部路径、URL 凭据。
 
 ## 5. 测试数据与 fixture 规范
-
-### 5.1 变更门禁手工验证记录（每次改 `lint-changed.mjs` 时填写）
-
-| 场景 | 操作 | 期望 | 实际 |
-| --- | --- | --- | --- |
-| 重命名 | `git mv a.ts b.ts` | 新路径 `b.ts` 被检查（`--no-renames`，重命名视为 A+D） | 已验证：`git mv scripts/invert-svg.js "scripts/invert svg 测试.js"` 后新路径被检查 |
-| 删除 | `git rm c.ts` | 删除文件不参与 lint，脚本不报错 | |
-| 中文名 | 新建 `测试 文件.ts` | 路径原样传给 Biome，不被转义或丢弃 | 已验证：临时文件被计入并通过 |
-| 空格名 | 新建 `lint path test.ts` | 不被拆参，作为一个完整参数处理 | 已验证：`lint path 测试.ts` 被计入并通过 |
-| 被忽略目录 | 在 `packages/foliate-js/` 新建 `.js` | Biome 跳过，脚本退出 0（`--no-errors-on-unmatched`） | 已验证：退出 0 |
-
 
 - 目录：`packages/core/src/sync/__fixtures__/`（按需创建），小型 JSON fixture 可提交；**大二进制不提交**，在测试运行时生成。
 - 命名：`<场景>-<期望>.json`，例如 `manifest-missing-file.json`、`sync-index-minimal.json`。
