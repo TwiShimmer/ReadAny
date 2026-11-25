@@ -37,13 +37,17 @@ const DIRECTORY_PROBE_TIMEOUT_MS = 5_000;
 
 /**
  * Retry policy for transient HTTP failures (401-after-auth, 429, 5xx).
- * Backoff: 500ms → 1s → 2s. Network/timeout errors are NOT retried — they may
- * have consumed the full timeout already, so retrying would amplify latency.
- * Issue #195 motivated this: Chinese WebDAV providers (Jianguoyun, NAS) reject
- * with 401 under burst load even though credentials are valid.
+ * `RETRY_MAX_RETRIES = 3` means the initial request plus at most 3 retries
+ * (4 attempts total), with 500ms → 1s → 2s backoff. Network/timeout errors are
+ * NOT retried — they may have consumed the full timeout already, so retrying
+ * would amplify latency. Issue #195 motivated this: Chinese WebDAV providers
+ * (Jianguoyun, NAS) reject with 401 under burst load even though credentials
+ * are valid.
  */
-const RETRY_MAX_ATTEMPTS = 3;
+const RETRY_MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 500;
+/** Minimum pause between a failed PUT and the single directory/auth retry. */
+const UPLOAD_HEAL_DELAY_MS = 200;
 
 type WebDavErrorKind =
   | "auth"
@@ -105,10 +109,17 @@ function getParentCollectionPath(path: string): { parent: string; name: string }
 
 /**
  * Statuses real-world WebDAV servers return when the parent collection of a
- * PUT target is missing (or the probe claiming it exists was wrong).
+ * PUT target is missing (or the probe claiming it exists was wrong). 403 is
+ * deliberately excluded: it means permission/read-only/quota/WAF, and running
+ * MKCOL over every ancestor would hide that real cause.
  */
 function isMissingParentStatus(status: number | undefined): boolean {
-  return status === 403 || status === 404 || status === 409;
+  return status === 404 || status === 409;
+}
+
+function uploadHealDelay(): Promise<void> {
+  const jitter = Math.floor(Math.random() * 100);
+  return new Promise((resolve) => setTimeout(resolve, UPLOAD_HEAL_DELAY_MS + jitter));
 }
 
 function createHttpWebDavError(
@@ -251,6 +262,19 @@ function createRequestWebDavError(
   );
 }
 
+/**
+ * Keep the original PUT failure as the surfaced error; the directory-heal
+ * failure is diagnostic context, not the cause of the upload failure.
+ */
+function withHealCause(error: WebDavError, healError: unknown): WebDavError {
+  return new WebDavError(error.kind, error.message, {
+    status: error.status,
+    method: error.method,
+    url: error.url,
+    cause: healError,
+  });
+}
+
 export class WebDavClient {
   private baseUrl: string;
   private authHeader: string;
@@ -378,10 +402,10 @@ export class WebDavClient {
           return response;
         }
 
-        if (attempt < RETRY_MAX_ATTEMPTS && this.isTransientStatus(response.status)) {
+        if (attempt < RETRY_MAX_RETRIES && this.isTransientStatus(response.status)) {
           const delay = RETRY_BASE_DELAY_MS * 2 ** attempt;
           console.warn(
-            `[WebDAV] ${method} ${logPath} got ${response.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${RETRY_MAX_ATTEMPTS})`,
+            `[WebDAV] ${method} ${logPath} got ${response.status}, retrying in ${delay}ms (retry ${attempt + 1}/${RETRY_MAX_RETRIES})`,
           );
           await new Promise((resolve) => setTimeout(resolve, delay));
           continue;
@@ -448,9 +472,10 @@ export class WebDavClient {
       this.knownCollections.add(collectionPath);
       return;
     }
-    if (status === 301 || status === 405) {
-      // RFC 4918 §9.3: 405 means the resource already exists. Some gateways
-      // answer 301 for a collection URI instead; both mean "nothing to do".
+    if (status === 405) {
+      // RFC 4918 §9.3: the resource already exists. A bare 301 is NOT
+      // success: gateways often redirect to a login page and the following
+      // request would lose the body, so it must surface as a real error.
       this.knownCollections.add(collectionPath);
       return;
     }
@@ -473,7 +498,7 @@ export class WebDavClient {
   }
 
   /**
-   * MKCOL every path segment including the target, tolerating 301/405
+   * MKCOL every path segment including the target, tolerating 405
    * (already exists). Unlike ensureDirectory() this does not trust PROPFIND
    * probes — it is used on recovery paths where a probe has been proven wrong
    * (409 on a collection whose parent probe reports as existing) and for PUT
@@ -488,16 +513,11 @@ export class WebDavClient {
       const collectionPath = toCollectionPath(current);
       if (!options.force && this.knownCollections.has(collectionPath)) continue;
       let resp = await this.request("MKCOL", collectionPath);
-      if (
-        !resp.ok &&
-        resp.status !== 201 &&
-        resp.status !== 301 &&
-        resp.status !== 405
-      ) {
+      if (!resp.ok && resp.status !== 201 && resp.status !== 405) {
         // Some servers and gateways mishandle the trailing slash on MKCOL.
         resp = await this.request("MKCOL", current);
       }
-      if (resp.ok || resp.status === 201 || resp.status === 301 || resp.status === 405) {
+      if (resp.ok || resp.status === 201 || resp.status === 405) {
         this.knownCollections.add(collectionPath);
         continue;
       }
@@ -510,6 +530,16 @@ export class WebDavClient {
       }
       throw this.createStatusError("MKCOL", current, resp);
     }
+  }
+
+  /**
+   * Recreate a collection after the server disproved our cached "it exists"
+   * belief. Only this segment is retried; an MKCOL 409 self-heals the missing
+   * ancestors through mkcolChain().
+   */
+  private async recreateCollection(path: string): Promise<void> {
+    this.knownCollections.delete(toCollectionPath(path));
+    await this.mkcol(path);
   }
 
   /** Ensure a full directory path exists (creates each segment) */
@@ -546,15 +576,21 @@ export class WebDavClient {
     if (!resp.ok && isMissingParentStatus(resp.status)) {
       // PUT never creates parent collections. First upload into a directory
       // that doesn't exist yet (e.g. /readany/sync on a fresh WebDAV account)
-      // fails with 404 on many servers and 409 on the rest — force-create the
-      // parent chain and retry once so every upload path (put/putJSON/…)
-      // self-heals instead of bubbling a 404 to the UI.
+      // fails with 404 on many servers and 409 on the rest — recreate the
+      // parent collection and retry once. Only one heal layer exists: the
+      // backend must not repeat it.
       const parent = getParentCollectionPath(path)?.parent;
       if (parent && parent !== "/") {
+        const putError = this.createStatusError("PUT", path, resp);
         console.warn(
-          `[WebDAV] PUT ${path} got ${resp.status}; ensuring parent collection and retrying once`,
+          `[WebDAV] PUT ${path} got ${resp.status}; recreating parent collection and retrying once`,
         );
-        await this.mkcolChain(parent, { force: true });
+        try {
+          await uploadHealDelay();
+          await this.recreateCollection(parent);
+        } catch (healError) {
+          throw withHealCause(putError, healError);
+        }
         resp = await this.request("PUT", path, {
           body: data,
           contentType,
@@ -578,7 +614,9 @@ export class WebDavClient {
     onProgress?: (loaded: number, total: number) => void,
   ): Promise<void> {
     const platform = getPlatformService();
-    const uploadFile = platform.uploadFile;
+    // `.bind(platform)` keeps the adapter's `this`; a bare detached function
+    // breaks adapters that read instance state.
+    const uploadFile = platform.uploadFile?.bind(platform);
     if (!uploadFile) {
       throw new Error("Platform does not support direct file upload");
     }
@@ -586,11 +624,22 @@ export class WebDavClient {
     const url = this.buildUrl(path);
     const logPath = path.startsWith("/") ? path : `/${path}`;
     const parent = getParentCollectionPath(path)?.parent;
+
+    // Best effort: some servers reject MKCOL for an existing collection with
+    // 401/403/405 but still accept the PUT. Creating the directory must never
+    // block an upload that used to work.
     if (parent && parent !== "/") {
-      await this.ensureDirectory(parent);
+      try {
+        await this.ensureDirectory(parent);
+      } catch (error) {
+        console.warn(
+          `[WebDAV] ensureDirectory ${parent} failed before upload; trying PUT anyway:`,
+          error,
+        );
+      }
     }
 
-    const upload = async (): Promise<void> => {
+    const uploadOnce = async (): Promise<void> => {
       const startTime = Date.now();
       console.log(`[WebDAV] PUT ${logPath} (file upload)`);
       try {
@@ -609,28 +658,56 @@ export class WebDavClient {
       console.log(`[WebDAV] PUT ${logPath} completed in ${Date.now() - startTime}ms`);
     };
 
-    try {
-      await upload();
-    } catch (error) {
-      if (
-        !(error instanceof WebDavError) ||
-        !isMissingParentStatus(error.status) ||
-        !parent ||
-        parent === "/"
-      ) {
+    // At most 2 streamed PUT attempts: one transient-401 retry or one
+    // directory heal. Rust may retry transient failures inside each attempt.
+    let authRetried = false;
+    let parentHealed = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await uploadOnce();
+        return;
+      } catch (error) {
+        if (!(error instanceof WebDavError)) throw error;
+        const isLastAttempt = attempt === 1;
+
+        if (!isLastAttempt && error.status === 401 && this.hadAuthSuccess && !authRetried) {
+          authRetried = true;
+          console.warn(
+            `[WebDAV] PUT ${path} got 401 after successful auth; retrying once with backoff`,
+          );
+          await uploadHealDelay();
+          continue;
+        }
+
+        if (
+          !isLastAttempt &&
+          isMissingParentStatus(error.status) &&
+          parent &&
+          parent !== "/" &&
+          !parentHealed
+        ) {
+          parentHealed = true;
+          console.warn(
+            `[WebDAV] PUT ${path} got ${error.status}; recreating parent collection and retrying once`,
+          );
+          try {
+            await uploadHealDelay();
+            await this.recreateCollection(parent);
+          } catch (healError) {
+            throw withHealCause(error, healError);
+          }
+          continue;
+        }
+
         throw error;
       }
-      console.warn(
-        `[WebDAV] PUT ${path} got ${error.status}; forcing parent collection and retrying once`,
-      );
-      await this.mkcolChain(parent, { force: true });
-      await upload();
     }
   }
 
   private toWebDavTransferError(error: unknown, method: string, url: string): WebDavError {
     if (error instanceof FileTransferError) {
-      if (error.status !== undefined) {
+      // A zero/absent status means the request never reached the server.
+      if (error.status !== undefined && error.status > 0) {
         return createHttpWebDavError(error.status, undefined, method, url);
       }
       return new WebDavError("network", error.message, {
@@ -661,22 +738,26 @@ export class WebDavClient {
    * `status`/`kind` drive every retry and not-found decision.
    */
   private createStatusError(method: string, path: string, resp: Response): WebDavError {
-    const kind: WebDavErrorKind =
-      resp.status === 401
-        ? "auth"
-        : resp.status === 403
-          ? "forbidden"
-          : resp.status === 404
-            ? "not-found"
-            : resp.status === 405
-              ? "method-not-allowed"
-              : resp.status >= 500
-                ? "server"
-                : "http";
+    const url = this.buildUrl(path);
+    if (
+      resp.status === 401 ||
+      resp.status === 403 ||
+      resp.status === 404 ||
+      resp.status === 405
+    ) {
+      const httpError = createHttpWebDavError(resp.status, resp.statusText, method, url);
+      return new WebDavError(
+        httpError.kind,
+        `${httpError.message} (${method} ${path})`,
+        { status: resp.status, method, url },
+      );
+    }
+
+    const kind: WebDavErrorKind = resp.status >= 500 ? "server" : "http";
     return new WebDavError(
       kind,
       `WebDAV ${method} failed for ${path}: ${resp.status} ${resp.statusText || ""}`,
-      { status: resp.status, method, url: this.buildUrl(path) },
+      { status: resp.status, method, url },
     );
   }
 
@@ -756,11 +837,15 @@ export class WebDavClient {
     const logPath = path.startsWith("/") ? path : `/${path}`;
     console.log(`[WebDAV] GET ${logPath} (file download)`);
     const startTime = Date.now();
-    await platform.downloadFile(url, localFilePath, {
-      headers: this.getAuthHeaders(),
-      allowInsecure: this.allowInsecure,
-      onProgress,
-    });
+    try {
+      await platform.downloadFile(url, localFilePath, {
+        headers: this.getAuthHeaders(),
+        allowInsecure: this.allowInsecure,
+        onProgress,
+      });
+    } catch (error) {
+      throw this.toWebDavTransferError(error, "GET", url);
+    }
     this.hadAuthSuccess = true;
     console.log(`[WebDAV] GET ${logPath} completed in ${Date.now() - startTime}ms`);
   }
@@ -824,18 +909,19 @@ export class WebDavClient {
     }
   }
 
-  /** Check if a resource exists (try HEAD first, fallback to PROPFIND Depth 0) */
+  /**
+   * Check if a resource exists. Returns false only for a confirmed 404/410;
+   * auth/permission/network failures propagate so callers never delete or
+   * overwrite remote data based on an unknowable state.
+   */
   async exists(path: string): Promise<boolean> {
-    try {
-      const resp = await this.request("HEAD", path);
-      if (resp.ok) return true;
-      if (resp.status === 405) {
-        return await this.propfindExists(path);
-      }
-      return false;
-    } catch {
-      return false;
+    const resp = await this.request("HEAD", path);
+    if (resp.ok) return true;
+    if (resp.status === 404 || resp.status === 410) return false;
+    if (resp.status === 405) {
+      return await this.propfindExistsStrict(path);
     }
+    throw this.createStatusError("HEAD", path, resp);
   }
 
   /** PROPFIND Depth 0 to check if a resource exists */
@@ -855,6 +941,20 @@ export class WebDavClient {
     } catch {
       return false;
     }
+  }
+
+  private async propfindExistsStrict(path: string): Promise<boolean> {
+    const resp = await this.request("PROPFIND", path, {
+      headers: { Depth: "0" },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
+      contentType: "application/xml",
+    });
+    if (resp.ok || resp.status === 207) {
+      this.knownCollections.add(toCollectionPath(path));
+      return true;
+    }
+    if (resp.status === 404 || resp.status === 410) return false;
+    throw this.createStatusError("PROPFIND", path, resp);
   }
 
   private async parentListingContainsCollection(path: string): Promise<boolean> {

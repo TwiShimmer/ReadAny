@@ -15,6 +15,7 @@ import {
   sanitizeBookTitleForFs,
 } from "./sync-naming";
 import { REMOTE_BOOKS_ROOT } from "./sync-types";
+import { WebDavError } from "./webdav-client";
 import { collectChanges, type DeviceSyncPayload } from "./simple-sync";
 
 const LAN_SYNC_DIR = "/readany/sync";
@@ -122,9 +123,7 @@ class LocalFsBackend implements ISyncBackend {
       const snapshot = await this.getCurrentDeviceSnapshot();
       const expectedPath = getLanDeviceSnapshotPath(snapshot.deviceId);
       if (path !== expectedPath) {
-        const err = new Error("File not found");
-        (err as any).statusCode = 404;
-        throw err;
+        throw new WebDavError("not-found", "File not found", { status: 404, method: "GET" });
       }
       return new TextEncoder().encode(JSON.stringify(snapshot));
     }
@@ -150,9 +149,10 @@ class LocalFsBackend implements ISyncBackend {
     }
 
     if (!(await adapter.fileExists(resolvedPath))) {
-      const err = new Error("File not found");
-      (err as any).statusCode = 404;
-      throw err;
+      throw new WebDavError("not-found", "File not found", {
+        status: 404,
+        method: "GET",
+      });
     }
     
     try {
@@ -511,10 +511,8 @@ export class LANServer {
             },
           };
         } catch (e) {
-          const error = e instanceof Error ? e.message : String(e);
-          const statusCode = (e as any).statusCode || 500;
-          if (statusCode === 404 || error.includes("File not found")) {
-             return { status: 404, body: new TextEncoder().encode("Not Found") };
+          if (e instanceof WebDavError && e.status === 404) {
+            return { status: 404, body: new TextEncoder().encode("Not Found") };
           }
           throw e;
         }

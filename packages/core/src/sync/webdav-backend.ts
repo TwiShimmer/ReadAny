@@ -10,7 +10,7 @@ import {
   type WebDavConfig,
 } from "./sync-backend";
 import { REMOTE_BOOKS_ROOT, REMOTE_DATA } from "./sync-types";
-import { WebDavClient, WebDavError, sanitizeWebDavRemoteRoot } from "./webdav-client";
+import { WebDavClient, sanitizeWebDavRemoteRoot } from "./webdav-client";
 
 /**
  * WebDAV backend implementation.
@@ -81,34 +81,10 @@ export class WebDavBackend implements ISyncBackend {
     this.directoriesEnsured = true;
   }
 
-  /**
-   * Some WebDAV servers (Synology, QNAP, 飞牛, etc.) return 403/404/409 when
-   * PUT-ing into a directory that doesn't exist yet. Ensure the parent and
-   * retry once — most uploads land on an existing dir, so this catch path
-   * only fires for first-time uploads into a brand-new folder. Shared by
-   * every upload entry point (put/putFile/putJSON) so no caller can bypass it.
-   */
-  private async putWithDirectoryHeal(
-    path: string,
-    write: (resolvedPath: string) => Promise<void>,
-  ): Promise<void> {
-    const resolved = this.resolvePath(path);
-    try {
-      await write(resolved);
-    } catch (e) {
-      // Branch on the structured status; message text is localized and may
-      // also contain unrelated numbers (e.g. a path called "/404").
-      const status = e instanceof WebDavError ? e.status : undefined;
-      if (status !== 403 && status !== 404 && status !== 409) throw e;
-      const parent = resolved.substring(0, resolved.lastIndexOf("/"));
-      if (!parent || parent === "/") throw e;
-      await this.client.ensureDirectory(parent);
-      await write(resolved);
-    }
-  }
-
+  // Directory self-healing lives in WebDavClient.put()/putFile() only. Keeping
+  // a second layer here doubled PUT attempts on every transient failure.
   async put(path: string, data: Uint8Array): Promise<void> {
-    await this.putWithDirectoryHeal(path, (resolved) => this.client.put(resolved, data));
+    await this.client.put(this.resolvePath(path), data);
   }
 
   async putFile(
@@ -116,9 +92,7 @@ export class WebDavBackend implements ISyncBackend {
     localFilePath: string,
     onProgress?: (loaded: number, total: number) => void,
   ): Promise<void> {
-    await this.putWithDirectoryHeal(path, (resolved) =>
-      this.client.putFile(resolved, localFilePath, onProgress),
-    );
+    await this.client.putFile(this.resolvePath(path), localFilePath, onProgress);
   }
 
   async get(path: string): Promise<Uint8Array> {
@@ -145,11 +119,8 @@ export class WebDavBackend implements ISyncBackend {
   }
 
   async putJSON<T>(path: string, data: T): Promise<void> {
-    // Must go through the shared heal path: this is how device snapshots and
-    // the file manifest get written, and a missing /readany/sync used to
-    // surface here as "WebDAV PUT failed … 404" because client.putJSON
-    // bypassed the retry that put()/putFile() had.
-    await this.putWithDirectoryHeal(path, (resolved) => this.client.putJSON(resolved, data));
+    // client.putJSON() delegates to put(), which owns the single heal layer.
+    await this.client.putJSON(this.resolvePath(path), data);
   }
 
   async listDir(path: string): Promise<RemoteFile[]> {
