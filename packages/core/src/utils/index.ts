@@ -1,5 +1,12 @@
 export { formatWebviewInfo, parseWebviewInfo } from "./webview-info";
 export type { WebviewInfo } from "./webview-info";
+export {
+  findMissingMapUpsertApis,
+  installMapUpsertPolyfill,
+  installModernMapPolyfills,
+  installWeakMapUpsertPolyfill,
+} from "./modern-map";
+export type { MapUpsertMethod, ModernMapInstallResult } from "./modern-map";
 export { cn } from "./cn";
 export { debounce } from "./debounce";
 export { throttle } from "./throttle";

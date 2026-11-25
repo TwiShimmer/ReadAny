@@ -164,6 +164,10 @@ export class DocumentLoader {
           await markImageOnlyEpubAsFixedLayout(book);
         }
       } else if (await this.isPDF()) {
+        // Must run before foliate-js/pdf.js imports pdf.js: the worker URL is
+        // bundled and polyfill-patched (see lib/pdf/pdf-worker.ts).
+        const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
+        ensurePdfWorker();
         const { makePDF } = await import("foliate-js/pdf.js");
         book = await makePDF(this.file);
         format = "PDF";

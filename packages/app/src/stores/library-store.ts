@@ -166,10 +166,9 @@ export async function extractEpubMetadata(blob: Blob): Promise<EpubMeta> {
  * Accepts either raw bytes or a file path (avoids loading large PDFs into memory). */
 async function generatePdfCover(source: Uint8Array | string): Promise<Blob | null> {
   try {
+    const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
+    ensurePdfWorker();
     const pdfjsLib = await import("pdfjs-dist");
-
-    // Always set worker to match the API version
-    pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
 
     const pdfSource =
       typeof source === "string"
@@ -1008,8 +1007,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
               }
               // PDF title: try extracting from PDF metadata
               try {
+                const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
+                ensurePdfWorker();
                 const pdfjsLib = await import("pdfjs-dist");
-                pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
                 const pdfDoc = await pdfjsLib.getDocument({
                   url: pdfUrl,
                   useWorkerFetch: false,
