@@ -17,6 +17,7 @@
  */
 import { ChatPage as ChatPageComponent } from "@/components/chat/ChatPage";
 import { CommandPalette } from "@/components/command-palette/CommandPalette";
+import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { EpubDraftWorkspace } from "@/components/epub-draft/EpubDraftWorkspace";
 import { HomePage } from "@/components/home/HomePage";
 import { NotesPage } from "@/components/notes/NotesPage";
@@ -392,7 +393,9 @@ export function AppLayout() {
                   t={t}
                 />
               ) : (
-                <ReaderView bookId={tab.bookId} tabId={tab.id} />
+                <ErrorBoundary scope="reader" resetKey={tab.id} context={`bookId=${tab.bookId}`}>
+                  <ReaderView bookId={tab.bookId} tabId={tab.id} />
+                </ErrorBoundary>
               )}
             </div>
           );

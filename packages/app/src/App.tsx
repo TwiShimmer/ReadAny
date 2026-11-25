@@ -2,6 +2,7 @@
  * App — Tab-driven layout. No react-router page switching.
  * All opened tabs stay mounted; visibility controlled by CSS display.
  */
+import { RuntimeCompatibilityBanner } from "@/components/common/RuntimeCompatibilityBanner";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { ContextMenu } from "@/components/layout/ContextMenu";
 import { UpdateNotification } from "@/components/layout/UpdateNotification";
@@ -22,6 +23,7 @@ export default function App() {
       <Toaster position="top-center" richColors duration={2000} />
       <UpdateNotification />
       <ContextMenu />
+      <RuntimeCompatibilityBanner />
     </>
   );
 }

@@ -7,6 +7,7 @@ import { initI18nLanguage } from "@readany/core/i18n";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { AppErrorBoundary } from "./components/common/ErrorBoundary";
 import "./styles/globals.css";
 import { setEmbeddingWorkerFactory, setStreamingFetch } from "@readany/core/ai";
 import { onLibraryChanged } from "@readany/core/events/library-events";
@@ -179,7 +180,9 @@ i18nReady.then(() => {
 
   createRoot(rootElement).render(
     <StrictMode>
-      <App />
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>
     </StrictMode>,
   );
 });

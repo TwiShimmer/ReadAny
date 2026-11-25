@@ -17,10 +17,12 @@ import { ReadSettingsPanel } from "@/components/settings/ReadSettings";
 import { useReadingSession } from "@/hooks/use-reading-session";
 import { useResizablePanel } from "@/hooks/use-resizable-panel";
 import { useResolvedSrc } from "@/hooks/use-resolved-src";
+import { copyErrorDiagnostics } from "@/lib/diagnostics";
 import { hasSeenReaderTour, startReaderTour } from "@/lib/reader-tour";
 import { DocumentLoader } from "@/lib/reader/document-loader";
 import type { BookDoc, BookFormat } from "@/lib/reader/document-loader";
 import { isFixedLayoutBook } from "@/lib/reader/document-loader";
+import { confirmLargePdfOpen } from "@/lib/reader/large-pdf-guard";
 import { resolveDesktopDataPath } from "@/lib/storage/desktop-library-root";
 import { useAnnotationStore } from "@/stores/annotation-store";
 import { useAppStore } from "@/stores/app-store";
@@ -31,6 +33,7 @@ import { useReaderStore } from "@/stores/reader-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useTTSStore } from "@/stores/tts-store";
 import { useChapterTranslation } from "@readany/core/hooks";
+import i18n from "@readany/core/i18n";
 import { getPlatformService } from "@readany/core/services";
 import { getCSSFontFace, useFontStore, useReadingSessionStore } from "@readany/core/stores";
 import { useRubyStore } from "@readany/core/stores/ruby-store";
@@ -190,12 +193,16 @@ function getAdjacentTTSSectionIndex(
  */
 async function loadAndParseBook(
   filePath: string,
-): Promise<{ bookDoc: BookDoc; format: BookFormat }> {
+): Promise<{ bookDoc: BookDoc; format: BookFormat } | null> {
   console.log("[loadAndParseBook] start, filePath:", filePath);
   const blob = await getCachedBlob(filePath);
   console.log("[loadAndParseBook] blob loaded, size:", blob.size);
 
   const fileName = filePath.split("/").pop() || "book.epub";
+  if (!(await confirmLargePdfOpen(fileName, blob.size))) {
+    return null;
+  }
+
   const file = new File([blob], fileName, {
     type: blob.type || "application/octet-stream",
   });
@@ -766,6 +773,8 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   const isFixedLayout = isFixedLayoutBook(bookFormat, bookDoc);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Full error object stays out of the UI but is available to "Copy diagnostics".
+  const lastLoadErrorRef = useRef<unknown>(null);
 
   useEffect(() => {
     currentSectionTotalRef.current = currentSectionTotal ?? bookDoc?.sections?.length ?? null;
@@ -1057,19 +1066,37 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   // --- Load book on mount ---
   useEffect(() => {
-    if (!book?.filePath || isInitializedRef.current) return;
+    const filePath = book?.filePath;
+    if (!filePath || isInitializedRef.current) return;
     isInitializedRef.current = true;
 
     const initBook = async () => {
       try {
         setIsLoading(true);
         setError(null);
-        const { bookDoc, format } = await loadAndParseBook(book.filePath!);
-        setBookDoc(bookDoc);
-        setBookFormat(format);
+        lastLoadErrorRef.current = null;
+        const parsed = await loadAndParseBook(filePath);
+        if (!parsed) {
+          // The user declined the large-PDF confirmation. Keep the library
+          // untouched and close the tab instead of showing a fake error.
+          setIsLoading(false);
+          toast.info(
+            i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
+          );
+          closeAppTab(tabId);
+          removeReaderTab(tabId);
+          return;
+        }
+        setBookDoc(parsed.bookDoc);
+        setBookFormat(parsed.format);
       } catch (err) {
         console.error("[ReaderView] Failed to load book:", err);
-        setError(err instanceof Error ? err.message : "Failed to load book");
+        lastLoadErrorRef.current = err;
+        setError(
+          i18n.t("reader.loadFailedMessage", {
+            defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
+          }),
+        );
         setIsLoading(false);
       }
     };
@@ -1079,7 +1106,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     return () => {
       isInitializedRef.current = false;
     };
-  }, [book?.filePath]);
+  }, [book?.filePath, tabId, closeAppTab, removeReaderTab]);
 
   useEffect(() => {
     return eventBus.on("sync:completed", () => {
@@ -1214,11 +1241,8 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       setIsLoading(true);
     } catch (err) {
       console.error("[ReaderView] Failed to re-import missing book:", err);
-      setError(
-        err instanceof Error
-          ? err.message
-          : t("reader.reimportFailed", "重新导入失败，请稍后再试。"),
-      );
+      lastLoadErrorRef.current = err;
+      setError(t("reader.reimportFailed", "重新导入失败，请稍后再试。"));
     } finally {
       setIsReimporting(false);
     }
@@ -1431,10 +1455,19 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     [highlights, bookId, chapterTranslation.reset],
   );
 
-  const handleError = useCallback((err: Error) => {
-    setError(err.message);
-    setIsLoading(false);
-  }, []);
+  const handleError = useCallback(
+    (err: Error) => {
+      console.error("[ReaderView] Renderer error:", err);
+      lastLoadErrorRef.current = err;
+      setError(
+        t("reader.loadFailedMessage", {
+          defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
+        }),
+      );
+      setIsLoading(false);
+    },
+    [t],
+  );
 
   // Sync chapter translation visibility with DOM
   useEffect(() => {
@@ -2970,13 +3003,30 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                         setBookDoc(null);
                         setIsLoading(true);
                         loadAndParseBook(book.filePath)
-                          .then(({ bookDoc, format }) => {
-                            setBookDoc(bookDoc);
-                            setBookFormat(format);
+                          .then((parsed) => {
+                            if (!parsed) {
+                              setIsLoading(false);
+                              toast.info(
+                                t("reader.largePdf.cancelled", {
+                                  defaultValue: "Large PDF was not opened.",
+                                }),
+                              );
+                              return;
+                            }
+                            lastLoadErrorRef.current = null;
+                            setBookDoc(parsed.bookDoc);
+                            setBookFormat(parsed.format);
                             isInitializedRef.current = true;
                           })
                           .catch((err) => {
-                            setError(err instanceof Error ? err.message : "Failed");
+                            console.error("[ReaderView] Retry failed:", err);
+                            lastLoadErrorRef.current = err;
+                            setError(
+                              t("reader.loadFailedMessage", {
+                                defaultValue:
+                                  "This book could not be opened. The file may be damaged or unsupported.",
+                              }),
+                            );
                             setIsLoading(false);
                           });
                       }}
@@ -2992,6 +3042,23 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                       {t("common.back", "返回")}
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="rounded-lg border border-border bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-muted"
+                    onClick={() => {
+                      void copyErrorDiagnostics(lastLoadErrorRef.current, {
+                        scope: "reader",
+                        context: `bookId=${bookId}`,
+                      })
+                        .then(() => toast.success(t("reader.errorBoundary.copied")))
+                        .catch((copyError) => {
+                          console.error("[ReaderView] Failed to copy diagnostics:", copyError);
+                          toast.error(t("reader.errorBoundary.copyFailed"));
+                        });
+                    }}
+                  >
+                    {t("reader.errorBoundary.copyDiagnostics")}
+                  </button>
                   <button
                     type="button"
                     className="rounded-lg border border-border bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"

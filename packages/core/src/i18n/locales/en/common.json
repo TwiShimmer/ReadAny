@@ -78,5 +78,10 @@
     "enterFullscreen": "Enter Fullscreen",
     "exitFullscreen": "Exit Fullscreen",
     "close": "Close"
+  },
+  "runtime": {
+    "minRuntimeTitle": "Your system component is too old for PDF rendering",
+    "minRuntimeDescription": "ReadAny could not enable the required PDF features in the embedded browser. Update the Microsoft Edge WebView2 Runtime (or your system WebView), then restart ReadAny.",
+    "downloadWebView2": "Download WebView2 Runtime"
   }
 }

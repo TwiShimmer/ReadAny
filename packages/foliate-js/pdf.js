@@ -4,12 +4,11 @@
  * Uses PDF.js TextLayer for text selection support.
  */
 import * as pdfjsLib from "pdfjs-dist";
-import { WorkerMessageHandler } from "pdfjs-dist/build/pdf.worker.mjs";
 
-globalThis.pdfjsWorker ??= { WorkerMessageHandler };
-
-// Configure PDF.js worker — always set to match the API version
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
+// The host app configures a bundled, polyfilled worker via
+// `lib/pdf/pdf-worker.ts` before calling makePDF(). Do not install a
+// main-thread fake worker here: it would shadow the real worker and re-expose
+// old WebView2 builds to pdf.js's modern Map APIs.
 const PDFJS_CDN_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}`;
 const PDFJS_DOCUMENT_OPTIONS = {
   useWorkerFetch: false,
@@ -603,6 +602,31 @@ const createPageTextDocument = async (page, pageNumber) => {
 
 const fakePageCfi = (pageIndex) => `epubcfi(/6/${(pageIndex + 1) * 2})`;
 
+// PDF pages can be large (a single page may hold a full-page image or a big
+// text layer). Keep these caches bounded so a 100+ MB PDF cannot pin every
+// rendered page/iframe document in memory for the whole session.
+const PAGE_HTML_CACHE_LIMIT = 8;
+const PAGE_TEXT_CACHE_LIMIT = 16;
+
+const readCachedPage = (cache, key) => {
+  const cached = cache.get(key);
+  if (cached === undefined) return undefined;
+  // Refresh insertion order so this is a small LRU rather than FIFO.
+  cache.delete(key);
+  cache.set(key, cached);
+  return cached;
+};
+
+const writeCachedPage = (cache, key, value, limit) => {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+};
+
 const loadPDFFromFile = async (file) => {
   const arrayBuffer = await file.arrayBuffer();
   return pdfjsLib.getDocument({
@@ -731,18 +755,18 @@ async function _buildPDFBook(pdf, fileName) {
   book.sections = Array.from({ length: numPages }, (_, i) => ({
     id: i,
     load: async () => {
-      const cached = cache.get(i);
-      if (cached) return cached;
+      const cached = readCachedPage(cache, i);
+      if (cached !== undefined) return cached;
       const result = await renderPage(await pdf.getPage(i + 1));
-      cache.set(i, result);
+      writeCachedPage(cache, i, result, PAGE_HTML_CACHE_LIMIT);
       return result;
     },
     createDocument: async () => {
-      const cached = textDocumentCache.get(i);
-      if (cached) return cached.cloneNode(true);
+      const cached = readCachedPage(textDocumentCache, i);
+      if (cached !== undefined) return cached.cloneNode(true);
 
       const doc = await createPageTextDocument(await pdf.getPage(i + 1), i + 1);
-      textDocumentCache.set(i, doc);
+      writeCachedPage(textDocumentCache, i, doc, PAGE_TEXT_CACHE_LIMIT);
       return doc.cloneNode(true);
     },
     size: 1000,
