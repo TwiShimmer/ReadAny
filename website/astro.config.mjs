@@ -72,7 +72,11 @@ export default defineConfig({
         {
           label: "Sync & Export",
           translations: { "zh-CN": "同步与导出" },
-          items: [{ slug: "support/sync/webdav" }, { slug: "support/sync/s3" }, { slug: "support/sync/export-notes" }],
+          items: [
+            { slug: "support/sync/webdav" },
+            { slug: "support/sync/s3" },
+            { slug: "support/sync/export-notes" },
+          ],
         },
         {
           label: "FAQ",
