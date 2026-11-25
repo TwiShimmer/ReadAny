@@ -45,7 +45,7 @@ ci: add lint test typecheck gates
 要求：
 
 - **一个提交只做一件事**。格式化、重命名、逻辑修复不要塞进同一个提交。
-- 变更文件门禁会要求**整个文件**符合 Biome 格式；如果只是历史文件的行尾/格式问题被触发，单独提交 `style(<scope>): normalize formatting`，不要混进功能提交。
+- 触及**预存 lint 债务**文件时，允许并应当单独提交 `style: format <file>`，并在 PR 描述注明“本文件为预存债务格式化”；不要把整文件格式化混进功能提交。
 - 提交信息写“做了什么 + 为什么”，不要只写 `update`、`fix bug`。
 - 不提交生成物、`node_modules`、本地数据库、日志、真实凭据。
 - 不为了通过检查而批量格式化无关文件；Biome 只检查本次变更文件（见第 6 节）。
@@ -64,7 +64,7 @@ ci: add lint test typecheck gates
 
 1. 关联 issue 已填写，范围与验收标准对得上。
 2. 回归测试已先红后绿，命令与结果写进 PR 的“测试证据”。
-3. `pnpm lint:changed`、`pnpm --filter @readany/core test`、`pnpm --filter @readany/cli test`、`pnpm --filter app exec tsc --noEmit` 全部通过；涉及 Rust 时 `cargo check` 通过。
+3. `pnpm lint:changed`、`pnpm --filter @readany/core test`、`pnpm --filter @readany/cli test`、`pnpm --filter app exec tsc --noEmit` 全部通过；**CLI 测试以 Linux CI 为准**，Windows 已知平台限制见 `test-plan.md` §2；涉及 Rust 时 `cargo check` 通过。
 4. 自己完整看过一遍 diff，没有调试输出、临时文件、无关格式化。
 5. 涉及 UI / PDF / 移动端时，附截图或录屏。
 6. 风险与回滚方式已写明。
@@ -102,11 +102,11 @@ ci: add lint test typecheck gates
 - [ ] **回归测试先红后绿**：修复前能复现失败，修复后通过；测试名能说明场景。
 - [ ] `pnpm lint:changed` 通过（只检查相对 `origin/main` 的变更文件）。
 - [ ] `pnpm --filter app exec tsc --noEmit` 通过。
-- [ ] `pnpm --filter @readany/core test` 与 `pnpm --filter @readany/cli test` 通过；涉及 Rust 时 `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` 通过。
+- [ ] `pnpm --filter @readany/core test` 与 `pnpm --filter @readany/cli test` 通过（CLI 测试以 Linux CI 为准；Windows 平台限制见 `test-plan.md` §2）；涉及 Rust 时 `cargo check --manifest-path packages/app/src-tauri/Cargo.toml --features tauri/custom-protocol` 通过。
 - [ ] issue 已回填测试证据（命令 + 结果 + 手动验收）。
 - [ ] 文档同步：行为、配置、错误语义变化时更新对应 `docs/`。
 - [ ] 无密钥：diff、测试 fixture、issue、日志中都没有真实密码、token、内网地址。
-- [ ] 变更范围之外没有无关格式化或重构。
+- [ ] 不得对**未触碰**的文件做无关格式化；触碰预存债务文件时按第 2 节单独提交 `style:`。变更范围之外没有无关重构。
 
 ## 6. Lint 门禁与预存债务
 
@@ -131,6 +131,17 @@ ci: add lint test typecheck gates
 - 新增 `.gitattributes`（`* text=auto eol=lf`）只影响**后续检出**，不承诺一次性修完历史 CRLF 文件，也不执行全库 renormalize。
 - `biome.json` 只新增 `files.ignore`（第三方/内嵌代码、构建产物、`target`），不调整规则、不批量改代码。
 - Linux CI 检出为 LF；Windows 本地若因 `core.autocrlf` 出现 CRLF，**本地全量 lint 红 ≠ CI 红**，以 `lint:changed` 和 CI 结果为准。
+
+### 6.1 CI 必过检查（required checks）
+
+`.github/workflows/ci.yml` 的四个 job 显示名固定为：
+
+1. `Lint (changed files)`
+2. `Test core`
+3. `Typecheck app`
+4. `Cargo check (release features)`
+
+分支保护里配置 required checks 时使用上述显示名；修改 job 的 `name` 或 job id 必须同步检查分支保护，否则 required check 会一直 pending 或失效。
 
 ## 7. 与 upstream 同步
 

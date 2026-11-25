@@ -40,7 +40,7 @@ Closes #
 - [ ] `pnpm lint:changed` 通过（Biome 只检查本次变更文件）
 - [ ] `pnpm --filter app exec tsc --noEmit` 通过
 - [ ] `pnpm --filter @readany/core test` 通过
-- [ ] `pnpm --filter @readany/cli test` 通过
+- [ ] `pnpm --filter @readany/cli test` 通过（以 Linux CI 为准；Windows 平台限制见 `test-plan.md` §2）
 - [ ] 涉及 Rust 时 `cargo check --features tauri/custom-protocol` 通过（前置 `pnpm --filter @readany/cli build` 与 `pnpm --filter app build`）
 - [ ] 回归测试先红后绿，测试证据已写入本文
 - [ ] 无真实 WebDAV 密码、token、内网地址、个人路径
