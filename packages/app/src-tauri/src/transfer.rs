@@ -12,7 +12,11 @@ use tauri_plugin_http::reqwest;
 use tokio_util::io::ReaderStream;
 
 const TRANSFER_TIMEOUT_SECS: u64 = 300;
-const MAX_ATTEMPTS: u32 = 3;
+const CONNECT_TIMEOUT_SECS: u64 = 30;
+const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
+/// One retry only: the JS layer already retries a failed streamed upload once
+/// (401 or directory heal), so this bounds the combined worst case.
+const UPLOAD_MAX_ATTEMPTS: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
 
 /// Serialized to the webview as `{ status, message }` so the JS layer can
@@ -49,7 +53,11 @@ impl std::error::Error for TransferError {}
 
 fn build_client(allow_insecure: Option<bool>) -> Result<reqwest::Client, TransferError> {
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS));
+        .timeout(std::time::Duration::from_secs(TRANSFER_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        // WebDAV gateways redirect to login pages; following a redirect on PUT
+        // can turn a rejected upload into a 200 text/html "success".
+        .redirect(reqwest::redirect::Policy::none());
     if allow_insecure.unwrap_or(false) {
         builder = builder
             .danger_accept_invalid_certs(true)
@@ -87,6 +95,25 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
 
+fn redirect_error(
+    method: &reqwest::Method,
+    url: &str,
+    response: &reqwest::Response,
+) -> TransferError {
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<no Location header>");
+    TransferError::with_status(
+        status.as_u16(),
+        format!(
+            "WebDAV {method} for {url} was redirected to {location} ({status}); refusing to follow a redirect because the request body may be dropped"
+        ),
+    )
+}
+
 /// Same retry policy as the JS layer: retry transient failures (network
 /// errors, 429, 5xx) up to 3 times with exponential backoff; 4xx fails fast.
 async fn send_with_retry(
@@ -98,7 +125,7 @@ async fn send_with_retry(
     let mut last_error =
         TransferError::new(format!("WebDAV {method} failed for {url}: no attempt was made"));
 
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(retry_delay(attempt)).await;
         }
@@ -117,6 +144,9 @@ async fn send_with_retry(
         let status = response.status();
         if status.is_success() {
             return Ok(response);
+        }
+        if status.is_redirection() {
+            return Err(redirect_error(&method, url, &response));
         }
         let error = TransferError::with_status(
             status.as_u16(),
@@ -141,9 +171,10 @@ async fn upload_file_with_retry(
     headers: reqwest::header::HeaderMap,
     file_path: &str,
 ) -> Result<(), TransferError> {
-    let mut last_error = TransferError::new(format!("WebDAV PUT failed for {url}: no attempt was made"));
+    let mut last_error =
+        TransferError::new(format!("WebDAV PUT failed for {url}: no attempt was made"));
 
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..UPLOAD_MAX_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(retry_delay(attempt)).await;
         }
@@ -161,7 +192,10 @@ async fn upload_file_with_retry(
             .put(url)
             .headers(headers.clone())
             .header(reqwest::header::CONTENT_LENGTH, total)
-            .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
+            .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
+                file,
+                64 * 1024,
+            )))
             .send()
             .await;
 
@@ -177,6 +211,9 @@ async fn upload_file_with_retry(
         let status = response.status();
         if status.is_success() {
             return Ok(());
+        }
+        if status.is_redirection() {
+            return Err(redirect_error(&reqwest::Method::PUT, url, &response));
         }
         let error = TransferError::with_status(
             status.as_u16(),
