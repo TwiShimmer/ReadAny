@@ -1,4 +1,5 @@
 import { getPlatformService } from "../services";
+import { installModernMapPolyfills } from "../utils/modern-map";
 
 export type PdfPageSummary = {
   source: "pdf";
@@ -43,6 +44,9 @@ function clampContentLimit(value: number | undefined): number {
 async function loadPdfDocument(bytes: Uint8Array): Promise<{
   pdf: Awaited<ReturnType<PdfJsModule["getDocument"]>["promise"]>;
 }> {
+  // pdf.js 5.x uses Map.prototype.getOrInsertComputed while parsing. Node
+  // runtimes behind the CLI can be older than the Chromium that ships it.
+  installModernMapPolyfills();
   const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const loadingTask = pdfjs.getDocument({
     data: bytes.slice(),
@@ -52,10 +56,7 @@ async function loadPdfDocument(bytes: Uint8Array): Promise<{
   return { pdf: await loadingTask.promise };
 }
 
-async function readPdfBookFile(
-  bookId: string,
-  bookFilePath: string,
-): Promise<Uint8Array> {
+async function readPdfBookFile(bookId: string, bookFilePath: string): Promise<Uint8Array> {
   const platform = getPlatformService();
   const dataDir = await platform.getDataDir();
   const absolutePath = await platform.joinPath(dataDir, bookFilePath);

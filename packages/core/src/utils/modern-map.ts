@@ -138,50 +138,67 @@ export function installWeakMapUpsertPolyfill(ctor: UpsertPrototype = WeakMap): b
 }
 
 export interface ModernMapInstallResult {
-  /** Methods that were missing and are now installed. */
+  /** Methods that were missing before and exist after installation. */
   installed: string[];
   /** Methods that were already present and left untouched. */
   skipped: string[];
+  /** Methods still missing after the attempt (e.g. a frozen prototype). */
+  missing: string[];
+}
+
+function listMethods(
+  ctor: UpsertPrototype,
+  label: string,
+  methods: readonly MapUpsertMethod[],
+): string[] {
+  const prototype = ctor.prototype as Record<string, unknown>;
+  return methods
+    .filter((name) => typeof prototype[name] === "function")
+    .map((name) => `${label}.${name}`);
 }
 
 /**
  * Installs the upsert polyfills on the global Map and WeakMap constructors.
- * Safe to call repeatedly (and from a worker).
+ * Safe to call repeatedly (and from a worker). The result reflects what is
+ * actually present after the attempt, not what was merely attempted.
  */
 export function installModernMapPolyfills(
   mapCtor: UpsertPrototype = Map,
   weakMapCtor: UpsertPrototype = WeakMap,
 ): ModernMapInstallResult {
-  const result: ModernMapInstallResult = { installed: [], skipped: [] };
+  const before = new Set([
+    ...listMethods(mapCtor, "Map", MAP_METHODS),
+    ...listMethods(weakMapCtor, "WeakMap", WEAK_MAP_METHODS),
+  ]);
 
-  const record = (ctor: UpsertPrototype, label: string, methods: readonly MapUpsertMethod[]) => {
-    const prototype = ctor.prototype as Record<string, unknown>;
-    for (const name of methods) {
-      if (typeof prototype[name] === "function") {
-        result.skipped.push(`${label}.${name}`);
-      } else {
-        result.installed.push(`${label}.${name}`);
-      }
-    }
-  };
-
-  record(mapCtor, "Map", MAP_METHODS);
-  record(weakMapCtor, "WeakMap", WEAK_MAP_METHODS);
-
-  // Installation is all-or-nothing per constructor; a frozen prototype throws
-  // and the caller reports the remaining gaps to the user.
+  // Installation is per-constructor; a frozen prototype throws and the caller
+  // reports the remaining gaps to the user.
   try {
     installMapUpsertPolyfill(mapCtor);
-  } catch {
-    // Keep going: WeakMap may still be patchable.
+  } catch (error) {
+    console.warn("[modern-map] Failed to install Map upsert polyfills:", error);
   }
   try {
     installWeakMapUpsertPolyfill(weakMapCtor);
-  } catch {
-    // The caller verifies support with findMissingMapUpsertApis().
+  } catch (error) {
+    console.warn("[modern-map] Failed to install WeakMap upsert polyfills:", error);
   }
 
-  return result;
+  const after = [
+    ...listMethods(mapCtor, "Map", MAP_METHODS),
+    ...listMethods(weakMapCtor, "WeakMap", WEAK_MAP_METHODS),
+  ];
+  const all = [
+    ...MAP_METHODS.map((name) => `Map.${name}`),
+    ...WEAK_MAP_METHODS.map((name) => `WeakMap.${name}`),
+  ];
+  const present = new Set(after);
+
+  return {
+    installed: after.filter((method) => !before.has(method)),
+    skipped: after.filter((method) => before.has(method)),
+    missing: all.filter((method) => !present.has(method)),
+  };
 }
 
 /**

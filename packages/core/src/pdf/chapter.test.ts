@@ -1,7 +1,7 @@
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { IPlatformService } from "../services";
 import { setPlatformService } from "../services";
 import { listPdfPagesFromBookFile, readPdfPageFromBookFile } from "./chapter";
@@ -22,7 +22,9 @@ function buildSimplePdf(pages: string[]): Uint8Array {
   for (const text of pages) {
     const escaped = text.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)");
     const stream = `BT /F1 18 Tf 72 720 Td (${escaped}) Tj ET`;
-    const contentId = addObject(`<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}\nendstream`);
+    const contentId = addObject(
+      `<< /Length ${encoder.encode(stream).length} >>\nstream\n${stream}\nendstream`,
+    );
     const pageId = addObject(
       `<< /Type /Page /Parent ${pagesId} 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${fontId} 0 R >> >> /Contents ${contentId} 0 R >>`,
     );
@@ -48,10 +50,13 @@ function buildSimplePdf(pages: string[]): Uint8Array {
   return encoder.encode(pdf);
 }
 
-async function createPlatform(root: string): Promise<string> {
+async function createPlatform(
+  root: string,
+  register: typeof setPlatformService = setPlatformService,
+): Promise<string> {
   const dataDir = join(root, "library");
   await mkdir(join(dataDir, "books"), { recursive: true });
-  setPlatformService({
+  register({
     platformType: "desktop",
     isDesktop: true,
     isMobile: false,
@@ -163,7 +168,33 @@ describe("PDF chapter fallback", () => {
     const dataDir = await createPlatform(root);
     await writeFile(join(dataDir, "books", "sample.pdf"), buildSimplePdf(["Only page"]));
 
-    await expect(readPdfPageFromBookFile("book-1", "books/sample.pdf", "chapter-1")).resolves.toBeNull();
-    await expect(readPdfPageFromBookFile("book-1", "books/sample.pdf", "page-2")).resolves.toBeNull();
+    await expect(
+      readPdfPageFromBookFile("book-1", "books/sample.pdf", "chapter-1"),
+    ).resolves.toBeNull();
+    await expect(
+      readPdfPageFromBookFile("book-1", "books/sample.pdf", "page-2"),
+    ).resolves.toBeNull();
+  });
+
+  it("installs Map upserts before loading the legacy pdf.js build", async () => {
+    const saved = Object.getOwnPropertyDescriptor(Map.prototype, "getOrInsertComputed");
+    Reflect.deleteProperty(Map.prototype, "getOrInsertComputed");
+
+    try {
+      vi.resetModules();
+      const freshServices = await import("../services");
+      const root = await mkdtemp(join(tmpdir(), "readany-core-pdf-polyfill-"));
+      const dataDir = await createPlatform(root, freshServices.setPlatformService);
+      await writeFile(join(dataDir, "books", "sample.pdf"), buildSimplePdf(["Polyfilled page"]));
+
+      const freshChapter = await import("./chapter");
+      await expect(
+        freshChapter.listPdfPagesFromBookFile("book-1", "books/sample.pdf"),
+      ).resolves.toHaveLength(1);
+      expect(typeof Map.prototype.getOrInsertComputed).toBe("function");
+    } finally {
+      if (saved) Object.defineProperty(Map.prototype, "getOrInsertComputed", saved);
+      else Reflect.deleteProperty(Map.prototype, "getOrInsertComputed");
+    }
   });
 });

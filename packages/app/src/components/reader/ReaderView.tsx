@@ -194,9 +194,7 @@ function getAdjacentTTSSectionIndex(
 async function loadAndParseBook(
   filePath: string,
 ): Promise<{ bookDoc: BookDoc; format: BookFormat } | null> {
-  console.log("[loadAndParseBook] start, filePath:", filePath);
   const blob = await getCachedBlob(filePath);
-  console.log("[loadAndParseBook] blob loaded, size:", blob.size);
 
   const fileName = filePath.split("/").pop() || "book.epub";
   if (!(await confirmLargePdfOpen(fileName, blob.size))) {
@@ -209,7 +207,6 @@ async function loadAndParseBook(
 
   const loader = new DocumentLoader(file);
   const { book, format } = await loader.open();
-  console.log("[loadAndParseBook] parsed, format:", format, "sections:", book.sections?.length);
   return { bookDoc: book, format };
 }
 
