@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { FetchOptions } from "../../services/platform";
 import type { ISyncBackend, RemoteFile } from "../sync-backend";
+import { WebDavClient } from "../webdav-client";
 
 type Row = Record<string, unknown>;
 
@@ -54,7 +56,11 @@ vi.mock("../../db/database", () => ({
 }));
 
 vi.mock("../../services/platform", () => ({
-  getPlatformService: vi.fn(() => ({ isDesktop: false })),
+  getPlatformService: vi.fn(() => ({ isDesktop: false, fetch: networkMocks.fetch })),
+}));
+
+const networkMocks = vi.hoisted(() => ({
+  fetch: vi.fn<(url: string, options?: FetchOptions) => Promise<Response>>(),
 }));
 
 const syncFileMocks = vi.hoisted(() => ({
@@ -107,7 +113,9 @@ class FakePerBookDb {
 
   private threadsOf(threadId: string): Row[] {
     return this.table("threads").size >= 0
-      ? [...this.table("threads")].filter(([, row]) => String(row.id) === threadId).map(([, r]) => r)
+      ? [...this.table("threads")]
+          .filter(([, row]) => String(row.id) === threadId)
+          .map(([, r]) => r)
       : [];
   }
 
@@ -177,7 +185,10 @@ class FakePerBookDb {
       const bookId = String(params[0]);
       return [...this.tombstones.values()]
         .filter(
-          (row) => row.book_id === bookId && row.table_name === table && !this.table(table).has(String(row.id)),
+          (row) =>
+            row.book_id === bookId &&
+            row.table_name === table &&
+            !this.table(table).has(String(row.id)),
         )
         .map((row) => ({ id: row.id, deleted_at: row.deleted_at })) as T[];
     }
@@ -318,7 +329,14 @@ class FakeBackend implements ISyncBackend {
 }
 
 function seedBook(db: FakePerBookDb, id: string, updatedAt: number, title = "Book"): void {
-  db.insert("books", { id, title, author: "", file_path: "", format: "epub", updated_at: updatedAt });
+  db.insert("books", {
+    id,
+    title,
+    author: "",
+    file_path: "",
+    format: "epub",
+    updated_at: updatedAt,
+  });
 }
 
 const T1 = 1_700_000_000_000;
@@ -328,8 +346,48 @@ const T3 = T1 + 120_000;
 describe("runPerBookSync (per-book cloud engine)", () => {
   let db: FakePerBookDb;
 
+  it.each([200, 302])(
+    "keeps the chat push cursor when the DAV write gets a login response (HTTP %s)",
+    async (status) => {
+      db.syncMetadata.set("perbook:chat-pushed-at", String(T1));
+      db.insert("messages", {
+        id: "msg-1",
+        thread_id: "thread-1",
+        content: "pending",
+        created_at: T2,
+      });
+      const backend = new FakeBackend({
+        "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+      });
+      const client = new WebDavClient("https://dav.example.com", "alice", "test-secret");
+      const storeJSON = backend.putJSON.bind(backend);
+      vi.spyOn(backend, "putJSON").mockImplementation((path, data) =>
+        path.startsWith("/readany/sync/chat/") ? client.putJSON(path, data) : storeJSON(path, data),
+      );
+      networkMocks.fetch.mockResolvedValueOnce(
+        new Response("<html>Login</html>", {
+          status,
+          headers: {
+            "Content-Type": "text/html",
+            Location: "/login?token=redacted-in-diagnostics",
+          },
+        }),
+      );
+
+      const result = await runPerBookSync(backend);
+
+      expect(networkMocks.fetch).toHaveBeenLastCalledWith(
+        expect.stringContaining("/readany/sync/chat/"),
+        expect.objectContaining({ method: "PUT", redirect: "error" }),
+      );
+      expect(result.success).toBe(false);
+      expect(db.syncMetadata.get("perbook:chat-pushed-at")).toBe(String(T1));
+    },
+  );
+
   beforeEach(() => {
     db = new FakePerBookDb();
+    networkMocks.fetch.mockReset();
     dbMocks.currentDb = db;
     dbMocks.getDB.mockResolvedValue(db);
     dbMocks.getDeviceId.mockResolvedValue("device-a");

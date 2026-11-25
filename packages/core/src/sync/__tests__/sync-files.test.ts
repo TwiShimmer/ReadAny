@@ -6,6 +6,7 @@ import {
   REMOTE_FILES,
   REMOTE_FILE_MANIFEST,
 } from "../sync-types";
+import { WebDavError } from "../webdav-client";
 
 const mockAdapter = {
   getAppDataDir: vi.fn().mockResolvedValue("/appdata"),
@@ -60,7 +61,7 @@ describe("sync-files", () => {
     vi.clearAllMocks();
     mockSelect.mockResolvedValue([]);
     mockAdapter.listFiles.mockResolvedValue([]);
-    mockAdapter.getFileSize.mockResolvedValue(null);
+    mockAdapter.getFileSize.mockResolvedValue(3);
     mockAdapter.maxBufferedTransferBytes = undefined;
   });
 
@@ -223,6 +224,23 @@ describe("sync-files", () => {
       expect(backend.put).not.toHaveBeenCalled();
     });
 
+    it("rejects buffered uploads of unknown size before reading bytes", async () => {
+      mockSelect.mockResolvedValue([
+        { id: "book-1", file_path: "books/book-1.epub", title: "Unknown", cover_url: null },
+      ]);
+      mockAdapter.fileExists.mockResolvedValue(true);
+      mockAdapter.getFileSize.mockResolvedValue(null);
+      const backend = createMockBackend();
+
+      const result = await syncFiles(backend);
+
+      expect(result.filesUploadFailed).toBe(1);
+      expect(result.failures[0]?.message).toContain("256.00 MB");
+      expect(result.failures[0]?.message).toContain("Unknown.epub");
+      expect(mockAdapter.readFileBytes).not.toHaveBeenCalled();
+      expect(backend.put).not.toHaveBeenCalled();
+    });
+
     it("reports the first upload failure with path, message and status", async () => {
       mockSelect.mockResolvedValue([
         {
@@ -235,6 +253,7 @@ describe("sync-files", () => {
       ]);
 
       mockAdapter.fileExists.mockResolvedValue(true);
+      mockAdapter.listFiles.mockRejectedValueOnce(new Error("Local cleanup unavailable"));
       const denied = Object.assign(new Error("WebDAV 访问被拒绝"), { status: 403 });
       const backend = createMockBackend({
         listDir: vi.fn().mockResolvedValue([]),
@@ -246,11 +265,76 @@ describe("sync-files", () => {
       expect(result.failures).toEqual([
         {
           path: `${REMOTE_BOOKS_ROOT}/Denied Book-book-1/Denied Book.epub`,
-          message: "WebDAV 访问被拒绝",
+          message: expect.stringContaining("403"),
           status: 403,
         },
       ]);
     });
+
+    it.each(["upload", "download"] as const)(
+      "attributes out-of-order %s failures to the file that failed",
+      async (operation) => {
+        const isUpload = operation === "upload";
+        const books = ["A", "B"].map((title) => ({
+          id: `book-${title}`,
+          title,
+          file_path: `books/book-${title}.epub`,
+          cover_url: null,
+        }));
+        const paths = books.map(
+          ({ title, id }) => `${REMOTE_BOOKS_ROOT}/${title}-${id}/${title}.epub`,
+        );
+        mockSelect.mockResolvedValue(books);
+        mockAdapter.fileExists.mockResolvedValue(isUpload);
+        let finishFirst = () => {};
+        const firstFinished = new Promise<void>((resolve) => {
+          finishFirst = resolve;
+        });
+        const denied = new WebDavError("forbidden", "Cannot access C:\\private\\book.epub", {
+          status: 403,
+        });
+        const backend = createMockBackend({
+          getJSON: vi.fn().mockResolvedValue({
+            version: 1,
+            generatedAt: 1,
+            books: Object.fromEntries(
+              books.map(({ title, id }, index) => [
+                id,
+                { folderName: `${title}-${id}`, filePath: paths[index] },
+              ]),
+            ),
+          }),
+          putFile: async (path) => {
+            if (path === paths[1]) throw denied;
+            await firstFinished;
+          },
+          getFileToPath: async (path) => {
+            if (path === paths[1]) throw denied;
+            await firstFinished;
+          },
+        });
+
+        const result = await syncFiles(
+          backend,
+          (progress) => {
+            if (progress.failure) finishFirst();
+          },
+          {
+            concurrency: 2,
+            forceUploadAll: isUpload,
+            forceDownloadAll: !isUpload,
+            downloadRemoteBooks: !isUpload,
+          },
+        );
+
+        expect(isUpload ? result.filesUploaded : result.filesDownloaded).toBe(1);
+        expect(isUpload ? result.filesUploadFailed : result.filesDownloadFailed).toBe(1);
+        expect(result.failures).toEqual([
+          { path: paths[1], status: 403, message: expect.stringContaining("403") },
+        ]);
+        expect(result.failures[0]?.message).not.toContain("private");
+      },
+    );
 
     it("migrates legacy files to the new layout via MOVE", async () => {
       mockSelect.mockResolvedValue([
@@ -682,68 +766,77 @@ describe("sync-files", () => {
       expect(backend.putJSON).not.toHaveBeenCalledWith(REMOTE_FILE_MANIFEST, expect.anything());
     });
 
-    it("renames the book folder when the title has changed", async () => {
-      mockSelect.mockResolvedValue([
-        {
-          id: "book-1",
-          file_path: "books/book-1.epub",
-          file_hash: "h1",
-          cover_url: "covers/book-1.jpg",
-          title: "New Title",
-        },
-      ]);
+    it.each([true, false])(
+      "deletes the old folder only when all files moved (all moved: %s)",
+      async (allMoved) => {
+        mockSelect.mockResolvedValue([
+          {
+            id: "book-1",
+            file_path: "books/book-1.epub",
+            file_hash: "h1",
+            cover_url: "covers/book-1.jpg",
+            title: "New Title",
+          },
+        ]);
 
-      mockAdapter.fileExists.mockResolvedValue(true);
+        mockAdapter.fileExists.mockResolvedValue(true);
 
-      const oldDirName = "Old Title-book-1";
-      const oldDirPath = `${REMOTE_BOOKS_ROOT}/${oldDirName}`;
-      const oldFolderEntry: RemoteFile = {
-        name: oldDirName,
-        path: oldDirPath,
-        size: 0,
-        lastModified: 0,
-        isDirectory: true,
-      };
-      const oldFiles: RemoteFile[] = [
-        {
-          name: "Old Title.epub",
-          path: `${oldDirPath}/Old Title.epub`,
-          size: 100,
-          lastModified: 1000,
-          isDirectory: false,
-        },
-        {
-          name: "Old Title.jpg",
-          path: `${oldDirPath}/Old Title.jpg`,
-          size: 50,
-          lastModified: 1000,
-          isDirectory: false,
-        },
-      ];
+        const oldDirName = "Old Title-book-1";
+        const oldDirPath = `${REMOTE_BOOKS_ROOT}/${oldDirName}`;
+        const oldFolderEntry: RemoteFile = {
+          name: oldDirName,
+          path: oldDirPath,
+          size: 0,
+          lastModified: 0,
+          isDirectory: true,
+        };
+        const oldFiles: RemoteFile[] = [
+          {
+            name: "Old Title.epub",
+            path: `${oldDirPath}/Old Title.epub`,
+            size: 100,
+            lastModified: 1000,
+            isDirectory: false,
+          },
+          {
+            name: "Old Title.jpg",
+            path: `${oldDirPath}/Old Title.jpg`,
+            size: 50,
+            lastModified: 1000,
+            isDirectory: false,
+          },
+        ];
 
-      const backend = createMockBackend({
-        listDir: vi.fn().mockImplementation(async (path: string) => {
-          if (path === REMOTE_BOOKS_ROOT) return [oldFolderEntry];
-          if (path === oldDirPath) return oldFiles;
-          return [];
-        }),
-        move: vi.fn().mockResolvedValue(undefined),
-        delete: vi.fn().mockResolvedValue(undefined),
-      });
+        const backend = createMockBackend({
+          listDir: vi.fn().mockImplementation(async (path: string) => {
+            if (path === REMOTE_BOOKS_ROOT) return [oldFolderEntry];
+            if (path === oldDirPath) return oldFiles;
+            return [];
+          }),
+          move: vi.fn(async (source) => {
+            if (!allMoved && source.endsWith("epub"))
+              throw new WebDavError("forbidden", "MOVE blocked", { status: 403 });
+          }),
+          exists: vi
+            .fn()
+            .mockRejectedValue(new WebDavError("network", "Cannot verify destination")),
+          delete: vi.fn().mockResolvedValue(undefined),
+        });
 
-      await syncFiles(backend);
+        await syncFiles(backend);
 
-      expect(backend.move).toHaveBeenCalledWith(
-        `${oldDirPath}/Old Title.epub`,
-        `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.epub`,
-      );
-      expect(backend.move).toHaveBeenCalledWith(
-        `${oldDirPath}/Old Title.jpg`,
-        `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.jpg`,
-      );
-      // Old dir is best-effort deleted at the end.
-      expect(backend.delete).toHaveBeenCalledWith(oldDirPath);
-    });
+        expect(backend.move).toHaveBeenCalledWith(
+          `${oldDirPath}/Old Title.epub`,
+          `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.epub`,
+        );
+        expect(backend.move).toHaveBeenCalledWith(
+          `${oldDirPath}/Old Title.jpg`,
+          `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.jpg`,
+        );
+        if (allMoved) expect(backend.delete).toHaveBeenCalledWith(oldDirPath);
+        else expect(backend.delete).not.toHaveBeenCalled();
+      },
+    );
 
     it("deletes remote orphan folders for books no longer in DB", async () => {
       mockSelect.mockResolvedValue([]);
@@ -1140,7 +1233,7 @@ describe("sync-files", () => {
         .fn<(p: string) => Promise<Uint8Array>>()
         .mockImplementation(async (path: string) => {
           if (path === `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.epub`) {
-            throw new Error("404 Not Found");
+            throw new WebDavError("not-found", "远端文件不存在", { status: 404 });
           }
           if (path === `${REMOTE_FILES}/book-1.epub`) {
             return new Uint8Array([9, 9, 9]);
@@ -1163,7 +1256,9 @@ describe("sync-files", () => {
       mockSelect.mockResolvedValue([{ id: "book-1", title: "Test Book" }]);
 
       const backend = createMockBackend({
-        get: vi.fn().mockRejectedValue(new Error("404 Not Found")),
+        getFileToPath: vi
+          .fn()
+          .mockRejectedValue(new WebDavError("not-found", "远端文件不存在", { status: 404 })),
       });
 
       const result = await downloadBookFile(backend, "book-1", "books/book-1.epub");

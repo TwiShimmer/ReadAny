@@ -253,19 +253,19 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       logSpy.mockRestore();
     }
 
-    expect(calls.map((call) => call.method)).toEqual(["PUT", "MKCOL", "PUT"]);
-    expect(calls[1]?.url).toBe("https://dav.example.com/dav/readany/sync/");
+    expect(calls.map((call) => call.method)).toEqual(["PUT", "PROPFIND", "MKCOL", "PUT"]);
+    expect(calls[2]?.url).toBe("https://dav.example.com/dav/readany/sync/");
     expect(calls[0]?.url).toBe("https://dav.example.com/dav/readany/sync/device-abc.json");
-    expect(calls[2]?.url).toBe(calls[0]?.url);
+    expect(calls[3]?.url).toBe(calls[0]?.url);
   });
 
-  it("heals an MKCOL 409 by force-creating the whole collection chain", async () => {
+  it("heals an MKCOL 409 by creating only the collections that are missing", async () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       const method = String(options?.method ?? "GET");
       calls.push({ method, url });
       if (method === "PROPFIND") {
-        return new Response("", { status: 207 });
+        return new Response("", { status: url.endsWith("/readany/") ? 207 : 404 });
       }
       if (method === "MKCOL") {
         const isBooksCall = url.endsWith("/readany/data/books/");
@@ -280,16 +280,14 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
     await client.mkcol("/readany/data/books");
 
-    expect(calls.map((call) => call.method)).toEqual(["MKCOL", "MKCOL", "MKCOL", "MKCOL"]);
-    expect(calls.map((call) => call.url)).toEqual([
+    expect(calls.filter((call) => call.method === "MKCOL").map((call) => call.url)).toEqual([
       "https://dav.example.com/dav/readany/data/books/",
-      "https://dav.example.com/dav/readany/",
       "https://dav.example.com/dav/readany/data/",
       "https://dav.example.com/dav/readany/data/books/",
     ]);
   });
 
-  it("retries MKCOL without the trailing slash on servers that 409 collection URIs", async () => {
+  it("keeps the collection URL when a conflict provides no evidence about the slash", async () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       const method = String(options?.method ?? "GET");
@@ -301,15 +299,11 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     });
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
-    await client.mkcol("/readany/sync");
+    await expect(client.mkcol("/readany/sync")).rejects.toMatchObject({ status: 409 });
 
-    expect(calls.map((call) => call.method)).toEqual(["MKCOL", "MKCOL", "MKCOL", "MKCOL", "MKCOL"]);
-    expect(calls.map((call) => call.url)).toEqual([
+    expect(calls.filter((call) => call.method === "MKCOL").map((call) => call.url)).toEqual([
       "https://dav.example.com/dav/readany/sync/",
       "https://dav.example.com/dav/readany/",
-      "https://dav.example.com/dav/readany",
-      "https://dav.example.com/dav/readany/sync/",
-      "https://dav.example.com/dav/readany/sync",
     ]);
   });
 
@@ -368,7 +362,7 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     );
   });
 
-  it("treats a 405 MKCOL response as an existing collection", async () => {
+  it("does not cache a collection on an unconfirmed 405", async () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       const method = String(options?.method ?? "GET");
@@ -380,8 +374,9 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
     await expect(client.ensureDirectory("/readany/data/books")).resolves.toBeUndefined();
+    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBeUndefined();
 
-    expect(calls.filter((call) => call.method === "MKCOL")).toHaveLength(3);
+    expect(calls.filter((call) => call.method === "MKCOL")).toHaveLength(6);
   });
 
   it("does not treat a bare 301 as a successful MKCOL", async () => {
@@ -448,7 +443,10 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     installTransferStub({
       fetch: (_url, options) => {
         const method = String(options?.method ?? "GET");
-        return new Response("", { status: method === "PROPFIND" ? 207 : 201 });
+        return new Response("", {
+          status: method === "PROPFIND" ? 207 : 201,
+          headers: { DAV: "1" },
+        });
       },
       uploadFile: async () => {
         uploads++;
@@ -474,7 +472,7 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
           mkcolUrls.push(url);
           return new Response("", { status: 201 });
         }
-        if (method === "PROPFIND") return new Response("", { status: 207 });
+        if (method === "PROPFIND") return new Response("", { status: uploads > 0 ? 404 : 207 });
         return new Response("", { status: 404 });
       },
       uploadFile: async (url) => {
@@ -491,6 +489,91 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     expect(uploads).toBe(2);
     expect(mkcolUrls).toEqual(["https://dav.example.com/dav/readany/data/books/Book-1/"]);
   });
+
+  it("rejects a followed login redirect even when the final response has status 200", async () => {
+    const response = new Response("login", { status: 200 });
+    Object.defineProperty(response, "url", {
+      value: "https://fake-user@dav.example.com/login?session=example#token",
+    });
+    installFetchStub(() => response);
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+    await expect(client.putJSON("/chat/day.json", {})).rejects.toMatchObject({
+      kind: "redirect",
+      status: 200,
+      cause: "https://dav.example.com/login",
+    });
+  });
+
+  it.each([403, 404, 302])(
+    "only continues past an inconclusive directory preflight (HTTP %s)",
+    async (status) => {
+      const uploadFile = vi.fn(async () => {});
+      installTransferStub({
+        fetch: (_url, options) =>
+          new Response("", {
+            status: options?.method === "MKCOL" ? status : 404,
+            headers: { Location: "/login?session=example" },
+          }),
+        uploadFile,
+      });
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+      const upload = client.putFile("/chat/photo.jpg", "/mock/photo.jpg");
+      if (status === 403) {
+        await expect(upload).resolves.toBeUndefined();
+        expect(uploadFile).toHaveBeenCalledOnce();
+      } else {
+        await expect(upload).rejects.toMatchObject({ status, method: "MKCOL" });
+        expect(uploadFile).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it("does not retry a first 401 after an ordinary GET 200", async () => {
+    const put = vi.fn(() => new Response("", { status: 401 }));
+    installFetchStub((_url, options) =>
+      options?.method === "GET" ? new Response("public") : put(),
+    );
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+    await client.getText("/public");
+    await expect(client.putJSON("/chat/day.json", {})).rejects.toMatchObject({ status: 401 });
+    expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    [401, 401, 401, 401],
+    [429, 409, 503, 401],
+  ])(
+    "shares the four-PUT retry budget after DAV auth (HTTP %s, %s, %s, %s)",
+    async (...statuses) => {
+      vi.useFakeTimers();
+      try {
+        const writes: number[] = [];
+        installFetchStub((url, options) => {
+          if (options?.method === "PUT") {
+            const status = statuses[writes.length] ?? 401;
+            writes.push(status);
+            return new Response("", { status });
+          }
+          if (options?.method === "MKCOL") return new Response("", { status: 201 });
+          return url.endsWith("/chat/")
+            ? new Response("", { status: 404 })
+            : new Response("", { status: 207, headers: { DAV: "1" } });
+        });
+        const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+        await client.ping();
+        const result = expect(client.putJSON("/chat/day.json", {})).rejects.toMatchObject({
+          status: 401,
+        });
+        await vi.runAllTimersAsync();
+        await result;
+        expect(writes).toEqual(statuses);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("handles a localized 404 by status instead of matching the message text", async () => {
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
