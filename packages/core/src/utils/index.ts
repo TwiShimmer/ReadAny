@@ -8,6 +8,7 @@ export {
 } from "./modern-map";
 export type { MapUpsertMethod, ModernMapInstallResult } from "./modern-map";
 export { cn } from "./cn";
+export { scrubSensitiveText } from "./redact";
 export { debounce } from "./debounce";
 export { throttle } from "./throttle";
 export { eventBus } from "./event-bus";

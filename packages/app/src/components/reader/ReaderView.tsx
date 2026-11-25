@@ -3002,12 +3002,17 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                         loadAndParseBook(book.filePath)
                           .then((parsed) => {
                             if (!parsed) {
+                              // Same outcome as the initial open: keep the
+                              // library intact and close the now-empty tab
+                              // instead of leaving a blank reader surface.
                               setIsLoading(false);
                               toast.info(
                                 t("reader.largePdf.cancelled", {
                                   defaultValue: "Large PDF was not opened.",
                                 }),
                               );
+                              closeAppTab(tabId);
+                              removeReaderTab(tabId);
                               return;
                             }
                             lastLoadErrorRef.current = null;

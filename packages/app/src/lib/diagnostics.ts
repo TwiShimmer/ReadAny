@@ -8,24 +8,13 @@
  */
 import { getWebviewLabel } from "@/lib/webview-info";
 import { findMissingMapUpsertApis } from "@readany/core/utils/modern-map";
+import { scrubSensitiveText } from "@readany/core/utils/redact";
 import { getVersion } from "@tauri-apps/api/app";
 
 const MAX_SUMMARY_LENGTH = 500;
 
 function truncate(value: string, limit: number): string {
   return value.length > limit ? `${value.slice(0, limit)}…` : value;
-}
-
-/** Coarse path/token scrubbing; diagnostics are copied deliberately, not logged. */
-function scrubSensitiveText(value: string): string {
-  return value
-    .replace(/\b(?:file|asset|tauri|https?):\/\/\S+/gi, "<url>")
-    .replace(/\b(?:blob|data):\S+/gi, "<url>")
-    .replace(/\b[A-Za-z]:\\[^\s]*/g, "<path>")
-    .replace(/\/(?:[^\s/]+\/)+[^\s/]+/g, "<path>")
-    .replace(/\b(?:sk|ghp|gho|github_pat)_[A-Za-z0-9_]+\b/g, "<redacted>")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
-    .replace(/\b[A-Za-z0-9_-]{32,}\b/g, "<redacted>");
 }
 
 /** One-line error summary; safe to put in a support report. */
