@@ -17,18 +17,17 @@ const POSIX_FILE_PATH = new RegExp(
 );
 
 export function scrubSensitiveText(value: string): string {
-  return value
-    .replace(/\b(?:file|asset|tauri|https?):\/\/\S+/gi, "<url>")
-    .replace(/\b(?:blob|data):\S+/gi, "<url>")
-    .replace(WINDOWS_FILE_PATH, "$1<path>")
-    .replace(POSIX_FILE_PATH, "$1<path>")
-    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1<redacted>@")
-    .replace(
-      /\b(?:sk|ghp|gho|github_pat|xox[baprs]|AIza)[-_A-Za-z0-9]{10,}\b/g,
-      "<redacted>",
-    )
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, "<redacted>")
-    // JWT-shaped three-part tokens; book IDs are single UUID-ish segments.
-    .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "<redacted>")
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>");
+  return (
+    value
+      .replace(/\b(?:file|asset|tauri|https?):\/\/\S+/gi, "<url>")
+      .replace(/\b(?:blob|data):\S+/gi, "<url>")
+      .replace(WINDOWS_FILE_PATH, "$1<path>")
+      .replace(POSIX_FILE_PATH, "$1<path>")
+      .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1<redacted>@")
+      .replace(/\b(?:sk|ghp|gho|github_pat|xox[baprs]|AIza)[-_A-Za-z0-9]{10,}\b/g, "<redacted>")
+      .replace(/\bAKIA[0-9A-Z]{16}\b/g, "<redacted>")
+      // JWT-shaped three-part tokens; book IDs are single UUID-ish segments.
+      .replace(/\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "<redacted>")
+      .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
+  );
 }

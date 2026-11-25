@@ -14,12 +14,16 @@ import * as pdfjsLib from "pdfjs-dist";
  *  - the React Native reader passes `workerMessageHandler` for its main-thread
  *    fake worker (and may leave workerSrc unset).
  *
- * Passing `workerSrc` also removes any stale `globalThis.pdfjsWorker` so a
- * previously configured fake worker cannot shadow the real one.
+ * Each realm chooses its mode before opening a PDF. PDF.js caches its
+ * fake-worker handler, so clearing the global cannot switch a running realm
+ * back to real workers.
  */
+let pdfWorkerMode;
 export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => {
-  // One mode per process: a real workerSrc and a main-thread fake worker must
-  // not be active at the same time.
+  const mode = workerSrc ? "worker" : workerMessageHandler ? "handler" : undefined;
+  if (!mode || mode === pdfWorkerMode) return;
+  if (pdfWorkerMode) throw new Error("PDF worker mode is already configured for this realm");
+
   if (workerSrc) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
     // biome-ignore lint/performance/noDelete: remove the fake-worker hook entirely
@@ -28,6 +32,7 @@ export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => 
     pdfjsLib.GlobalWorkerOptions.workerSrc = "";
     globalThis.pdfjsWorker ??= { WorkerMessageHandler: workerMessageHandler };
   }
+  pdfWorkerMode = mode;
 };
 
 const DEFAULT_PDFJS_ASSET_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/`;
@@ -673,22 +678,57 @@ const writeCachedPage = (cache, key, value, limit, onEvict) => {
   }
 };
 
-const loadPDFFromFile = async (file) => {
+const loadPDFFromFile = async (file, signal) => {
+  signal?.throwIfAborted();
   const arrayBuffer = await file.arrayBuffer();
+  signal?.throwIfAborted();
   return pdfjsLib.getDocument({
     ...getPDFJSDocumentOptions(),
     data: new Uint8Array(arrayBuffer),
-  }).promise;
+  });
 };
 
-const loadPDFFromURL = async (url) =>
+const loadPDFFromURL = (url) =>
   pdfjsLib.getDocument({
     ...getPDFJSDocumentOptions(),
     url,
     rangeChunkSize: 65536,
     disableAutoFetch: true,
     disableStream: false,
-  }).promise;
+  });
+
+const destroyLoadingTask = async (task) => {
+  try {
+    await task.destroy();
+  } catch (error) {
+    console.warn("Failed to release PDF loading task:", error);
+  }
+};
+
+async function buildBookFromLoadingTask(task, fileName, signal) {
+  let destruction;
+  const destroy = () => (destruction ??= destroyLoadingTask(task));
+  // PDF.js may abandon its loading promise after destroy(), so abort must
+  // also settle our own wait, even when the worker handshake is still pending.
+  let abort;
+  const aborted = new Promise((_, reject) => {
+    abort = () => reject(signal.reason);
+  });
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const building = task.promise.then((pdf) => {
+      signal?.throwIfAborted();
+      return _buildPDFBook(pdf, fileName, destroy);
+    });
+    if (signal?.aborted) abort();
+    return await (signal ? Promise.race([building, aborted]) : building);
+  } catch (error) {
+    await destroy();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
 
 const makeTOCItem = async (item, pdf) => {
   let pageIndex = undefined;
@@ -713,26 +753,23 @@ const makeTOCItem = async (item, pdf) => {
 /**
  * Create a foliate-js compatible book object from a PDF file
  */
-export const makePDF = async (file) => {
-  const pdf = await loadPDFFromFile(file);
-  return _buildPDFBook(pdf, file.name);
-};
+export const makePDF = async (file, { signal } = {}) =>
+  buildBookFromLoadingTask(await loadPDFFromFile(file, signal), file.name, signal);
 
 /**
  * Create a foliate-js compatible book object from a PDF URL with Range support.
  * pdf.js will use HTTP Range requests to lazily load pages on demand,
  * avoiding loading the entire file into memory upfront.
  */
-export const makePDFFromURL = async (url, fileName) => {
-  const pdf = await loadPDFFromURL(url);
-  return _buildPDFBook(pdf, fileName);
-};
+export const makePDFFromURL = (url, fileName) =>
+  buildBookFromLoadingTask(loadPDFFromURL(url), fileName);
 
 export const extractPDFChapters = async (file, options = {}) => {
-  const pdf = await loadPDFFromFile(file);
+  const task = await loadPDFFromFile(file);
   const chapters = [];
 
   try {
+    const pdf = await task.promise;
     for (let i = 0; i < pdf.numPages; i++) {
       const pageNumber = i + 1;
       const page = await pdf.getPage(pageNumber);
@@ -754,13 +791,13 @@ export const extractPDFChapters = async (file, options = {}) => {
       });
     }
   } finally {
-    await pdf.destroy();
+    await destroyLoadingTask(task);
   }
 
   return chapters;
 };
 
-async function _buildPDFBook(pdf, fileName) {
+async function _buildPDFBook(pdf, fileName, destroy) {
   const numPages = pdf.numPages;
   const firstPage = await pdf.getPage(1);
   const viewport = firstPage.getViewport({ scale: 1 });
@@ -798,12 +835,17 @@ async function _buildPDFBook(pdf, fileName) {
   // Sections - one per page
   const cache = new Map();
   const textDocumentCache = new Map();
+  let destroyed = false;
   book.sections = Array.from({ length: numPages }, (_, i) => ({
     id: i,
     load: async () => {
       const cached = readCachedPage(cache, i);
       if (cached !== undefined) return cached;
       const result = await renderPage(await pdf.getPage(i + 1));
+      if (destroyed) {
+        disposeCachedPage(result);
+        throw new Error("PDF book is closed");
+      }
       writeCachedPage(cache, i, result, PAGE_HTML_CACHE_LIMIT, disposeCachedPage);
       return result;
     },
@@ -812,6 +854,7 @@ async function _buildPDFBook(pdf, fileName) {
       if (cached !== undefined) return cached.cloneNode(true);
 
       const doc = await createPageTextDocument(await pdf.getPage(i + 1), i + 1);
+      if (destroyed) throw new Error("PDF book is closed");
       writeCachedPage(textDocumentCache, i, doc, PAGE_TEXT_CACHE_LIMIT);
       return doc.cloneNode(true);
     },
@@ -856,10 +899,11 @@ async function _buildPDFBook(pdf, fileName) {
   book.getTOCFragment = (doc) => doc.documentElement;
   book.getCover = async () => renderPageAsBlob(await pdf.getPage(1));
   book.destroy = () => {
+    destroyed = true;
     for (const value of cache.values()) disposeCachedPage(value);
     cache.clear();
     textDocumentCache.clear();
-    return pdf.destroy();
+    return destroy();
   };
 
   return book;

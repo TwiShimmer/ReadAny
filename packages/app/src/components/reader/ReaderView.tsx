@@ -193,20 +193,23 @@ function getAdjacentTTSSectionIndex(
  */
 async function loadAndParseBook(
   filePath: string,
+  signal: AbortSignal,
 ): Promise<{ bookDoc: BookDoc; format: BookFormat } | null> {
   const blob = await getCachedBlob(filePath);
+  signal.throwIfAborted();
 
   const fileName = filePath.split("/").pop() || "book.epub";
   if (!(await confirmLargePdfOpen(fileName, blob.size))) {
     return null;
   }
+  signal.throwIfAborted();
 
   const file = new File([blob], fileName, {
     type: blob.type || "application/octet-stream",
   });
 
   const loader = new DocumentLoader(file);
-  const { book, format } = await loader.open();
+  const { book, format } = await loader.open(signal);
   return { bookDoc: book, format };
 }
 
@@ -587,8 +590,9 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     Map<string, { cfi: string; hasNote: boolean; color?: HighlightColor }>
   >(new Map());
 
-  // Reset rendered highlights tracking when book changes
+  // Reset rendered highlights tracking when the reader switches books.
   useEffect(() => {
+    if (!bookId) return;
     renderedHighlightsRef.current.clear();
     setFoliateReady(false);
     setTranslationReady(false);
@@ -765,7 +769,21 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [highlights, foliateReady, bookId]);
 
   // Book document state
-  const [bookDoc, setBookDoc] = useState<BookDoc | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [loadedBook, setLoadedBook] = useState<{
+    doc: BookDoc;
+    bookId: string;
+    filePath: string;
+    attempt: number;
+    signal: AbortSignal;
+  } | null>(null);
+  const bookDoc =
+    loadedBook &&
+    loadedBook.bookId === bookId &&
+    loadedBook.attempt === loadAttempt &&
+    loadedBook.filePath === book?.filePath
+      ? loadedBook.doc
+      : null;
   const [bookFormat, setBookFormat] = useState<BookFormat>("EPUB");
   const isFixedLayout = isFixedLayoutBook(bookFormat, bookDoc);
   const [isLoading, setIsLoading] = useState(true);
@@ -942,7 +960,6 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [bookId, resetReaderTTSState]);
 
   const { t } = useTranslation();
-  const isInitializedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const ttsCoverSrc = useResolvedSrc(book?.meta.coverUrl);
 
@@ -1061,21 +1078,28 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     };
   }, [flushLatestProgress]);
 
-  // --- Load book on mount ---
+  // ReaderView owns the document for this load attempt. FoliateViewer only
+  // borrows it to render and closes its renderer on unmount.
   useEffect(() => {
     const filePath = book?.filePath;
-    if (!filePath || isInitializedRef.current) return;
-    isInitializedRef.current = true;
+    if (!filePath || !bookId) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    let ownedPdf: BookDoc | undefined;
 
     const initBook = async () => {
       try {
+        setLoadedBook(null);
         setIsLoading(true);
         setError(null);
         lastLoadErrorRef.current = null;
-        const parsed = await loadAndParseBook(filePath);
+        const parsed = await loadAndParseBook(filePath, signal);
+        if (parsed?.format === "PDF") ownedPdf = parsed.bookDoc;
+        if (signal.aborted) {
+          await ownedPdf?.destroy?.();
+          return;
+        }
         if (!parsed) {
-          // The user declined the large-PDF confirmation. Keep the library
-          // untouched and close the tab instead of showing a fake error.
           setIsLoading(false);
           toast.info(
             i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
@@ -1084,9 +1108,10 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
           removeReaderTab(tabId);
           return;
         }
-        setBookDoc(parsed.bookDoc);
+        setLoadedBook({ doc: parsed.bookDoc, bookId, filePath, attempt: loadAttempt, signal });
         setBookFormat(parsed.format);
       } catch (err) {
+        if (signal.aborted) return;
         console.error("[ReaderView] Failed to load book:", err);
         lastLoadErrorRef.current = err;
         setError(
@@ -1101,9 +1126,12 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     initBook();
 
     return () => {
-      isInitializedRef.current = false;
+      controller.abort();
+      const pdf = ownedPdf;
+      // Let the child renderer close before releasing the document backing it.
+      if (pdf) queueMicrotask(() => void pdf.destroy?.());
     };
-  }, [book?.filePath, tabId, closeAppTab, removeReaderTab]);
+  }, [book?.filePath, bookId, tabId, closeAppTab, removeReaderTab, loadAttempt]);
 
   useEffect(() => {
     return eventBus.on("sync:completed", () => {
@@ -1112,6 +1140,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [bookId, loadAnnotations]);
 
   useEffect(() => {
+    if (!bookId || !tabId || !bookFormat) return;
     sessionProgressRef.current = null;
     latestProgressRef.current = null;
     suppressProgressTracking(INITIAL_PROGRESS_RESTORE_GUARD_MS);
@@ -1232,10 +1261,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         return;
       }
 
-      isInitializedRef.current = false;
-      setBookDoc(null);
-      setError(null);
-      setIsLoading(true);
+      setLoadAttempt((attempt) => attempt + 1);
     } catch (err) {
       console.error("[ReaderView] Failed to re-import missing book:", err);
       lastLoadErrorRef.current = err;
@@ -1243,7 +1269,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     } finally {
       setIsReimporting(false);
     }
-  }, [bookId, isReimporting, t]);
+  }, [book, bookId, isReimporting, t]);
 
   const handleCloseMissingBookTab = useCallback(() => {
     closeAppTab(tabId);
@@ -1382,18 +1408,25 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       setChapter,
       throttledSaveProgress,
       translationReady,
+      incrementCharactersRead,
+      incrementPagesRead,
     ],
   );
 
-  const handleTocReady = useCallback((toc: TOCItem[]) => {
-    setTocItems(toc);
-  }, []);
+  const documentSignal = loadedBook?.signal;
+  const handleTocReady = useCallback(
+    (toc: TOCItem[]) => {
+      if (!documentSignal?.aborted) setTocItems(toc);
+    },
+    [documentSignal],
+  );
 
   const handleLoaded = useCallback(() => {
+    if (documentSignal?.aborted) return;
     setIsLoading(false);
     // Mark foliate as ready to receive annotations
     setFoliateReady(true);
-  }, []);
+  }, [documentSignal]);
 
   // Show reader tour on first visit (after book loads)
   const tourTriggered = useRef(false);
@@ -1454,6 +1487,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   const handleError = useCallback(
     (err: Error) => {
+      if (documentSignal?.aborted) return;
       console.error("[ReaderView] Renderer error:", err);
       lastLoadErrorRef.current = err;
       setError(
@@ -1463,7 +1497,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       );
       setIsLoading(false);
     },
-    [t],
+    [documentSignal, t],
   );
 
   // Sync chapter translation visibility with DOM
@@ -1477,19 +1511,19 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       const { originalVisible, translationVisible } = chapterTranslation.state;
       // Translation elements
       const translationEls = doc.querySelectorAll(".readany-translation");
-      translationEls.forEach((el) => {
+      for (const el of translationEls) {
         (el as HTMLElement).setAttribute("data-hidden", String(!translationVisible));
         // When original is hidden, show translation in original style
         (el as HTMLElement).setAttribute(
           "data-solo",
           String(!originalVisible && translationVisible),
         );
-      });
+      }
       // Original text elements
       const originalEls = doc.querySelectorAll("[data-translate-id]");
-      originalEls.forEach((el) => {
+      for (const el of originalEls) {
         (el as HTMLElement).setAttribute("data-original-hidden", String(!originalVisible));
-      });
+      }
     } catch {
       // Ignore
     }
@@ -1605,7 +1639,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   // --- Selection actions ---
   const handleHighlight = useCallback(
     (color: HighlightColor = viewSettings.defaultHighlightColor ?? "yellow") => {
-      if (selection && selection.cfi) {
+      if (selection?.cfi) {
         updateReadSettings({ defaultHighlightColor: color });
         const existingHighlight = selection.highlightId
           ? highlights.find((h) => h.id === selection.highlightId)
@@ -1669,7 +1703,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   // Handle note button - open notebook panel with pending note
   const handleNote = useCallback(() => {
-    if (selection && selection.cfi) {
+    if (selection?.cfi) {
       // Check if this selection is already highlighted
       const existingHighlight = highlights.find(
         (h) => h.bookId === bookId && h.cfi === selection.cfi,
@@ -2283,6 +2317,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       readerTab?.currentCfi,
       bookId,
       primeDesktopTTSLyricContext,
+      t,
     ],
   );
 
@@ -2329,6 +2364,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     },
     [
       filterDistinctTTSSegments,
+      goToCFISafely,
       handleTTSPageEnd,
       ttsContinuousEnabled,
       ttsPlay,
@@ -2763,7 +2799,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         navigateToCfi(results[0].cfi);
       }
     },
-    [navigateToCfi, setSearchResults, setSearchIndex],
+    [navigateToCfi],
   );
 
   const navigateSearchResult = useCallback(
@@ -2994,44 +3030,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                     <button
                       type="button"
                       className="mt-2 rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90"
-                      onClick={() => {
-                        isInitializedRef.current = false;
-                        setError(null);
-                        setBookDoc(null);
-                        setIsLoading(true);
-                        loadAndParseBook(book.filePath)
-                          .then((parsed) => {
-                            if (!parsed) {
-                              // Same outcome as the initial open: keep the
-                              // library intact and close the now-empty tab
-                              // instead of leaving a blank reader surface.
-                              setIsLoading(false);
-                              toast.info(
-                                t("reader.largePdf.cancelled", {
-                                  defaultValue: "Large PDF was not opened.",
-                                }),
-                              );
-                              closeAppTab(tabId);
-                              removeReaderTab(tabId);
-                              return;
-                            }
-                            lastLoadErrorRef.current = null;
-                            setBookDoc(parsed.bookDoc);
-                            setBookFormat(parsed.format);
-                            isInitializedRef.current = true;
-                          })
-                          .catch((err) => {
-                            console.error("[ReaderView] Retry failed:", err);
-                            lastLoadErrorRef.current = err;
-                            setError(
-                              t("reader.loadFailedMessage", {
-                                defaultValue:
-                                  "This book could not be opened. The file may be damaged or unsupported.",
-                              }),
-                            );
-                            setIsLoading(false);
-                          });
-                      }}
+                      onClick={() => setLoadAttempt((attempt) => attempt + 1)}
                     >
                       {t("common.retry")}
                     </button>
@@ -3216,8 +3215,17 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         {showSettings && (
           <>
             <div
+              role="button"
+              tabIndex={0}
+              aria-label={t("common.close", { defaultValue: "Close" })}
               className="absolute inset-0 z-40 bg-black/20"
               onClick={() => setShowSettings(false)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" || event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setShowSettings(false);
+                }
+              }}
             />
             <div className="absolute top-12 right-2 z-50 w-80 animate-in slide-in-from-top-2 duration-200 rounded-lg border border-border/60 bg-background shadow-lg">
               <div className="flex items-center justify-between border-b border-border/40 px-4 py-2">

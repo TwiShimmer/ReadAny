@@ -166,43 +166,42 @@ export async function extractEpubMetadata(blob: Blob): Promise<EpubMeta> {
  * Accepts either raw bytes or a file path (avoids loading large PDFs into memory). */
 async function generatePdfCover(source: Uint8Array | string): Promise<Blob | null> {
   try {
-    const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
-    ensurePdfWorker();
-    const pdfjsLib = await import("pdfjs-dist");
+    const { withPdfDocument } = await import("@/lib/pdf/pdf-worker");
 
     const pdfSource =
       typeof source === "string"
         ? { url: source, useWorkerFetch: false, isEvalSupported: false }
         : { data: new Uint8Array(source), useWorkerFetch: false, isEvalSupported: false };
 
-    const pdfDoc = await pdfjsLib.getDocument(pdfSource).promise;
-    const page = await pdfDoc.getPage(1);
-
-    // Render at a reasonable thumbnail size (width ~400px)
-    const viewport = page.getViewport({ scale: 1 });
-    const targetWidth = 400;
-    const scale = targetWidth / viewport.width;
-    const scaledViewport = page.getViewport({ scale });
-
-    // Create an HTMLCanvasElement for pdfjs v5 compatibility
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.floor(scaledViewport.width);
-    canvas.height = Math.floor(scaledViewport.height);
-
-    await page.render({
-      canvas: canvas,
-      viewport: scaledViewport,
-    }).promise;
-
-    const blob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob((b) => resolve(b), "image/jpeg", 0.85);
-    });
-    pdfDoc.destroy();
-    return blob;
+    return await withPdfDocument(pdfSource, renderPdfCover);
   } catch (err) {
     console.warn("Failed to generate PDF cover:", err);
     return null;
   }
+}
+
+async function renderPdfCover(pdfDoc: import("pdfjs-dist").PDFDocumentProxy): Promise<Blob | null> {
+  const page = await pdfDoc.getPage(1);
+
+  // Render at a reasonable thumbnail size (width ~400px)
+  const viewport = page.getViewport({ scale: 1 });
+  const targetWidth = 400;
+  const scale = targetWidth / viewport.width;
+  const scaledViewport = page.getViewport({ scale });
+
+  // Create an HTMLCanvasElement for pdfjs v5 compatibility
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.floor(scaledViewport.width);
+  canvas.height = Math.floor(scaledViewport.height);
+
+  await page.render({
+    canvas: canvas,
+    viewport: scaledViewport,
+  }).promise;
+
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob((b) => resolve(b), "image/jpeg", 0.85);
+  });
 }
 
 /** Resolve a relative path (e.g. "books/xxx.epub") to an absolute path on desktop. */
@@ -911,11 +910,17 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           }
 
           let deletedMatch = fileHash
-            ? await db.getDeletedBookByFileHash(fileHash).catch((err) => { console.warn("[Library] Failed to check deleted book by hash:", err); return null; })
+            ? await db.getDeletedBookByFileHash(fileHash).catch((err) => {
+                console.warn("[Library] Failed to check deleted book by hash:", err);
+                return null;
+              })
             : null;
           // Fallback: match by title if hash lookup failed (e.g. hash was null on first import)
           if (!deletedMatch && title) {
-            deletedMatch = await db.getDeletedBookByTitle(title).catch((err) => { console.warn("[Library] Failed to check deleted book by title:", err); return null; });
+            deletedMatch = await db.getDeletedBookByTitle(title).catch((err) => {
+              console.warn("[Library] Failed to check deleted book by title:", err);
+              return null;
+            });
           }
           const bookId = deletedMatch?.id ?? crypto.randomUUID();
 
@@ -1007,18 +1012,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
               }
               // PDF title: try extracting from PDF metadata
               try {
-                const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
-                ensurePdfWorker();
-                const pdfjsLib = await import("pdfjs-dist");
-                const pdfDoc = await pdfjsLib.getDocument({
-                  url: pdfUrl,
-                  useWorkerFetch: false,
-                  isEvalSupported: false,
-                }).promise;
-                const metadata = await pdfDoc.getMetadata();
+                const { withPdfDocument } = await import("@/lib/pdf/pdf-worker");
+                const metadata = await withPdfDocument(
+                  { url: pdfUrl, useWorkerFetch: false, isEvalSupported: false },
+                  (pdfDoc) => pdfDoc.getMetadata(),
+                );
                 const pdfTitle = (metadata?.info as Record<string, unknown>)?.Title as string;
                 if (pdfTitle?.trim()) title = pdfTitle.trim();
-                pdfDoc.destroy();
               } catch (err) {
                 console.warn("[Library] PDF metadata extraction failed:", err);
               }
@@ -1119,9 +1119,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           ) {
             triggerVectorizeBook(book.id, relativePath, (progress) => {
               // Update book's vectorizeProgress so BookCard can show it
-              const pct = progress.totalChunks > 0
-                ? progress.processedChunks / progress.totalChunks
-                : 0;
+              const pct =
+                progress.totalChunks > 0 ? progress.processedChunks / progress.totalChunks : 0;
               get().updateBook(book.id, { vectorizeProgress: pct });
             }).catch((err) => {
               console.warn(`[importBooks] Auto-vectorize failed for ${title}:`, err);
@@ -1301,7 +1300,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     // Persist book tag changes to DB
     const books = get().books;
     for (const b of books) {
-      db.updateBook(b.id, { tags: b.tags }).catch((err) => console.warn("[Library] Failed to update book tags:", err));
+      db.updateBook(b.id, { tags: b.tags }).catch((err) =>
+        console.warn("[Library] Failed to update book tags:", err),
+      );
     }
   },
 
@@ -1321,7 +1322,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     });
     for (const b of get().books) {
       if (b.tags.includes(trimmed)) {
-        db.updateBook(b.id, { tags: b.tags }).catch((err) => console.warn("[Library] Failed to update book tags:", err));
+        db.updateBook(b.id, { tags: b.tags }).catch((err) =>
+          console.warn("[Library] Failed to update book tags:", err),
+        );
       }
     }
   },
@@ -1338,7 +1341,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       return { books, allTags };
     });
     const book = get().books.find((b) => b.id === bookId);
-    if (book) db.updateBook(bookId, { tags: book.tags }).catch((err) => console.warn("[Library] Failed to update book tags:", err));
+    if (book)
+      db.updateBook(bookId, { tags: book.tags }).catch((err) =>
+        console.warn("[Library] Failed to update book tags:", err),
+      );
   },
 
   removeTagFromBook: (bookId, tag) => {
@@ -1350,6 +1356,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       return { books };
     });
     const book = get().books.find((b) => b.id === bookId);
-    if (book) db.updateBook(bookId, { tags: book.tags }).catch((err) => console.warn("[Library] Failed to update book tags:", err));
+    if (book)
+      db.updateBook(bookId, { tags: book.tags }).catch((err) =>
+        console.warn("[Library] Failed to update book tags:", err),
+      );
   },
 }));

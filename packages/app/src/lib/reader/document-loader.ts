@@ -51,6 +51,7 @@ export interface BookDoc {
   transformTarget?: EventTarget;
   splitTOCHref(href: string): Array<string | number>;
   getCover(): Promise<Blob | null>;
+  destroy?(): void | Promise<void>;
 }
 
 /** File extension map */
@@ -98,14 +99,16 @@ export class DocumentLoader {
 
     const load =
       (f: (entry: Entry, type?: string) => Promise<string | Blob> | null) =>
-      (name: string, ...args: [string?]) =>
-        map.has(name) ? f(map.get(name)!, ...args) : null;
+      (name: string, ...args: [string?]) => {
+        const entry = map.get(name);
+        return entry ? f(entry, ...args) : null;
+      };
 
     const loadText = load((entry: Entry) =>
-      !entry.directory ? entry.getData!(new TextWriter()) : null,
+      !entry.directory && entry.getData ? entry.getData(new TextWriter()) : null,
     );
     const loadBlob = load((entry: Entry, type?: string) =>
-      !entry.directory ? entry.getData!(new BlobWriter(type!)) : null,
+      !entry.directory && entry.getData ? entry.getData(new BlobWriter(type)) : null,
     );
     const getSize = (name: string) => map.get(name)?.uncompressedSize ?? 0;
 
@@ -133,7 +136,7 @@ export class DocumentLoader {
     );
   }
 
-  public async open(): Promise<{ book: BookDoc; format: BookFormat }> {
+  public async open(signal?: AbortSignal): Promise<{ book: BookDoc; format: BookFormat }> {
     // biome-ignore lint: foliate-js returns untyped book objects
     let book: any = null;
     let format: BookFormat = "EPUB";
@@ -153,7 +156,11 @@ export class DocumentLoader {
           format = "CBZ";
         } else if (this.isFBZ()) {
           const entry = entries.find((e) => e.filename.endsWith(`.${EXTS.FB2}`));
-          const blob = await loader.loadBlob((entry ?? entries[0]!).filename);
+          const fb2Entry = entry ?? entries[0];
+          if (!fb2Entry) {
+            throw new Error("FBZ archive is empty");
+          }
+          const blob = await loader.loadBlob(fb2Entry.filename);
           const { makeFB2 } = await import("foliate-js/fb2.js");
           book = await makeFB2(blob);
           format = "FBZ";
@@ -169,7 +176,7 @@ export class DocumentLoader {
         const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
         ensurePdfWorker();
         const { makePDF } = await import("foliate-js/pdf.js");
-        book = await makePDF(this.file);
+        book = await makePDF(this.file, { signal });
         format = "PDF";
       } else if (await (await import("foliate-js/mobi.js")).isMOBI(this.file)) {
         const fflate = await import("foliate-js/vendor/fflate.js");
@@ -194,7 +201,7 @@ export class DocumentLoader {
         throw new Error(`Unsupported file format: ${this.file.name}`);
       }
     } catch (e: unknown) {
-      console.error("Failed to open document:", e);
+      if (!signal?.aborted) console.error("Failed to open document:", e);
       if (e instanceof Error && e.message?.includes("not a valid zip")) {
         throw new Error("Unsupported or corrupted book file");
       }

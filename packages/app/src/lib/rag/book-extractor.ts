@@ -31,6 +31,7 @@ export async function extractBookChapters(filePath: string): Promise<ChapterData
   const { book, format } = await loader.open();
 
   if (format === "PDF") {
+    await book.destroy?.();
     return extractPdfChapters(fileBytes);
   }
 
@@ -112,9 +113,9 @@ async function extractEpubTocFromFile(file: File): Promise<TocTreeItemLike[]> {
     const parser = new DOMParser();
     const containerDoc = parser.parseFromString(containerXml, "application/xml");
     const opfPath =
-      Array.from(containerDoc.getElementsByTagName("*")).find(
-        (element) => element.localName === "rootfile",
-      )?.getAttribute("full-path") || "content.opf";
+      Array.from(containerDoc.getElementsByTagName("*"))
+        .find((element) => element.localName === "rootfile")
+        ?.getAttribute("full-path") || "content.opf";
     const opfXml = await readTextEntry(opfPath);
     if (!opfXml) return [];
 
@@ -401,16 +402,16 @@ function extractBlockText(block: Element): string {
 }
 
 async function extractPdfChapters(fileBytes: Uint8Array): Promise<ChapterData[]> {
-  const { ensurePdfWorker } = await import("@/lib/pdf/pdf-worker");
-  ensurePdfWorker();
-  const pdfjsLib = await import("pdfjs-dist");
+  const { withPdfDocument } = await import("@/lib/pdf/pdf-worker");
+  return withPdfDocument(
+    { data: new Uint8Array(fileBytes), useWorkerFetch: false, isEvalSupported: false },
+    readPdfChapters,
+  );
+}
 
-  const pdfDoc = await pdfjsLib.getDocument({
-    data: new Uint8Array(fileBytes),
-    useWorkerFetch: false,
-    isEvalSupported: false,
-  }).promise;
-
+async function readPdfChapters(
+  pdfDoc: import("pdfjs-dist").PDFDocumentProxy,
+): Promise<ChapterData[]> {
   const chapters: ChapterData[] = [];
   const numPages = pdfDoc.numPages;
   const pagesPerChapter = Math.max(1, Math.min(10, Math.ceil(numPages / 20)));
@@ -423,7 +424,7 @@ async function extractPdfChapters(fileBytes: Uint8Array): Promise<ChapterData[]>
       try {
         const page = await pdfDoc.getPage(p);
         const textContent = await page.getTextContent();
-        const pageText = textContent.items.map((item: any) => item.str ?? "").join(" ");
+        const pageText = textContent.items.map((item) => ("str" in item ? item.str : "")).join(" ");
         if (pageText.trim()) {
           segments.push({
             text: pageText.trim(),
@@ -445,6 +446,5 @@ async function extractPdfChapters(fileBytes: Uint8Array): Promise<ChapterData[]>
     }
   }
 
-  pdfDoc.destroy();
   return chapters;
 }

@@ -7,4 +7,4 @@
  * evaluates and calls `getOrInsertComputed`.
  */
 import "./pdf-worker-polyfills";
-import "pdfjs-dist/build/pdf.worker.mjs";
+export { WorkerMessageHandler } from "pdfjs-dist/build/pdf.worker.mjs";

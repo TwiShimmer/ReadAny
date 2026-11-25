@@ -14,6 +14,7 @@
  * `workerPort`, which pdf.js destroys together with the first document).
  */
 import { configurePDFWorker } from "foliate-js/pdf.js";
+import { type PDFDocumentProxy, getDocument } from "pdfjs-dist";
 import pdfWorkerUrl from "./pdf-worker-entry.ts?worker&url";
 
 let configured = false;
@@ -30,5 +31,20 @@ export function ensurePdfWorker(): void {
     // permanently falling back to the CDN/workerSrc-less path.
     console.error("[pdf-worker] Failed to configure the bundled PDF worker:", error);
     throw error;
+  }
+}
+
+export async function withPdfDocument<T>(
+  source: Parameters<typeof getDocument>[0],
+  useDocument: (pdf: PDFDocumentProxy) => Promise<T>,
+): Promise<T> {
+  ensurePdfWorker();
+  const task = getDocument(source);
+  try {
+    return await useDocument(await task.promise);
+  } finally {
+    await task
+      .destroy()
+      .catch((error) => console.warn("Failed to release PDF loading task:", error));
   }
 }

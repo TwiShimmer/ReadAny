@@ -401,15 +401,18 @@ export function AppLayout() {
           );
         })}
 
-        {draftTabs.map((tab) => (
-          <div
-            key={tab.id}
-            className="absolute inset-0 overflow-hidden pt-8"
-            style={{ display: activeTabId === tab.id ? "block" : "none" }}
-          >
-            <EpubDraftWorkspace draftId={tab.draftId!} />
-          </div>
-        ))}
+        {draftTabs.map((tab) => {
+          if (!tab.draftId) return null;
+          return (
+            <div
+              key={tab.id}
+              className="absolute inset-0 overflow-hidden pt-8"
+              style={{ display: activeTabId === tab.id ? "block" : "none" }}
+            >
+              <EpubDraftWorkspace draftId={tab.draftId} />
+            </div>
+          );
+        })}
       </main>
       <MissingBookPromptDialog />
       <SettingsDialog open={showSettings} onClose={() => setShowSettings(false)} />

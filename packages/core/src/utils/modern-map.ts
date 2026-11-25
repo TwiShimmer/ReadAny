@@ -104,11 +104,18 @@ export function installMapUpsertPolyfill(ctor: UpsertPrototype = Map): boolean {
   return installed;
 }
 
-/**
- * Installs both upsert methods on a WeakMap-like constructor. Primitive keys
- * are rejected by the receiver's own `has` (native WeakMap throws), preserving
- * spec behaviour without duplicating the key validation here.
- */
+function assertWeakMapKey(key: unknown): void {
+  if ((typeof key === "object" && key !== null) || typeof key === "function") return;
+  if (typeof key === "symbol" && Symbol.keyFor(key) === undefined) {
+    // Older runtimes can reject even unregistered symbols. Probe a separate
+    // map so validation never changes the receiver or invokes user code.
+    Reflect.apply(WeakMap.prototype.set, new WeakMap(), [key, true]);
+    return;
+  }
+  throw new TypeError("Invalid WeakMap key");
+}
+
+/** Installs both upsert methods on a WeakMap-like constructor. */
 export function installWeakMapUpsertPolyfill(ctor: UpsertPrototype = WeakMap): boolean {
   let installed = false;
 
@@ -126,6 +133,7 @@ export function installWeakMapUpsertPolyfill(ctor: UpsertPrototype = WeakMap): b
   ): V {
     assertReceiver<K, V>(ctor, this, "WeakMap", "getOrInsertComputed");
     assertCallback(callback, "WeakMap", "getOrInsertComputed");
+    assertWeakMapKey(key);
     if (this.has(key)) return this.get(key) as V;
     const value = callback(key);
     this.set(key, value);
