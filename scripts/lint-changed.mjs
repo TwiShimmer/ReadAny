@@ -44,8 +44,20 @@ const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], {
 function argBase(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
-    if (arg === "--base") return argv[index + 1];
-    if (arg.startsWith("--base=")) return arg.slice("--base=".length);
+    if (arg === "--base") {
+      const value = argv[index + 1]?.trim();
+      if (!value || value.startsWith("-")) {
+        throw new Error("[lint:changed] --base requires a ref, e.g. --base origin/main.");
+      }
+      return value;
+    }
+    if (arg.startsWith("--base=")) {
+      const value = arg.slice("--base=".length).trim();
+      if (!value) {
+        throw new Error("[lint:changed] --base requires a ref, e.g. --base=origin/main.");
+      }
+      return value;
+    }
   }
   return undefined;
 }
@@ -59,10 +71,18 @@ function refExists(ref) {
   );
 }
 
+function remoteNames() {
+  return execFileSync("git", ["remote"], { cwd: repoRoot, encoding: "utf8" })
+    .split(/\r?\n/)
+    .filter(Boolean);
+}
+
 function fetchRef(base) {
   const separator = base.indexOf("/");
-  const remote = separator > 0 ? base.slice(0, separator) : "origin";
-  const branch = separator > 0 ? base.slice(separator + 1) : base;
+  const maybeRemote = separator > 0 ? base.slice(0, separator) : "";
+  const isKnownRemote = Boolean(maybeRemote) && remoteNames().includes(maybeRemote);
+  const remote = isKnownRemote ? maybeRemote : "origin";
+  const branch = isKnownRemote ? base.slice(separator + 1) : base;
 
   try {
     execFileSync("git", ["fetch", "--quiet", "--no-tags", remote, branch], {
@@ -74,19 +94,28 @@ function fetchRef(base) {
   }
 }
 
+function warnIfLocalFallback(ref, base) {
+  if (ref === base && !base.includes("/")) {
+    console.warn(
+      `[lint:changed] origin/${base} not found; using local ref "${base}", which may be stale. Pass --base origin/<branch> or LINT_BASE_REF to be explicit.`,
+    );
+  }
+  return ref;
+}
+
 function resolveBaseRef() {
   const explicit = argBase(process.argv.slice(2))?.trim() || process.env.LINT_BASE_REF?.trim();
   const base = explicit || process.env.GITHUB_BASE_REF?.trim() || "main";
   const refs = base.includes("/") ? [base] : [`origin/${base}`, base];
 
   for (const ref of refs) {
-    if (refExists(ref)) return ref;
+    if (refExists(ref)) return warnIfLocalFallback(ref, base);
   }
 
   fetchRef(base);
 
   for (const ref of refs) {
-    if (refExists(ref)) return ref;
+    if (refExists(ref)) return warnIfLocalFallback(ref, base);
   }
 
   throw new Error(
@@ -110,8 +139,16 @@ function changedFiles(baseRef) {
   // untracked files so the same script works before committing.
   return [
     ...new Set([
-      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", "-z", `${baseRef}...HEAD`]),
-      ...gitFileList(["diff", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"]),
+      // --no-renames turns a rename into A+D, so the new path is always linted.
+      ...gitFileList([
+        "diff",
+        "--no-renames",
+        "--name-only",
+        "--diff-filter=ACMR",
+        "-z",
+        `${baseRef}...HEAD`,
+      ]),
+      ...gitFileList(["diff", "--no-renames", "--name-only", "--diff-filter=ACMR", "-z", "HEAD"]),
       ...gitFileList(["ls-files", "-z", "--others", "--exclude-standard"]),
     ]),
   ];
