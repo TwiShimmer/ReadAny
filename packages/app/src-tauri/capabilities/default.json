@@ -17,6 +17,7 @@
     "sql:allow-execute",
     "sql:allow-select",
     "fs:default",
+    "fs:allow-open",
     "fs:allow-read",
     "fs:allow-write",
     "fs:allow-exists",

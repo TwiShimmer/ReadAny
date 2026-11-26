@@ -57,7 +57,7 @@ import {
   withDatabaseLockRetry,
 } from "./simple-sync";
 import type { DeviceSyncPayload } from "./simple-sync";
-import type { ISyncBackend, RemoteFile } from "./sync-backend";
+import type { ISyncBackend } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
 import type { FileSyncFailure, SyncProgress } from "./sync-types";
 
@@ -574,6 +574,7 @@ export async function runPerBookSync(
   error?: string;
 }> {
   const { receiveOnly = false, forceApply = false } = options;
+  const syncStartedAt = Date.now();
   try {
     const db = await getDB();
     const deviceId = await getLocalDeviceId();
@@ -814,12 +815,15 @@ export async function runPerBookSync(
 
       // Pull: every remote day file that is past our cursor, or whose file
       // changed under the cursor (offline devices write old days).
-      const dayEntries = await backend.listDir(CHAT_DIR).catch(() => [] as RemoteFile[]);
+      const dayEntries = await backend.listDir(CHAT_DIR);
       const dayFiles = dayEntries
         .filter((e) => !e.isDirectory && /^\d{4}-\d{2}-\d{2}\.json$/.test(e.name))
         .map((e) => ({ day: e.name.replace(/\.json$/, ""), lastModified: e.lastModified }))
         .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
 
+      let nextPulledDay = pulledDay;
+      let mergedDaysChanged = false;
+      let pushedMessages = false;
       for (const { day, lastModified } of dayFiles) {
         const pastCursor = day > pulledDay;
         // Cheap up-front filter for the days under our cursor: the PROPFIND
@@ -861,19 +865,17 @@ export async function runPerBookSync(
           await applyTombstoneMap(db, "messages", file.deleted, undefined, forceApply, deviceId);
         }, "apply chat day file");
         mergedDayVersions[day] = file.updatedAt;
-        if (day > pulledDay) {
-          await setMetadata(CHAT_PULLED_DAY_KEY, day);
-        }
-        await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
+        mergedDaysChanged = true;
+        if (day > nextPulledDay) nextPulledDay = day;
         await sleep(0);
       }
 
       // Push: day files containing messages created after our last push.
       if (!receiveOnly) {
         const pushedAt = legacyImported ? 0 : Number((await getMetadata(CHAT_PUSHED_AT_KEY)) ?? 0);
-        const newMessages = await db
-          .select<Row>("SELECT * FROM messages WHERE created_at > ?", [pushedAt])
-          .catch(() => [] as Row[]);
+        const newMessages = await db.select<Row>("SELECT * FROM messages WHERE created_at > ?", [
+          pushedAt,
+        ]);
         const byDay = new Map<string, Row[]>();
         for (const message of newMessages) {
           const day = dayKeyOf(Number(message.created_at ?? Date.now()));
@@ -891,15 +893,17 @@ export async function runPerBookSync(
             updatedAt: Date.now(),
           };
           await backend.putJSON(`${CHAT_DIR}/${day}.json`, file);
+          pushedMessages = true;
+          mergedDaysChanged = true;
           mergedDayVersions[day] = file.updatedAt;
           changes += localMessages.length;
           await sleep(0);
         }
-        if (byDay.size > 0) {
-          await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
-        }
-        await setMetadata(CHAT_PUSHED_AT_KEY, String(Date.now()));
       }
+      if (mergedDaysChanged)
+        await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
+      if (nextPulledDay > pulledDay) await setMetadata(CHAT_PULLED_DAY_KEY, nextPulledDay);
+      if (pushedMessages) await setMetadata(CHAT_PUSHED_AT_KEY, String(syncStartedAt));
     }
 
     // 7. Profile files — one uniform single-table file per table
@@ -929,10 +933,12 @@ export async function runPerBookSync(
     // 8. Reading sessions — monthly shards
     progress("同步阅读统计...");
     const lastSync = legacyImported ? 0 : await getLastSyncTimestamp();
-    const changedSessions = await db
-      .select<Row>("SELECT * FROM reading_sessions WHERE updated_at > ?", [lastSync])
-      .catch(() => [] as Row[]);
+    const shardEntries = await backend.listDir(SESSIONS_DIR);
     if (!receiveOnly) {
+      const changedSessions = await db.select<Row>(
+        "SELECT * FROM reading_sessions WHERE updated_at > ?",
+        [lastSync],
+      );
       const byMonth = new Map<string, Row[]>();
       for (const session of changedSessions) {
         const startedAt = Number(session.started_at ?? session.updated_at ?? 0);
@@ -956,7 +962,6 @@ export async function runPerBookSync(
         await sleep(0);
       }
     }
-    const shardEntries = await backend.listDir(SESSIONS_DIR).catch(() => [] as RemoteFile[]);
     for (const shard of shardEntries) {
       if (shard.isDirectory || !shard.name.endsWith(".json")) continue;
       const file = await backend.getJSON<SessionShardFile>(
@@ -1048,7 +1053,9 @@ export async function runPerBookSync(
       ];
     }
 
-    await setLastSyncTimestamp(Date.now());
+    if (filesUploadFailed === 0 && filesDownloadFailed === 0) {
+      await setLastSyncTimestamp(syncStartedAt);
+    }
 
     onProgress?.({
       phase: "database",

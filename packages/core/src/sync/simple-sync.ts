@@ -970,7 +970,9 @@ export async function runSimpleSync(
     }
 
     // 5. Update last sync timestamp
-    await setLastSyncTimestamp(now);
+    if (filesUploadFailed === 0 && filesDownloadFailed === 0) {
+      await setLastSyncTimestamp(now);
+    }
 
     onProgress?.({
       phase: "database",

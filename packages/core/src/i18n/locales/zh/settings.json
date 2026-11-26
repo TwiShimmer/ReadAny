@@ -279,6 +279,7 @@
     "syncAllowInsecureDesc": "跳过 TLS 证书验证（用于自签名证书）",
     "syncAllowInsecureDescMobile": "对自签名证书服务器使用 HTTP 代替 HTTPS",
     "syncBufferedSizeUnknown": "无法确定 {{path}} 的大小。缓冲上传要求文件大小已知，上限为 {{limit}}。",
+    "syncUnverifiableUploadTooLarge": "此设备只能安全上传不超过 {{limit}} 的 WebDAV 文件。{{path}} 的大小为 {{size}}。请从 ReadAny 桌面端或 WebDAV 服务端上传该文件。",
     "syncFileHttpFailure": "存储服务器返回了异常响应（HTTP {{status}}）。",
     "syncFileTransferFailure": "文件传输失败，请检查文件和存储连接。",
     "syncFilePhaseFailure": "文件同步未能完成，请检查存储连接后重试。",

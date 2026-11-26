@@ -7,7 +7,9 @@ import type { ISyncAdapter } from "@readany/core/sync";
 import Constants from "expo-constants";
 import * as Crypto from "expo-crypto";
 import { Directory, File, Paths } from "expo-file-system";
+import { moveAsync } from "expo-file-system/legacy";
 import { Platform } from "react-native";
+import SyncFileTransfer from "../../../modules/sync-file-transfer";
 
 const MAX_MOBILE_BUFFERED_TRANSFER_BYTES = 16 * 1024 * 1024;
 
@@ -121,6 +123,31 @@ export class MobileSyncAdapter implements ISyncAdapter {
       destFile.delete();
     }
     srcFile.copy(destFile);
+  }
+
+  async readFilePrefix(filePath: string, limit: number): Promise<Uint8Array> {
+    const handle = new File(filePath).open();
+    try {
+      return handle.readBytes(limit);
+    } finally {
+      handle.close();
+    }
+  }
+
+  async replaceFile(src: string, dest: string): Promise<void> {
+    const source = new File(src);
+    const destination = new File(dest);
+    if (Platform.OS === "android") {
+      await moveAsync({ from: source.uri, to: destination.uri });
+      return;
+    }
+    if (SyncFileTransfer) {
+      await SyncFileTransfer.replace(source.uri, destination.uri);
+      return;
+    }
+    if (destination.exists)
+      throw new Error("Update ReadAny to replace an existing synced file safely");
+    source.move(destination);
   }
 
   async deleteFile(filePath: string): Promise<void> {

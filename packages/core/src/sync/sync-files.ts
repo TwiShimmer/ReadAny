@@ -11,6 +11,8 @@
 
 import { getDB } from "../db/database";
 import i18n from "../i18n";
+import { UnverifiableUploadTargetError } from "../services/platform";
+import { DAV_BODY_PREFIX_BYTES, isUnsafeDavFilePrefix } from "./dav-response";
 import { canonicalBookFilePath } from "./local-book-paths";
 import { getSyncAdapter } from "./sync-adapter";
 import { DEFAULT_SYNC_CONFIG, type ISyncBackend, type RemoteFile } from "./sync-backend";
@@ -101,6 +103,7 @@ const DEFAULT_MAX_BUFFERED_TRANSFER_BYTES = 256 * 1024 * 1024;
  * catches obviously unsupported payloads and gives a diagnosable error.
  */
 const MAX_STREAMING_TRANSFER_BYTES = 2 * 1024 * 1024 * 1024;
+const STAGED_DOWNLOAD_PREFIX = ".readany-transfer-";
 
 class UploadSizeError extends Error {}
 
@@ -108,17 +111,6 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(2)} KB`;
   return `${bytes} B`;
-}
-
-async function makeTempTransferPath(finalPath: string): Promise<string> {
-  const adapter = getSyncAdapter();
-  const tempDir = await adapter.getTempDir();
-  await adapter.ensureDir(tempDir);
-  const ext = getExt(finalPath) || "tmp";
-  return adapter.joinPath(
-    tempDir,
-    `readany-transfer-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`,
-  );
 }
 
 async function uploadFileToRemote(
@@ -129,6 +121,7 @@ async function uploadFileToRemote(
 ): Promise<number | null> {
   const adapter = getSyncAdapter();
   const fileSize = await adapter.getFileSize(localPath);
+  let unverifiedDirectUpload = false;
 
   // Path-based upload (Tauri/Expo native streaming): the file never enters
   // the JS heap, so only the much higher streaming ceiling applies.
@@ -144,7 +137,8 @@ async function uploadFileToRemote(
       await backend.putFile(remotePath, localPath, onProgress);
       return null;
     } catch (e) {
-      if (!isDirectFileTransferUnsupported(e)) throw e;
+      unverifiedDirectUpload = e instanceof UnverifiableUploadTargetError;
+      if (!unverifiedDirectUpload && !isDirectFileTransferUnsupported(e)) throw e;
       console.warn(
         `[Sync] Direct upload unsupported for ${remotePath}; falling back to buffered upload`,
       );
@@ -166,6 +160,17 @@ async function uploadFileToRemote(
     );
   }
   if (fileSize > bufferedLimit) {
+    if (unverifiedDirectUpload) {
+      throw new UploadSizeError(
+        i18n.t("settings.syncUnverifiableUploadTooLarge", {
+          defaultValue:
+            "This device can only upload WebDAV files up to {{limit}} with redirect verification. {{path}} is {{size}}. Upload it from ReadAny on desktop or directly through your WebDAV server.",
+          path: remotePath,
+          size: formatBytes(fileSize),
+          limit: formatBytes(bufferedLimit),
+        }),
+      );
+    }
     throw new UploadSizeError(
       `文件超过缓冲上传上限：${remotePath}（${formatBytes(fileSize)}），上限 ${formatBytes(
         bufferedLimit,
@@ -188,34 +193,54 @@ async function downloadRemoteFileToPath(
 ): Promise<number | null> {
   const adapter = getSyncAdapter();
 
-  if (backend.getFileToPath) {
-    const tempPath = await makeTempTransferPath(localPath);
-    try {
-      await backend.getFileToPath(remotePath, tempPath, onProgress);
-      const dir = getDirName(localPath);
-      if (dir) await adapter.ensureDir(dir);
-      await adapter.copyFile(tempPath, localPath);
-      return null;
-    } catch (e) {
-      if (!isDirectFileTransferUnsupported(e)) throw e;
-      console.warn(
-        `[Sync] Direct download unsupported for ${remotePath}; falling back to buffered download`,
-      );
-    } finally {
-      try {
-        await adapter.deleteFile(tempPath);
-      } catch {}
-    }
-  }
-
-  const data = backend.getWithProgress
-    ? await backend.getWithProgress(remotePath, onProgress)
-    : await backend.get(remotePath);
   const dir = getDirName(localPath);
   if (dir) await adapter.ensureDir(dir);
-  await adapter.writeFileBytes(localPath, data);
-  onProgress?.(data.length, data.length);
-  return data.length;
+  const tempPath = adapter.joinPath(
+    dir,
+    `${STAGED_DOWNLOAD_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  const validateDownload = (bytes: Uint8Array) => {
+    if (bytes.length === 0) throw new Error("Downloaded file is empty");
+    if (isUnsafeDavFilePrefix(bytes, remotePath)) {
+      throw new WebDavError("unexpected-response", "Unexpected WebDAV download response", {
+        status: 200,
+        method: "GET",
+      });
+    }
+  };
+  try {
+    if (backend.getFileToPath) {
+      let downloaded = false;
+      try {
+        await backend.getFileToPath(remotePath, tempPath, onProgress);
+        downloaded = true;
+      } catch (error) {
+        if (!isDirectFileTransferUnsupported(error)) throw error;
+      }
+      if (downloaded) {
+        if (backend.type === "webdav")
+          validateDownload(await adapter.readFilePrefix(tempPath, DAV_BODY_PREFIX_BYTES));
+        else if ((await adapter.getFileSize(tempPath)) === 0)
+          throw new Error("Downloaded file is empty");
+        await adapter.replaceFile(tempPath, localPath);
+        return null;
+      }
+    }
+
+    const data = backend.getWithProgress
+      ? await backend.getWithProgress(remotePath, onProgress)
+      : await backend.get(remotePath);
+    if (data.length === 0) throw new Error("Downloaded file is empty");
+    if (backend.type === "webdav") validateDownload(data);
+    await adapter.writeFileBytes(tempPath, data);
+    await adapter.replaceFile(tempPath, localPath);
+    onProgress?.(data.length, data.length);
+    return data.length;
+  } finally {
+    try {
+      await adapter.deleteFile(tempPath);
+    } catch {}
+  }
 }
 
 type BookRow = {
@@ -610,8 +635,10 @@ export async function syncFiles(
     if (info.hasFile && info.fileExt) {
       const localExists = localExistsMap.get(info.localFilePath) ?? false;
       const remoteExists = migration.fileAtNew;
+      const willDownload =
+        remoteExists && (forceDownloadAll || (downloadRemoteBooks && !localExists));
 
-      if (localExists && book.sync_status && book.sync_status !== "local") {
+      if (!willDownload && localExists && book.sync_status && book.sync_status !== "local") {
         try {
           await setBookSyncStatus(book.id, "local");
         } catch (e) {
@@ -636,7 +663,7 @@ export async function syncFiles(
         });
       }
 
-      if (remoteExists && (forceDownloadAll || (downloadRemoteBooks && !localExists))) {
+      if (willDownload) {
         downloadTasks.push({
           ...buildDownloadFileTask(backend, info, setBookSyncStatus),
           sizeBytes: migration.fileSize,
@@ -855,6 +882,7 @@ async function loadRemoteListings(
 
   for (let i = 0; i < settled.length; i++) {
     if (settled[i].status === "rejected") {
+      if (backend.type === "webdav") throw (settled[i] as PromiseRejectedResult).reason;
       const dirs = [REMOTE_BOOKS_ROOT, REMOTE_FILES, REMOTE_COVERS];
       console.warn(
         `[Sync] Failed to list remote dir ${dirs[i]}, assuming empty:`,
@@ -1443,6 +1471,7 @@ async function cleanupLocalOrphans(
   ]);
 
   const idFromLocalName = (name: string): string | null => {
+    if (name.startsWith(STAGED_DOWNLOAD_PREFIX)) return null;
     const dot = name.lastIndexOf(".");
     if (dot <= 0) return null;
     return name.slice(0, dot);
@@ -1522,6 +1551,7 @@ export async function downloadBookFile(
 ): Promise<DownloadBookOutcome> {
   const adapter = getSyncAdapter();
   const { setBookSyncStatus, updateBook } = await import("../db/database");
+  let needsRemoteStatus = false;
 
   try {
     const localRelativePath = canonicalBookFilePath(bookId, filePath);
@@ -1555,6 +1585,7 @@ export async function downloadBookFile(
 
     const appDataDir = await adapter.getAppDataDir();
     const localPath = adapter.joinPath(appDataDir, localRelativePath);
+    needsRemoteStatus = !(await adapter.fileExists(localPath));
     const reportDownloadProgress = (loaded: number, total: number) => {
       if (total > 0) onProgress?.({ downloaded: loaded, total });
     };
@@ -1625,15 +1656,8 @@ export async function downloadBookFile(
       console.log(
         `[Sync] Book file not found on remote (new=${newPath}, legacy=${legacyPath}, title=${book?.title ?? "?"})`,
       );
-      await setBookSyncStatus(bookId, "remote");
+      if (needsRemoteStatus) await setBookSyncStatus(bookId, "remote");
       return sawNon404Error ? "error" : "not-found";
-    }
-
-    const localSize = await adapter.getFileSize(localPath);
-    if (localSize === 0) {
-      console.warn(`[Sync] Downloaded empty book file for ${bookId}; keeping it remote`);
-      await setBookSyncStatus(bookId, "remote");
-      return "error";
     }
 
     onProgress?.({ downloaded: 100, total: 100 });
@@ -1642,7 +1666,6 @@ export async function downloadBookFile(
     return "ok";
   } catch (e) {
     console.error(`[Sync] Failed to download book ${bookId}:`, e);
-    await setBookSyncStatus(bookId, "remote");
     return "error";
   }
 }

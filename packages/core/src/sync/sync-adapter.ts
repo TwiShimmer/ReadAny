@@ -30,6 +30,9 @@ export interface ISyncAdapter {
   /** Read a file as Uint8Array */
   readFileBytes(filePath: string): Promise<Uint8Array>;
 
+  /** Read up to the given number of bytes from the beginning of a file. */
+  readFilePrefix(filePath: string, limit: number): Promise<Uint8Array>;
+
   /** Get file size in bytes, or null when unavailable. */
   getFileSize(filePath: string): Promise<number | null>;
 
@@ -41,6 +44,9 @@ export interface ISyncAdapter {
 
   /** Copy file from source to destination */
   copyFile(src: string, dest: string): Promise<void>;
+
+  /** Atomically install a staged file in the same directory. */
+  replaceFile(src: string, dest: string): Promise<void>;
 
   /** Delete a file */
   deleteFile(filePath: string): Promise<void>;
