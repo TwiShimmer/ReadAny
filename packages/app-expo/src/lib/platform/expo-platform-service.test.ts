@@ -1,3 +1,4 @@
+import { isDavMissingResponse } from "@readany/core/sync/dav-response";
 import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -77,17 +78,20 @@ describe("Expo WebDAV transport", () => {
     vi.unstubAllGlobals();
   });
 
-  it.each([404, 410])("retains the bounded PROPFIND body for HTTP %s", async (status) => {
-    const html = "<!-- gateway --><html>Log in</html>";
-    fetch.mockResolvedValueOnce(response(url, html + " ".repeat(2000), status));
+  it.each([404, 410])(
+    "does not treat disguised PROPFIND markup as empty for HTTP %s",
+    async (status) => {
+      const html = "<!-- gateway --><html>Log in</html>";
+      fetch.mockResolvedValueOnce(response(url, html + " ".repeat(2000), status));
 
-    const result = await platform.fetch(url, { method: "PROPFIND", redirect: "error" });
+      const result = await platform.fetch(url, { method: "PROPFIND", redirect: "error" });
 
-    expect(result.status).toBe(status);
-    expect(await result.text()).toBe(html.padEnd(1024));
-  });
+      expect(result.status).toBe(status);
+      expect(await isDavMissingResponse(result)).toBe(false);
+    },
+  );
 
-  it("preserves the disguised response prefix with React Native's streamless Response", async () => {
+  it("preserves the rejection of a body when the snapshot Response is streamless", async () => {
     const html = "<!-- gateway --><html>Log in</html>";
     fetch.mockResolvedValueOnce(response(url, html, 404));
     vi.stubGlobal(
@@ -100,8 +104,41 @@ describe("Expo WebDAV transport", () => {
     );
 
     const result = await platform.fetch(url, { method: "PROPFIND", redirect: "error" });
-    const prefix = await result.body?.getReader().read();
-    expect(prefix?.value).toEqual(new TextEncoder().encode(html));
+    expect(result.body).toBeNull();
+    expect(await isDavMissingResponse(result)).toBe(false);
+  });
+
+  it.each(["PROPFIND", "GET"])(
+    "does not turn an unreadable %s error into an empty response",
+    async (method) => {
+      const raw = response(url, "<html>Log in</html>", 404);
+      Object.defineProperty(raw, "body", { value: null });
+      const read = vi.spyOn(raw, "arrayBuffer");
+      fetch.mockResolvedValueOnce(raw);
+
+      const result = await platform.fetch(url, { method, redirect: "error" });
+      expect(await isDavMissingResponse(result)).toBe(false);
+      expect(read).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["PROPFIND", "GET"])("accepts an explicitly empty %s 404", async (method) => {
+    const raw = response(url, null, 404);
+    raw.headers.set("Content-Length", "0");
+    fetch.mockResolvedValueOnce(raw);
+
+    const result = await platform.fetch(url, { method, redirect: "error" });
+    expect(await isDavMissingResponse(result)).toBe(true);
+  });
+
+  it("rejects an EPUB with only a mimetype entry", async () => {
+    const writer = new ZipWriter(new Uint8ArrayWriter());
+    await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+    fetch.mockResolvedValueOnce(response(url, await writer.close()));
+
+    await expect(
+      platform.downloadFile(url, "/books/staged.tmp", { rejectRedirects: true }),
+    ).rejects.toMatchObject({ status: 200 });
   });
 
   it.each([
@@ -131,9 +168,16 @@ describe("Expo WebDAV transport", () => {
     expect(files.get(path)).toEqual(new TextEncoder().encode(body));
   });
 
-  it("writes a nonempty ZIP and rejects a truncated archive", async () => {
+  it("writes a valid EPUB and rejects a truncated archive", async () => {
     const writer = new ZipWriter(new Uint8ArrayWriter());
     await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+    await writer.add(
+      "META-INF/container.xml",
+      new TextReader(
+        '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+      ),
+    );
+    await writer.add("book.opf", new TextReader("<package/>"));
     const zip = await writer.close();
     fetch.mockResolvedValueOnce(response(url, zip));
     fetch.mockResolvedValueOnce(response(url, zip.subarray(0, 32)));
@@ -143,6 +187,25 @@ describe("Expo WebDAV transport", () => {
     await expect(
       platform.downloadFile(url, "/books/staged.tmp", { rejectRedirects: true }),
     ).rejects.toMatchObject({ status: 200 });
+  });
+
+  it("validates deflated EPUB metadata without a native DecompressionStream", async () => {
+    const writer = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false });
+    await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+    await writer.add(
+      "META-INF/container.xml",
+      new TextReader(
+        '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+      ),
+    );
+    await writer.add("book.opf", new TextReader("<package/>"));
+    const bytes = await writer.close();
+    fetch.mockResolvedValueOnce(response(url, bytes));
+    vi.stubGlobal("DecompressionStream", undefined);
+    const hermesPlatform = new ExpoPlatformService();
+
+    await hermesPlatform.downloadFile(url, path, { rejectRedirects: true });
+    expect(files.get(path)).toEqual(bytes);
   });
 
   it("aborts a timed-out fetch while reading its body", async () => {

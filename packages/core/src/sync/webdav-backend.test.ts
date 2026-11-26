@@ -184,7 +184,8 @@ describe("WebDavBackend directory healing", () => {
       .mockImplementationOnce(() => new Response(null, { status: 405 }))
       .mockImplementationOnce(() => new Response(null, { status: 201 }));
     installFetchStub((url, options) => {
-      if (options?.method !== "MKCOL") return new Response(null, { status: 404 });
+      if (options?.method !== "MKCOL")
+        return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
       if (url.endsWith("/sync/")) return createSyncDirectory();
       return new Response(null, { status: 201 });
     });

@@ -396,9 +396,10 @@ describe("runPerBookSync (per-book cloud engine)", () => {
     ["sessions", 200],
     ["sessions", 404],
     ["sessions", 410],
+    ["sessions", 404, true],
   ])(
-    "keeps cursors when the %s PROPFIND returns HTTP %s and advances after a successful retry",
-    async (folder, status) => {
+    "keeps cursors when the %s PROPFIND returns HTTP %s (streamless: %s) and advances on retry",
+    async (folder, status, streamless = false) => {
       db.syncMetadata.set("last_sync_at", String(T1));
       db.syncMetadata.set("perbook:sessions-pushed-at", String(T1));
       db.syncMetadata.set("perbook:chat-pulled-day", "2024-04-01");
@@ -413,12 +414,12 @@ describe("runPerBookSync (per-book cloud engine)", () => {
         await client.safeReadDir(path);
         return [];
       });
-      networkMocks.fetch.mockResolvedValueOnce(
-        new Response("<!-- login --><html>Sign in</html>", {
-          status,
-          headers: { "Content-Type": status === 410 ? "text/html" : "text/plain" },
-        }),
-      );
+      const response = new Response("<!-- login --><html>Sign in</html>", {
+        status,
+        headers: { "Content-Type": status === 410 ? "text/html" : "text/plain" },
+      });
+      if (streamless) Object.defineProperty(response, "body", { value: null });
+      networkMocks.fetch.mockResolvedValueOnce(response);
 
       const failed = await runPerBookSync(backend, undefined, { receiveOnly: true });
       expect(failed.success).toBe(false);
@@ -428,7 +429,10 @@ describe("runPerBookSync (per-book cloud engine)", () => {
       expect(db.syncMetadata.get("perbook:sessions-pushed-at")).toBe(String(T1));
 
       networkMocks.fetch.mockResolvedValueOnce(
-        new Response("Missing collection", { status: status === 410 ? 410 : 404 }),
+        new Response(null, {
+          status: status === 410 ? 410 : 404,
+          headers: { "Content-Length": "0" },
+        }),
       );
       const retried = await runPerBookSync(backend, undefined, { receiveOnly: true });
       expect(retried.success).toBe(true);
@@ -515,6 +519,56 @@ describe("runPerBookSync (per-book cloud engine)", () => {
 
     await runPerBookSync(backend, undefined, { receiveOnly: true });
     expect(Number(db.syncMetadata.get("last_sync_at"))).toBeGreaterThan(T1);
+  });
+
+  it("does not replay a successfully uploaded session when a cover download keeps failing", async () => {
+    db.syncMetadata.set("last_sync_at", String(T2));
+    const session = { id: "session-1", book_id: "book-1", started_at: T1, updated_at: T1 };
+    db.insert("reading_sessions", session);
+    const backend = new FakeBackend({
+      "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+    });
+    const putJSON = vi.spyOn(backend, "putJSON");
+    const fileFailure = {
+      filesUploaded: 0,
+      filesDownloaded: 0,
+      filesUploadFailed: 0,
+      filesDownloadFailed: 1,
+      failures: [{ path: "/cover.jpg", message: "Unexpected WebDAV response" }],
+    };
+    syncFileMocks.syncFiles.mockResolvedValueOnce(fileFailure).mockResolvedValueOnce(fileFailure);
+
+    expect((await runPerBookSync(backend)).filesDownloadFailed).toBe(1);
+    expect((await runPerBookSync(backend)).filesDownloadFailed).toBe(1);
+    expect(db.syncMetadata.get("last_sync_at")).toBe(String(T2));
+    expect(
+      putJSON.mock.calls.filter(([path]) => path.startsWith("/readany/sync/sessions/")),
+    ).toEqual([[expect.any(String), expect.objectContaining({ sessions: [session] })]]);
+  });
+
+  it("does not rewrite a session shard after a later shard PUT fails during upgrade replay", async () => {
+    const session = { id: "session-1", book_id: "book-1", started_at: T1, updated_at: T1 };
+    db.insert("reading_sessions", session);
+    db.insert("reading_sessions", {
+      ...session,
+      id: "session-2",
+      started_at: T1 + 90 * 24 * 60 * 60 * 1000,
+    });
+    const backend = new FakeBackend({
+      "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+    });
+    const put = backend.putJSON.bind(backend);
+    const attempted = new Map<string, number>();
+    vi.spyOn(backend, "putJSON").mockImplementation(async (path, data) => {
+      if (path.startsWith("/readany/sync/sessions/")) {
+        attempted.set(path, (attempted.get(path) ?? 0) + 1);
+        if (attempted.size === 2 && attempted.get(path) === 1) throw new Error("PUT failed");
+      }
+      return put(path, data);
+    });
+    expect((await runPerBookSync(backend)).success).toBe(false);
+    expect((await runPerBookSync(backend)).success).toBe(true);
+    expect([...attempted.values()]).toEqual([1, 2]);
   });
 
   afterEach(() => {

@@ -323,7 +323,7 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
         ) {
           return collectionResponse(url);
         }
-        return new Response(null, { status: 404 });
+        return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
       }
       if (path === "/dav/ancestor/") return new Response(null, { status: 201 });
       if (path === "/dav/ancestor/parent/") return new Response(null, { status: 405 });
@@ -537,7 +537,9 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
           return new Response("", { status: 201 });
         }
         if (method === "PROPFIND")
-          return uploads > 0 ? new Response(null, { status: 404 }) : collectionResponse(url);
+          return uploads > 0
+            ? new Response(null, { status: 404, headers: { "Content-Length": "0" } })
+            : collectionResponse(url);
         return new Response("", { status: 404 });
       },
       uploadFile: async (url) => {
@@ -641,7 +643,14 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
   );
 
   it.each([404, 410])("lists a missing collection as empty (HTTP %s)", async (status) => {
-    const fetch = vi.fn(() => new Response(null, { status, statusText: "Indisponible" }));
+    const fetch = vi.fn(
+      () =>
+        new Response(null, {
+          status,
+          statusText: "Indisponible",
+          headers: { "Content-Length": "0" },
+        }),
+    );
     installFetchStub(fetch);
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
     await expect(client.safeReadDir("/readany/sync")).resolves.toEqual([]);
@@ -692,6 +701,66 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
 
     installFetchStub(() => new Response("", { status: 401 }));
     await expect(client.getJSON("/readany/sync/missing.json")).rejects.toThrow();
+  });
+
+  it.each([
+    [404, "<html>Login</html>"],
+    [409, "<html>Login</html>"],
+    [404, "not found"],
+    [410, '<?xml version="1.0"?><error/>'],
+    [409, ""],
+  ])("does not treat a shard GET with status %s and body %j as missing", async (status, body) => {
+    installFetchStub(() => new Response(body, { status }));
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.getJSON("/sessions/shard.json")).rejects.toMatchObject({ status });
+  });
+
+  it("reads a normal JSON shard", async () => {
+    installFetchStub(() => Response.json({ sessions: [] }));
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.getJSON("/sessions/shard.json")).resolves.toEqual({ sessions: [] });
+  });
+
+  it("does not treat a literal JSON null at HTTP 200 as a missing shard", async () => {
+    installFetchStub(() => Response.json(null));
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.getJSON("/sessions/shard.json")).rejects.toMatchObject({ status: 200 });
+  });
+
+  it.each([undefined, "18"])(
+    "does not infer a missing collection from a streamless response (%s)",
+    async (length) => {
+      const response = new Response("<html>Login</html>", {
+        status: 404,
+        headers: length ? { "Content-Length": length } : {},
+      });
+      Object.defineProperty(response, "body", { value: null });
+      const arrayBuffer = vi.spyOn(response, "arrayBuffer");
+      installFetchStub(() => response);
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+      await expect(client.safeReadDir("/sessions")).rejects.toMatchObject({ status: 404 });
+      expect(arrayBuffer).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [" ".repeat(1023), "<"],
+    [" \t", "<", "html>Login</html>"],
+  ])("rejects a missing collection with markup split across chunks", async (...chunks) => {
+    installFetchStub(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+              controller.close();
+            },
+          }),
+          { status: 404, headers: { "Content-Type": "text/plain" } },
+        ),
+    );
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.safeReadDir("/sessions")).rejects.toMatchObject({ status: 404 });
   });
 
   it("skips re-probing collections confirmed earlier in the same client", async () => {

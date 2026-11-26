@@ -71,6 +71,22 @@ pub async fn sync_hash_file(path: String) -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
+#[tokio::test]
+async fn hashes_a_file_larger_than_the_read_buffer() {
+    let path = std::env::temp_dir().join(format!("readany-hash-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 123))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let result = sync_hash_file(path.to_string_lossy().into_owned()).await;
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        result.unwrap(),
+        "030ccaa3b42e4c1a5f01d6f1e3cb1ac695331e7dd54f16592f818bc1a89fc62d"
+    );
+}
+
 /// Get the local IP address of this machine.
 /// Uses the local-ip-address crate which safely queries network interfaces.
 #[tauri::command]

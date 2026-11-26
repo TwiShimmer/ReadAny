@@ -106,6 +106,13 @@ function installFetchCapture(): { requests: Array<{ method: string; url: string 
       }
       const writer = new ZipWriter(new Uint8ArrayWriter());
       await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+      await writer.add(
+        "META-INF/container.xml",
+        new TextReader(
+          '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
+        ),
+      );
+      await writer.add("book.opf", new TextReader("<package/>"));
       return new Response(await writer.close(), { status: 200 });
     },
   } as unknown as IPlatformService);

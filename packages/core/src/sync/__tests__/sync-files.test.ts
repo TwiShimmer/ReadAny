@@ -46,9 +46,26 @@ vi.mock("../../db/database", () => ({
 
 const { syncFiles, downloadBookFile } = await import("../sync-files");
 
-const zipWriter = new ZipWriter(new Uint8ArrayWriter());
-await zipWriter.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
-const epubBytes = await zipWriter.close();
+async function epubFixture(rootfile?: string, packagePath?: string, mime = "application/epub+zip") {
+  const zip = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false });
+  await zip.add("mimetype", new TextReader(mime), { level: 0 });
+  if (rootfile)
+    await zip.add(
+      "META-INF/container.xml",
+      new TextReader(
+        `<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="${rootfile}"/></rootfiles></container>`,
+      ),
+    );
+  if (packagePath)
+    await zip.add(packagePath, new TextReader('<package xmlns="http://www.idpf.org/2007/opf"/>'));
+  return zip.close();
+}
+const epubBytes = await epubFixture("OPS/book.opf", "OPS/book.opf");
+const mimetypeOnly = await epubFixture();
+const noContainer = await epubFixture(undefined, "OPS/book.opf");
+const noPackage = await epubFixture("OPS/missing.opf", "OPS/book.opf");
+const traversal = await epubFixture("../book.opf", "../book.opf");
+const wrongMime = await epubFixture("OPS/book.opf", "OPS/book.opf", "application/zip");
 
 function createMockBackend(overrides: Partial<ISyncBackend> = {}): ISyncBackend {
   return {
@@ -392,6 +409,38 @@ describe("sync-files", () => {
       );
     });
 
+    it("keeps the legacy book after a MOVE conflict even if the new path exists", async () => {
+      mockSelect.mockResolvedValue([
+        { id: "book-1", file_path: "books/book-1.epub", title: "Test Book", cover_url: null },
+      ]);
+      const legacy = `${REMOTE_FILES}/book-1.epub`;
+      const backend = createMockBackend({
+        listDir: vi.fn(async (path: string) =>
+          path === REMOTE_FILES
+            ? [
+                {
+                  path: legacy,
+                  name: "book-1.epub",
+                  size: 100,
+                  lastModified: 0,
+                  isDirectory: false,
+                },
+              ]
+            : [],
+        ),
+        move: vi.fn().mockRejectedValue(new WebDavError("http", "MOVE conflict", { status: 412 })),
+        exists: vi.fn().mockResolvedValue(true),
+        get: vi.fn().mockRejectedValue(new Error("Target unreadable")),
+      });
+      const result = await syncFiles(backend, undefined, {
+        forceDownloadAll: true,
+        disableUploads: true,
+      });
+      expect(backend.move).toHaveBeenCalledOnce();
+      expect(result.filesDownloadFailed).toBe(1);
+      expect(backend.delete).not.toHaveBeenCalledWith(legacy);
+    });
+
     it("downloads remote files from the new layout when forceDownloadAll is set", async () => {
       mockSelect.mockResolvedValue([
         {
@@ -447,6 +496,11 @@ describe("sync-files", () => {
       { name: "buffered non-ZIP EPUB", body: "Not a ZIP" },
       { name: "staged truncated EPUB", body: epubBytes.subarray(0, 32), native: true },
       { name: "buffered empty ZIP", body: Uint8Array.of(80, 75, 5, 6, ...Array(18).fill(0)) },
+      { name: "buffered mimetype-only ZIP without a hash", body: mimetypeOnly },
+      { name: "staged ZIP missing container.xml without a hash", body: noContainer, native: true },
+      { name: "buffered ZIP with a missing rootfile", body: noPackage },
+      { name: "staged ZIP with a traversing rootfile", body: traversal, native: true },
+      { name: "staged EPUB with the wrong mimetype", body: wrongMime, native: true },
       { name: "buffered TXT", body: "<chapter> is the title.\n", ext: "txt", valid: true },
       {
         name: "staged native TXT",

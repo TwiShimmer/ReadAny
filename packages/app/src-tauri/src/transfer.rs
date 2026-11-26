@@ -142,7 +142,7 @@ fn check_response_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     async fn download_fixture(
         suffix: &str,
@@ -208,9 +208,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_nonempty_epub_zip() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let zip = STANDARD.decode("UEsDBBQAAAAAAKNael1vYassFAAAABQAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi9lcHViK3ppcFBLAQIUABQAAAAAAKNael1vYassFAAAABQAAAAIAAAAAAAAAAAAAACAAQAAAABtaW1ldHlwZVBLBQYAAAAAAQABADYAAAA6AAAAAAA=").unwrap();
+    async fn rejects_mimetype_only_epub_zip() {
+        let zip = epub_fixture(false);
+        let (result, _) = download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
+        assert_eq!(result.unwrap_err().status, Some(200));
+    }
+
+    fn epub_fixture(with_container: bool) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("mimetype", options).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        if with_container {
+            zip.start_file("META-INF/container.xml", options).unwrap();
+            zip.write_all(br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OPS/book.opf"/></rootfiles></container>"#).unwrap();
+            zip.start_file("OPS/book.opf", options).unwrap();
+            zip.write_all(br#"<package xmlns="http://www.idpf.org/2007/opf"/>"#)
+                .unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[tokio::test]
+    async fn stages_an_epub_with_a_container_and_package() {
+        let zip = epub_fixture(true);
         let (result, bytes) =
             download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
         result.unwrap();
