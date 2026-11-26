@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FetchOptions } from "../../services/platform";
 import type { ISyncBackend, RemoteFile } from "../sync-backend";
-import { WebDavClient } from "../webdav-client";
+import { WebDavClient, WebDavError } from "../webdav-client";
 
 type Row = Record<string, unknown>;
 
@@ -390,12 +390,17 @@ describe("runPerBookSync (per-book cloud engine)", () => {
   it.each([
     ["chat", 302],
     ["chat", 200],
+    ["chat", 404],
+    ["chat", 410],
     ["sessions", 302],
     ["sessions", 200],
+    ["sessions", 404],
+    ["sessions", 410],
   ])(
     "keeps cursors when the %s PROPFIND returns HTTP %s and advances after a successful retry",
     async (folder, status) => {
       db.syncMetadata.set("last_sync_at", String(T1));
+      db.syncMetadata.set("perbook:sessions-pushed-at", String(T1));
       db.syncMetadata.set("perbook:chat-pulled-day", "2024-04-01");
       db.syncMetadata.set("perbook:chat-pushed-at", String(T1));
       const backend = new FakeBackend({
@@ -411,7 +416,7 @@ describe("runPerBookSync (per-book cloud engine)", () => {
       networkMocks.fetch.mockResolvedValueOnce(
         new Response("<!-- login --><html>Sign in</html>", {
           status,
-          headers: { "Content-Type": "text/plain", Location: "/login" },
+          headers: { "Content-Type": status === 410 ? "text/html" : "text/plain" },
         }),
       );
 
@@ -420,13 +425,68 @@ describe("runPerBookSync (per-book cloud engine)", () => {
       expect(db.syncMetadata.get("last_sync_at")).toBe(String(T1));
       expect(db.syncMetadata.get("perbook:chat-pulled-day")).toBe("2024-04-01");
       expect(db.syncMetadata.get("perbook:chat-pushed-at")).toBe(String(T1));
+      expect(db.syncMetadata.get("perbook:sessions-pushed-at")).toBe(String(T1));
 
-      networkMocks.fetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
+      networkMocks.fetch.mockResolvedValueOnce(
+        new Response("Missing collection", { status: status === 410 ? 410 : 404 }),
+      );
       const retried = await runPerBookSync(backend, undefined, { receiveOnly: true });
       expect(retried.success).toBe(true);
       expect(Number(db.syncMetadata.get("last_sync_at"))).toBeGreaterThan(T1);
+      expect(db.syncMetadata.get("perbook:sessions-pushed-at")).toBe(String(T1));
     },
   );
+
+  it("uploads a local reading session after a download-only sync", async () => {
+    db.syncMetadata.set("last_sync_at", String(T1));
+    const session = { id: "session-1", book_id: "book-1", started_at: T2, updated_at: T2 };
+    db.insert("reading_sessions", session);
+    const backend = new FakeBackend({
+      "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+    });
+    const putJSON = vi.spyOn(backend, "putJSON");
+
+    expect((await runPerBookSync(backend, undefined, { receiveOnly: true })).success).toBe(true);
+    expect(Number(db.syncMetadata.get("last_sync_at"))).toBeGreaterThan(T2);
+    expect(putJSON).not.toHaveBeenCalled();
+
+    expect((await runPerBookSync(backend)).success).toBe(true);
+    expect(putJSON).toHaveBeenCalledWith(
+      expect.stringContaining("/readany/sync/sessions/"),
+      expect.objectContaining({ sessions: [session] }),
+    );
+    putJSON.mockClear();
+
+    expect((await runPerBookSync(backend)).success).toBe(true);
+    expect(putJSON.mock.calls.some(([path]) => path.startsWith("/readany/sync/sessions/"))).toBe(
+      false,
+    );
+  });
+
+  it("redacts WebDAV errors from directory preflight and global sync logs", async () => {
+    const backend = new FakeBackend({});
+    const url = "https://private-user@dav.example.com/sync?token=private-query#private-fragment";
+    vi.spyOn(backend, "ensureDirectory").mockRejectedValue(
+      new WebDavError("forbidden", `Denied ${url}`, { status: 403, method: "MKCOL", url }),
+    );
+    vi.spyOn(backend, "getJSON").mockRejectedValue(
+      new WebDavError("http", `Failed ${url}`, { status: 400, method: "GET", url }),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    expect((await runPerBookSync(backend)).success).toBe(false);
+    expect(warn).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ kind: "forbidden", status: 403, method: "MKCOL" }),
+    );
+    expect(error).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ kind: "http", status: 400, method: "GET" }),
+    );
+    const logs = JSON.stringify([warn.mock.calls, error.mock.calls]);
+    expect(logs).not.toContain("private");
+  });
 
   beforeEach(() => {
     db = new FakePerBookDb();

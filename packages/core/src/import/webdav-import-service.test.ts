@@ -1,3 +1,4 @@
+import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { describe, expect, it } from "vitest";
 
 import { type FetchOptions, type IPlatformService, setPlatformService } from "../services/platform";
@@ -103,7 +104,9 @@ function installFetchCapture(): { requests: Array<{ method: string; url: string 
       if (method === "PROPFIND") {
         return new Response(PROPFIND_BOOKS_XML, { status: 207 });
       }
-      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      const writer = new ZipWriter(new Uint8ArrayWriter());
+      await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+      return new Response(await writer.close(), { status: 200 });
     },
   } as unknown as IPlatformService);
   return { requests };

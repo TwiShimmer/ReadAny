@@ -136,6 +136,108 @@ fn check_response_target(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    async fn download_fixture(
+        suffix: &str,
+        status: &str,
+        mime: &str,
+        body: &[u8],
+    ) -> (Result<(), TransferError>, Vec<u8>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = [
+            format!("HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes(),
+            body,
+        ].concat();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 2048]).unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        let path = std::env::temp_dir().join(format!("readany-test-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"old book").unwrap();
+        let result = webdav_download_file(
+            format!("http://{address}/book.{suffix}"),
+            path.to_str().unwrap().into(),
+            HashMap::new(),
+            None,
+            Channel::new(|_| Ok(())),
+        )
+        .await;
+        server.join().unwrap();
+        let staged_bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        (result, staged_bytes)
+    }
+
+    #[tokio::test]
+    async fn rejects_json_before_opening_the_download_destination() {
+        let (result, bytes) = download_fixture(
+            "epub",
+            "200 OK",
+            "application/json",
+            br#"{"error":"Login"}"#,
+        )
+        .await;
+        assert_eq!(result.unwrap_err().status, Some(200));
+        assert_eq!(bytes, b"old book");
+    }
+
+    #[tokio::test]
+    async fn accepts_plain_text_starting_with_angle_brackets() {
+        let (result, bytes) =
+            download_fixture("txt", "200 OK", "text/plain", b"<chapter> is the title").await;
+        result.unwrap();
+        assert_eq!(bytes, b"<chapter> is the title");
+    }
+
+    #[tokio::test]
+    async fn rejects_non_zip_and_truncated_epub() {
+        for body in [b"Not a ZIP".as_slice(), b"PK\x03\x04"] {
+            let (result, _) =
+                download_fixture("epub", "200 OK", "application/octet-stream", body).await;
+            assert_eq!(result.unwrap_err().status, Some(200));
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_nonempty_epub_zip() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let zip = STANDARD.decode("UEsDBBQAAAAAAKNael1vYassFAAAABQAAAAIAAAAbWltZXR5cGVhcHBsaWNhdGlvbi9lcHViK3ppcFBLAQIUABQAAAAAAKNael1vYassFAAAABQAAAAIAAAAAAAAAAAAAACAAQAAAABtaW1ldHlwZVBLBQYAAAAAAQABADYAAAA6AAAAAAA=").unwrap();
+        let (result, bytes) =
+            download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
+        result.unwrap();
+        assert_eq!(bytes, zip);
+    }
+
+    #[tokio::test]
+    async fn rejects_disguised_markup_without_touching_destination() {
+        let (result, bytes) = download_fixture(
+            "txt",
+            "200 OK",
+            "text/plain",
+            b"<!-- gateway --><html>Login</html>",
+        )
+        .await;
+        assert_eq!(result.unwrap_err().status, Some(200));
+        assert_eq!(bytes, b"old book");
+    }
+
+    #[tokio::test]
+    async fn rejects_redirect_and_multistatus_without_touching_destination() {
+        for (status, code) in [("302 Found", 302), ("207 Multi-Status", 207)] {
+            let (result, bytes) =
+                download_fixture("epub", status, "text/plain", b"unexpected").await;
+            assert_eq!(result.unwrap_err().status, Some(code));
+            assert_eq!(bytes, b"old book");
+        }
+    }
+}
+
 fn unexpected_response(response: &reqwest::Response) -> TransferError {
     let mut error =
         TransferError::with_status(response.status().as_u16(), "Unexpected WebDAV response");

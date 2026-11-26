@@ -197,6 +197,21 @@ describe("WebDavClient PROPFIND parsing", () => {
     expect(calls.map((call) => call.url)).toEqual(["https://dav.example.com/dav/readany/sync/"]);
   });
 
+  it.each([
+    ["/dav/one/two/", "/dav/one%2Ftwo/"],
+    ["/dav/one%2ftwo/", "/dav/one/two/"],
+    ["/dav/one/two/", "/dav/one//two/"],
+  ])("does not confirm %s with the propstat for %s", async (path, otherHref) => {
+    installFetchStub(() => collectionResponse(`https://dav.example.com${otherHref}`));
+    const client = new WebDavClient(
+      `https://dav.example.com${path.slice(0, -1)}`,
+      "alice",
+      "secret",
+    );
+
+    await expect(client.ping()).rejects.toMatchObject({ kind: "unexpected-response", status: 207 });
+  });
+
   it("preserves remote root path casing while normalizing slashes", () => {
     expect(sanitizeWebDavRemoteRoot(" /Apps//ReadAny-Sync/ ")).toBe("Apps/ReadAny-Sync");
   });
@@ -214,9 +229,10 @@ describe("WebDavClient PROPFIND parsing", () => {
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
     const path =
       "/ReadAnySync/data/books/这里是，终末停滞委员会。 [第一卷]/姉の彼女にキスをした.epub";
-    await client.get(path);
+    await client.get(path.replace(/\.epub$/, ".bin"));
 
     const expectedPath = path
+      .replace(/\.epub$/, ".bin")
       .split("/")
       .map((segment) => encodeURIComponent(segment))
       .join("/");
@@ -294,6 +310,29 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       "https://dav.example.com/dav/readany/data/",
       "https://dav.example.com/dav/readany/data/books/",
     ]);
+  });
+
+  it("does not retry a target MKCOL when only an ancestor was confirmed", async () => {
+    const target = vi.fn(() => new Response(null, { status: 409 }));
+    installFetchStub((url, options) => {
+      const path = new URL(url).pathname;
+      if (options?.method === "PROPFIND") {
+        if (
+          path === "/dav/ancestor/" &&
+          (options.headers as Record<string, string>).Depth === "1"
+        ) {
+          return collectionResponse(url);
+        }
+        return new Response(null, { status: 404 });
+      }
+      if (path === "/dav/ancestor/") return new Response(null, { status: 201 });
+      if (path === "/dav/ancestor/parent/") return new Response(null, { status: 405 });
+      return target();
+    });
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+    await expect(client.mkcol("/ancestor/parent/target")).rejects.toMatchObject({ status: 409 });
+    expect(target).toHaveBeenCalledOnce();
   });
 
   it("keeps the collection URL when a conflict provides no evidence about the slash", async () => {
@@ -611,6 +650,25 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       expect.objectContaining({ method: "PROPFIND" }),
     );
   });
+
+  it.each(["application/xml", "text/plain"])(
+    "rejects an XML error page disguised as a missing collection (%s)",
+    async (contentType) => {
+      installFetchStub(
+        () =>
+          new Response('<?xml version="1.0"?><error>Log in</error>', {
+            status: 404,
+            headers: { "Content-Type": contentType },
+          }),
+      );
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+      await expect(client.safeReadDir("/readany/sync")).rejects.toMatchObject({
+        kind: "unexpected-response",
+        status: 404,
+      });
+    },
+  );
 
   it("does not treat an unrelated localized error containing 404 as a missing collection", async () => {
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");

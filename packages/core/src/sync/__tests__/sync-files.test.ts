@@ -1,3 +1,4 @@
+import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   FileTransferError,
@@ -45,13 +46,17 @@ vi.mock("../../db/database", () => ({
 
 const { syncFiles, downloadBookFile } = await import("../sync-files");
 
+const zipWriter = new ZipWriter(new Uint8ArrayWriter());
+await zipWriter.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
+const epubBytes = await zipWriter.close();
+
 function createMockBackend(overrides: Partial<ISyncBackend> = {}): ISyncBackend {
   return {
     type: "webdav",
     testConnection: vi.fn(),
     ensureDirectories: vi.fn(),
     put: vi.fn(),
-    get: vi.fn().mockResolvedValue(new Uint8Array([10, 20, 30])),
+    get: vi.fn().mockResolvedValue(epubBytes),
     getJSON: vi.fn(),
     putJSON: vi.fn(),
     listDir: vi.fn().mockResolvedValue([]),
@@ -69,7 +74,11 @@ describe("sync-files", () => {
     mockSelect.mockResolvedValue([]);
     mockAdapter.fileExists.mockResolvedValue(false);
     mockAdapter.listFiles.mockResolvedValue([]);
-    mockAdapter.getFileSize.mockResolvedValue(3);
+    mockAdapter.getFileSize.mockResolvedValue(epubBytes.length);
+    mockAdapter.readFilePrefix.mockImplementation(
+      async (_path: string, limit: number, offset = 0) =>
+        epubBytes.subarray(offset, offset + limit),
+    );
     mockAdapter.maxBufferedTransferBytes = undefined;
   });
 
@@ -429,12 +438,49 @@ describe("sync-files", () => {
       expect(result.filesDownloaded).toBe(1);
     });
 
-    it.each(["buffered login page", "native login page", "redirect to login"])(
-      "keeps the local book and sync status on a forced download with a %s",
-      async (scenario) => {
-        const localPath = "/appdata/books/book-1.epub";
+    it.each([
+      { name: "buffered HTML", body: "<!-- sign in --><html>Login</html>" },
+      { name: "staged native HTML", body: "<!-- sign in --><html>Login</html>", native: true },
+      { name: "redirect", body: "<html>Login</html>", status: 302 },
+      { name: "buffered 200 JSON", body: '{"error":"Login"}', mime: "application/json" },
+      { name: "staged native 200 JSON", body: '{"error":"Login"}', native: true },
+      { name: "buffered non-ZIP EPUB", body: "Not a ZIP" },
+      { name: "staged truncated EPUB", body: epubBytes.subarray(0, 32), native: true },
+      { name: "buffered empty ZIP", body: Uint8Array.of(80, 75, 5, 6, ...Array(18).fill(0)) },
+      { name: "buffered TXT", body: "<chapter> is the title.\n", ext: "txt", valid: true },
+      {
+        name: "staged native TXT",
+        body: "<chapter> is the title.\n",
+        ext: "txt",
+        native: true,
+        valid: true,
+      },
+      { name: "buffered EPUB", body: epubBytes, valid: true },
+      { name: "staged native EPUB", body: epubBytes, native: true, valid: true },
+      { name: "mismatched book hash", body: epubBytes, hash: "a".repeat(64) },
+      { name: "matching book hash", body: epubBytes, hash: "b".repeat(64), valid: true },
+      {
+        name: "source hash for a converted TXT",
+        body: epubBytes,
+        hash: "a".repeat(64),
+        format: "txt",
+        valid: true,
+      },
+    ])(
+      "validates a forced $name download before changing the local book and status",
+      async ({
+        body,
+        ext = "epub",
+        format = ext,
+        hash,
+        native,
+        status = 200,
+        mime = "text/plain",
+        valid = false,
+      }) => {
+        const localPath = `/appdata/books/book-1.${ext}`;
         const oldBytes = new Uint8Array([1, 2, 3]);
-        const loginBytes = new TextEncoder().encode("<!-- sign in --><html>Login</html>");
+        const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
         const files = new Map([[localPath, oldBytes]]);
         mockAdapter.fileExists.mockImplementation(async (path: string) => files.has(path));
         mockAdapter.writeFileBytes.mockImplementation(
@@ -449,37 +495,42 @@ describe("sync-files", () => {
         };
         mockAdapter.replaceFile.mockImplementation(replaceFile);
         mockAdapter.copyFile.mockImplementation(replaceFile);
-        mockAdapter.readFilePrefix.mockImplementation(async (path: string, limit: number) =>
-          files.get(path)?.subarray(0, limit),
+        mockAdapter.readFilePrefix.mockImplementation(
+          async (path: string, limit: number, offset = 0) =>
+            files.get(path)?.subarray(offset, offset + limit),
         );
+        mockAdapter.getFileSize.mockImplementation(
+          async (path: string) => files.get(path)?.length ?? null,
+        );
+        mockAdapter.hashFile.mockResolvedValue("b".repeat(64));
         mockAdapter.deleteFile.mockImplementation(async (path: string) => files.delete(path));
         mockSelect.mockResolvedValue([
           {
             id: "book-1",
-            file_path: "books/book-1.epub",
-            file_hash: "h1",
+            file_path: `books/book-1.${ext}`,
+            file_hash: hash ?? "h1",
+            format,
             cover_url: null,
             title: "Test Book",
             sync_status: "remote",
           },
         ]);
 
-        const isRedirect = scenario === "redirect to login";
         setPlatformService({
           fetch: vi.fn(
             async () =>
-              new Response(loginBytes, {
-                status: isRedirect ? 302 : 200,
-                headers: { "Content-Type": "text/plain", Location: "/login" },
+              new Response(bytes, {
+                status,
+                headers: { "Content-Type": mime, Location: "/login" },
               }),
           ),
         } as unknown as IPlatformService);
         const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
         const backend = createMockBackend({
           get: client.get.bind(client),
-          ...(scenario === "native login page" && {
+          ...(native && {
             getFileToPath: async (_remotePath: string, path: string) => {
-              files.set(path, loginBytes);
+              files.set(path, bytes);
             },
           }),
           getJSON: vi.fn().mockResolvedValue({
@@ -488,7 +539,7 @@ describe("sync-files", () => {
             books: {
               "book-1": {
                 folderName: "Test Book-book-1",
-                filePath: `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.epub`,
+                filePath: `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.${ext}`,
                 fileSize: 100,
               },
             },
@@ -500,10 +551,12 @@ describe("sync-files", () => {
             forceDownloadAll: true,
             disableUploads: true,
           });
-          expect(result.filesDownloaded).toBe(0);
-          expect(result.filesDownloadFailed).toBe(1);
-          expect(files).toEqual(new Map([[localPath, oldBytes]]));
-          expect(mockSetBookSyncStatus).not.toHaveBeenCalled();
+          if (valid) expect(result.failures).toEqual([]);
+          expect(result.filesDownloaded).toBe(valid ? 1 : 0);
+          expect(result.filesDownloadFailed).toBe(valid ? 0 : 1);
+          expect(files).toEqual(new Map([[localPath, valid ? bytes : oldBytes]]));
+          if (valid) expect(mockSetBookSyncStatus).toHaveBeenCalledWith("book-1", "local");
+          else expect(mockSetBookSyncStatus).not.toHaveBeenCalled();
           expect(mockUpdateBook).not.toHaveBeenCalled();
           expect(mockAdapter.deleteFile).not.toHaveBeenCalledWith(localPath);
         } finally {
@@ -515,7 +568,9 @@ describe("sync-files", () => {
           ]) {
             method.mockReset();
           }
-          mockAdapter.readFilePrefix.mockReset().mockResolvedValue(oldBytes);
+          mockAdapter.readFilePrefix.mockReset();
+          mockAdapter.getFileSize.mockReset();
+          mockAdapter.hashFile.mockReset().mockResolvedValue("local-hash");
         }
       },
     );
@@ -1263,7 +1318,7 @@ describe("sync-files", () => {
       mockSelect.mockResolvedValue([{ id: "book-1", title: "Test Book" }]);
 
       const backend = createMockBackend({
-        get: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3, 4, 5])),
+        get: vi.fn().mockResolvedValue(epubBytes),
       });
 
       const result = await downloadBookFile(backend, "book-1", "books/book-1.epub");
@@ -1340,7 +1395,7 @@ describe("sync-files", () => {
             throw new WebDavError("not-found", "远端文件不存在", { status: 404 });
           }
           if (path === `${REMOTE_FILES}/book-1.epub`) {
-            return new Uint8Array([9, 9, 9]);
+            return epubBytes;
           }
           throw new Error(`unexpected path ${path}`);
         });
@@ -1378,7 +1433,7 @@ describe("sync-files", () => {
     it("reports progress", async () => {
       mockSelect.mockResolvedValue([{ id: "book-1", title: "Test Book" }]);
       const backend = createMockBackend({
-        get: vi.fn().mockResolvedValue(new Uint8Array([1])),
+        get: vi.fn().mockResolvedValue(epubBytes),
       });
       const onProgress = vi.fn();
 
