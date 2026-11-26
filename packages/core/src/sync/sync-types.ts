@@ -24,6 +24,8 @@ export interface SyncResult {
   filesUploadFailed: number;
   /** Number of book/cover files that failed to download from the remote in the file-sync phase. */
   filesDownloadFailed: number;
+  /** First-class per-file failures (Track 2 will expand the UI list). */
+  fileFailures?: FileSyncFailure[];
   durationMs: number;
   error?: string;
 }
@@ -36,6 +38,13 @@ export interface DavResource {
   contentLength?: number;
   lastModified?: string;
   etag?: string;
+}
+
+/** First-class per-file failure; Track 2 will extend this into a full list. */
+export interface FileSyncFailure {
+  path: string;
+  message: string;
+  status?: number;
 }
 
 /** Detailed progress information for sync operations */
@@ -51,6 +60,8 @@ export interface SyncProgress {
   totalCurrentBytes?: number;
   /** Total bytes for the whole current file batch, when every task size is known. */
   totalTransferBytes?: number;
+  /** Most recent file failure, when this progress event reports one. */
+  failure?: FileSyncFailure;
   message: string;
 }
 

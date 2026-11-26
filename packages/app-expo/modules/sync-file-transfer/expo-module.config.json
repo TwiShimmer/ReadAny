@@ -1,0 +1,11 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["SyncFileTransferModule"],
+    "podspecPath": "ios/SyncFileTransfer.podspec",
+    "swiftModuleName": "SyncFileTransfer"
+  },
+  "android": {
+    "modules": ["expo.modules.syncfiletransfer.SyncFileTransferModule"]
+  }
+}

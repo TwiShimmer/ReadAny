@@ -1,8 +1,9 @@
 use crate::storage;
-use std::net::{IpAddr, Ipv4Addr};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr};
 use tauri::AppHandle;
+use tokio::io::AsyncReadExt;
 
 fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
     let [a, b, ..] = ip.octets();
@@ -44,8 +45,7 @@ pub async fn sync_vacuum_into(app: AppHandle, target_path: String) -> Result<(),
 #[tauri::command]
 pub async fn sync_integrity_check(db_path: String) -> Result<bool, String> {
     tokio::task::spawn_blocking(move || {
-        let conn =
-            Connection::open(&db_path).map_err(|e| format!("Failed to open DB: {}", e))?;
+        let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open DB: {}", e))?;
         let result: String = conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|e| format!("integrity_check failed: {}", e))?;
@@ -58,11 +58,33 @@ pub async fn sync_integrity_check(db_path: String) -> Result<bool, String> {
 /// Compute SHA-256 hash of a file, returns hex string.
 #[tauri::command]
 pub async fn sync_hash_file(path: String) -> Result<String, String> {
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("Failed to read file {}: {}", path, e))?;
-    let hash = Sha256::digest(&data);
-    Ok(format!("{:x}", hash))
+    let read_error = |e| format!("Failed to read file {}: {}", path, e);
+    let mut file = tokio::fs::File::open(&path).await.map_err(read_error)?;
+    let mut buffer = vec![0; 1024 * 1024];
+    let mut hash = Sha256::new();
+    loop {
+        let count = file.read(&mut buffer).await.map_err(read_error)?;
+        if count == 0 {
+            return Ok(format!("{:x}", hash.finalize()));
+        }
+        hash.update(&buffer[..count]);
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn hashes_a_file_larger_than_the_read_buffer() {
+    let path = std::env::temp_dir().join(format!("readany-hash-{}.tmp", uuid::Uuid::new_v4()));
+    let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 123))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let result = sync_hash_file(path.to_string_lossy().into_owned()).await;
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(
+        result.unwrap(),
+        "030ccaa3b42e4c1a5f01d6f1e3cb1ac695331e7dd54f16592f818bc1a89fc62d"
+    );
 }
 
 /// Get the local IP address of this machine.

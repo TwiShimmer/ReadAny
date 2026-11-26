@@ -32,7 +32,34 @@ export interface FetchOptions extends RequestInit {
 export interface FileTransferOptions {
   headers?: Record<string, string>;
   allowInsecure?: boolean;
+  rejectRedirects?: boolean;
   onProgress?: (loaded: number, total: number) => void;
+}
+
+export class UnverifiableUploadTargetError extends Error {}
+
+/**
+ * Structured failure for native file transfers. `status` carries the HTTP
+ * status when the transfer reached the server, so callers can branch on
+ * 403/404/409 without matching localized message text.
+ */
+export class FileTransferError extends Error {
+  readonly status?: number;
+  readonly url?: string;
+  readonly cause?: unknown;
+  readonly redirectLocation?: string;
+
+  constructor(
+    message: string,
+    options?: { status?: number; url?: string; cause?: unknown; redirectLocation?: string },
+  ) {
+    super(message);
+    this.name = "FileTransferError";
+    this.status = options?.status;
+    this.url = options?.url;
+    this.cause = options?.cause;
+    this.redirectLocation = options?.redirectLocation;
+  }
 }
 
 export interface UpdateInfo {

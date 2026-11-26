@@ -73,44 +73,18 @@ export class WebDavBackend implements ISyncBackend {
     if (this.directoriesEnsured) return;
 
     // Create directories for the new simple sync (JSON-based)
-    await this.client.ensureDirectory(this.resolvePath("/readany/sync"));
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_DATA));
-    // New per-book layout root
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_BOOKS_ROOT));
-    // Legacy directories kept ensured during the transition window (cheap & safe).
-    // ensureDirectory (not bare mkcol): some servers answer 409 to MKCOL when
-    // an intermediate collection is missing, which must not be read as success.
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_FILES));
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_COVERS));
-    this.directoriesEnsured = true;
+    const syncConfirmed = await this.client.ensureDirectory(this.resolvePath("/readany/sync"));
+    const dataConfirmed = await this.client.ensureDirectory(this.resolvePath(REMOTE_DATA));
+    // New per-book layout root. Legacy /data/file and /data/cover are only
+    // read for migration; creating them on every sync is unnecessary.
+    const booksConfirmed = await this.client.ensureDirectory(this.resolvePath(REMOTE_BOOKS_ROOT));
+    this.directoriesEnsured = syncConfirmed && dataConfirmed && booksConfirmed;
   }
 
-  /**
-   * Some WebDAV servers (Synology, QNAP, 飞牛, etc.) return 403/404/409 when
-   * PUT-ing into a directory that doesn't exist yet. Ensure the parent and
-   * retry once — most uploads land on an existing dir, so this catch path
-   * only fires for first-time uploads into a brand-new folder. Shared by
-   * every upload entry point (put/putFile/putJSON) so no caller can bypass it.
-   */
-  private async putWithDirectoryHeal(
-    path: string,
-    write: (resolvedPath: string) => Promise<void>,
-  ): Promise<void> {
-    const resolved = this.resolvePath(path);
-    try {
-      await write(resolved);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      if (!/\b(403|404|409)\b/.test(message)) throw e;
-      const parent = resolved.substring(0, resolved.lastIndexOf("/"));
-      if (!parent || parent === "/") throw e;
-      await this.client.ensureDirectory(parent);
-      await write(resolved);
-    }
-  }
-
+  // Directory self-healing lives in WebDavClient.put()/putFile() only. Keeping
+  // a second layer here doubled PUT attempts on every transient failure.
   async put(path: string, data: Uint8Array): Promise<void> {
-    await this.putWithDirectoryHeal(path, (resolved) => this.client.put(resolved, data));
+    await this.client.put(this.resolvePath(path), data);
   }
 
   async putFile(
@@ -118,9 +92,7 @@ export class WebDavBackend implements ISyncBackend {
     localFilePath: string,
     onProgress?: (loaded: number, total: number) => void,
   ): Promise<void> {
-    await this.putWithDirectoryHeal(path, (resolved) =>
-      this.client.putFile(resolved, localFilePath, onProgress),
-    );
+    await this.client.putFile(this.resolvePath(path), localFilePath, onProgress);
   }
 
   async get(path: string): Promise<Uint8Array> {
@@ -147,15 +119,14 @@ export class WebDavBackend implements ISyncBackend {
   }
 
   async putJSON<T>(path: string, data: T): Promise<void> {
-    // Must go through the shared heal path: this is how device snapshots and
-    // the file manifest get written, and a missing /readany/sync used to
-    // surface here as "WebDAV PUT failed … 404" because client.putJSON
-    // bypassed the retry that put()/putFile() had.
-    await this.putWithDirectoryHeal(path, (resolved) => this.client.putJSON(resolved, data));
+    // client.putJSON() delegates to put(), which owns the single heal layer.
+    await this.client.putJSON(this.resolvePath(path), data);
   }
 
   async listDir(path: string): Promise<RemoteFile[]> {
-    const resources = await this.client.safeReadDir(this.resolvePath(path));
+    const missing =
+      path === REMOTE_FILES || path === REMOTE_COVERS ? "allow-plain-missing" : undefined;
+    const resources = await this.client.safeReadDir(this.resolvePath(path), missing);
     return resources.map((r) => ({
       name: r.name,
       path: this.joinLogicalPath(path, r.name),
@@ -163,6 +134,10 @@ export class WebDavBackend implements ISyncBackend {
       lastModified: r.lastModified ? new Date(r.lastModified).getTime() : 0,
       isDirectory: r.isCollection,
     }));
+  }
+
+  async isDirectoryEmpty(path: string): Promise<boolean> {
+    return this.client.isDirectoryEmpty(this.resolvePath(path));
   }
 
   async delete(path: string): Promise<void> {

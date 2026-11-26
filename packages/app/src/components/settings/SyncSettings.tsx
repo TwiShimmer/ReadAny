@@ -547,6 +547,17 @@ export function SyncSettings() {
             onCheckedChange={(checked) => setWebdavAllowInsecure(checked)}
           />
         </div>
+        {webdavAllowInsecure ? (
+          <p
+            role="alert"
+            className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-700 dark:text-amber-300"
+          >
+            {t(
+              "settings.syncAllowInsecureWarning",
+              "已关闭 TLS 证书校验，HTTPS 也可能被降级为 HTTP。仅在你信任的网络和服务器上使用，否则可能被中间人窃听或篡改。",
+            )}
+          </p>
+        ) : null}
         <div className="space-y-2 pt-1">
           <div className="flex flex-wrap items-center gap-2">
             <button
@@ -819,6 +830,11 @@ export function SyncSettings() {
                     })}
                   </p>
                 )}
+                {lastResult.fileFailures?.[0] && (
+                  <p className="break-all text-red-500/80">
+                    {lastResult.fileFailures[0].path}: {lastResult.fileFailures[0].message}
+                  </p>
+                )}
                 <p className="text-muted-foreground/60">
                   {t("settings.syncDuration", { ms: lastResult.durationMs })}
                 </p>
@@ -885,9 +901,7 @@ export function SyncSettings() {
             </div>
             <div className="flex items-center justify-between gap-3 border-t border-border/40 pt-3">
               <div>
-                <span className="text-sm text-foreground">
-                  {t("settings.syncConcurrency")}
-                </span>
+                <span className="text-sm text-foreground">{t("settings.syncConcurrency")}</span>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   {t("settings.syncConcurrencyDesc")}
                 </p>

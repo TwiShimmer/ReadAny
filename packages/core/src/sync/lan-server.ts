@@ -5,8 +5,9 @@
 
 import { getDB, getDeviceId } from "../db/database";
 import { getPlatformService } from "../services/platform";
-import { getSyncAdapter } from "./sync-adapter";
 import { type LANQRData, createLANQRData, generatePairCode } from "./lan-backend";
+import { type DeviceSyncPayload, collectChanges } from "./simple-sync";
+import { getSyncAdapter } from "./sync-adapter";
 import type { ISyncBackend, RemoteFile } from "./sync-backend";
 import {
   buildBookFolderName,
@@ -15,7 +16,7 @@ import {
   sanitizeBookTitleForFs,
 } from "./sync-naming";
 import { REMOTE_BOOKS_ROOT } from "./sync-types";
-import { collectChanges, type DeviceSyncPayload } from "./simple-sync";
+import { WebDavError } from "./webdav-client";
 
 const LAN_SYNC_DIR = "/readany/sync";
 
@@ -77,7 +78,8 @@ class LocalFsBackend implements ISyncBackend {
       const folderName = rest.substring(0, slashIdx);
       const fileName = rest.substring(slashIdx + 1);
       const bookId = parseBookFolderName(folderName) ?? folderName.split("-").pop() ?? folderName;
-      const ext = fileName.includes(".") ? fileName.split(".").pop()! : "";
+      const dotIndex = fileName.lastIndexOf(".");
+      const ext = dotIndex >= 0 ? fileName.slice(dotIndex + 1) : "";
       const targetSubdir = isCoverFileName(fileName) ? "covers" : "books";
       return adapter.joinPath(dataDir, targetSubdir, ext ? `${bookId}.${ext}` : bookId);
     }
@@ -100,7 +102,9 @@ class LocalFsBackend implements ISyncBackend {
     return adapter.joinPath(dataDir, path);
   }
 
-  async testConnection(): Promise<boolean> { return true; }
+  async testConnection(): Promise<boolean> {
+    return true;
+  }
   async ensureDirectories(): Promise<void> {}
 
   async put(path: string, data: Uint8Array): Promise<void> {
@@ -122,15 +126,13 @@ class LocalFsBackend implements ISyncBackend {
       const snapshot = await this.getCurrentDeviceSnapshot();
       const expectedPath = getLanDeviceSnapshotPath(snapshot.deviceId);
       if (path !== expectedPath) {
-        const err = new Error("File not found");
-        (err as any).statusCode = 404;
-        throw err;
+        throw new WebDavError("not-found", "File not found", { status: 404, method: "GET" });
       }
       return new TextEncoder().encode(JSON.stringify(snapshot));
     }
 
     const resolvedPath = await this.mapVirtualPath(path);
-    
+
     // Special handling for database to ensure consistency (snapshot via vacuum)
     const dbPath = await adapter.getDatabasePath();
     if (resolvedPath === dbPath) {
@@ -143,18 +145,19 @@ class LocalFsBackend implements ISyncBackend {
         await adapter.deleteFile(snapshotPath);
         return data;
       } catch (e) {
-        console.error(`[LAN Server] Failed to snapshot database:`, e);
+        console.error("[LAN Server] Failed to snapshot database:", e);
         // Fallback to direct read if vacuum fails (might be inconsistent but better than nothing)
         return await platform.readFile(resolvedPath);
       }
     }
 
     if (!(await adapter.fileExists(resolvedPath))) {
-      const err = new Error("File not found");
-      (err as any).statusCode = 404;
-      throw err;
+      throw new WebDavError("not-found", "File not found", {
+        status: 404,
+        method: "GET",
+      });
     }
-    
+
     try {
       return await platform.readFile(resolvedPath);
     } catch (e) {
@@ -167,7 +170,9 @@ class LocalFsBackend implements ISyncBackend {
     try {
       const data = await this.get(path);
       return JSON.parse(new TextDecoder().decode(data)) as T;
-    } catch { return null; }
+    } catch {
+      return null;
+    }
   }
 
   async putJSON<T>(path: string, data: T): Promise<void> {
@@ -229,7 +234,10 @@ class LocalFsBackend implements ISyncBackend {
           title: string;
           file_path: string | null;
           cover_url: string | null;
-        }>("SELECT id, title, file_path, cover_url FROM books WHERE id = ? AND deleted_at IS NULL", [bookId]);
+        }>(
+          "SELECT id, title, file_path, cover_url FROM books WHERE id = ? AND deleted_at IS NULL",
+          [bookId],
+        );
         if (rows.length === 0) return [];
         const book = rows[0];
         const stem = sanitizeBookTitleForFs(book.title);
@@ -269,7 +277,7 @@ class LocalFsBackend implements ISyncBackend {
       if (!(await adapter.fileExists(resolvedPath))) return [];
       const names = await adapter.listFiles(resolvedPath);
       return names.map((name) => {
-        const childVirtualPath = path.endsWith("/") ? path + name : path + "/" + name;
+        const childVirtualPath = path.endsWith("/") ? `${path}${name}` : `${path}/${name}`;
         return {
           name,
           path: childVirtualPath,
@@ -316,7 +324,9 @@ class LocalFsBackend implements ISyncBackend {
     return adapter.fileExists(resolvedPath);
   }
 
-  async getDisplayName(): Promise<string> { return "Local Filesystem"; }
+  async getDisplayName(): Promise<string> {
+    return "Local Filesystem";
+  }
 }
 
 export type { LANQRData } from "./lan-backend";
@@ -480,10 +490,10 @@ export class LANServer {
     headers: Record<string, string>,
   ): Promise<{ status: number; body?: Uint8Array; headers?: Record<string, string> }> {
     // Verify pair code (headers may be lowercased by HTTP layer)
-    const pairCodeKey = Object.keys(headers).find(k => k.toLowerCase() === "x-pair-code");
+    const pairCodeKey = Object.keys(headers).find((k) => k.toLowerCase() === "x-pair-code");
     const clientPairCode = pairCodeKey ? headers[pairCodeKey] : undefined;
     if (clientPairCode !== this.pairCode) {
-      console.warn(`[LAN Server] Pair code mismatch from client`);
+      console.warn("[LAN Server] Pair code mismatch from client");
       return { status: 403, body: new TextEncoder().encode("Forbidden") };
     }
 
@@ -511,10 +521,8 @@ export class LANServer {
             },
           };
         } catch (e) {
-          const error = e instanceof Error ? e.message : String(e);
-          const statusCode = (e as any).statusCode || 500;
-          if (statusCode === 404 || error.includes("File not found")) {
-             return { status: 404, body: new TextEncoder().encode("Not Found") };
+          if (e instanceof WebDavError && e.status === 404) {
+            return { status: 404, body: new TextEncoder().encode("Not Found") };
           }
           throw e;
         }

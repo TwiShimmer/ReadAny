@@ -262,6 +262,9 @@ importers:
 
   packages/app-expo:
     dependencies:
+      '@aws-crypto/sha256-js':
+        specifier: 5.2.0
+        version: 5.2.0
       '@aws-sdk/client-s3':
         specifier: ^3.712.0
         version: 3.1014.0

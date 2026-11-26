@@ -30,7 +30,12 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-websocket = "2"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+# Enables Body::wrap_stream on the reqwest 0.12 instance re-exported by
+# tauri-plugin-http (feature flags are unified per crate version).
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
 sha2 = "0.10"
+zip = { version = "4", default-features = false }
 local-ip-address = "0.6.10"
 axum = "0.8.8"
 tower-http = { version = "0.6.8", features = ["cors"] }

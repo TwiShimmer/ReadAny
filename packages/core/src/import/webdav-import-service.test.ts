@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { type FetchOptions, type IPlatformService, setPlatformService } from "../services/platform";
+import { epubFixture } from "../sync/__tests__/epub-fixture";
 import {
   WebDavImportService,
   getWebDavImportRootPrefix,
@@ -82,11 +83,11 @@ const PROPFIND_BOOKS_XML = `<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:">
   <D:response>
     <D:href>/home/Books/</D:href>
-    <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
+    <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
   </D:response>
   <D:response>
     <D:href>/home/Books/novel.epub</D:href>
-    <D:propstat><D:prop><D:resourcetype/><D:getcontentlength>123</D:getcontentlength></D:prop></D:propstat>
+    <D:propstat><D:prop><D:resourcetype/><D:getcontentlength>123</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
   </D:response>
 </D:multistatus>`;
 
@@ -103,7 +104,7 @@ function installFetchCapture(): { requests: Array<{ method: string; url: string 
       if (method === "PROPFIND") {
         return new Response(PROPFIND_BOOKS_XML, { status: 207 });
       }
-      return new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+      return new Response(await epubFixture(), { status: 200 });
     },
   } as unknown as IPlatformService);
   return { requests };

@@ -1,5 +1,5 @@
-import { closeDB, initDatabase, resetDBCache, resetLocalDBCache } from "@readany/core/db";
 import { getDesktopDatabasePath, getDesktopLibraryRoot } from "@/lib/storage/desktop-library-root";
+import { closeDB, initDatabase, resetDBCache, resetLocalDBCache } from "@readany/core/db";
 /**
  * Desktop (Tauri) sync adapter — implements ISyncAdapter
  * using Tauri invoke commands and @tauri-apps/plugin-fs.
@@ -9,12 +9,15 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { join, tempDir } from "@tauri-apps/api/path";
 import {
+  SeekMode,
   copyFile,
   exists,
   mkdir,
+  open,
   readDir,
   readFile,
   remove,
+  rename,
   stat,
   writeFile,
 } from "@tauri-apps/plugin-fs";
@@ -101,6 +104,27 @@ export class DesktopSyncAdapter implements ISyncAdapter {
     const resolvedSrc = await this.resolveToAbsolute(src);
     const resolvedDest = await this.resolveToAbsolute(dest);
     await copyFile(resolvedSrc, resolvedDest);
+  }
+
+  async readFilePrefix(filePath: string, limit: number, offset = 0): Promise<Uint8Array> {
+    const file = await open(await this.resolveToAbsolute(filePath), { read: true });
+    try {
+      if (offset) await file.seek(offset, SeekMode.Start);
+      const prefix = new Uint8Array(limit);
+      let length = 0;
+      while (length < limit) {
+        const count = await file.read(prefix.subarray(length));
+        if (!count) break;
+        length += count;
+      }
+      return prefix.subarray(0, length);
+    } finally {
+      await file.close();
+    }
+  }
+
+  async replaceFile(src: string, dest: string): Promise<void> {
+    await rename(await this.resolveToAbsolute(src), await this.resolveToAbsolute(dest));
   }
 
   async deleteFile(filePath: string): Promise<void> {

@@ -63,6 +63,9 @@ export interface ISyncBackend {
   /** List directory contents */
   listDir(path: string): Promise<RemoteFile[]>;
 
+  /** Confirm that an existing directory has no children, including unaddressable names. */
+  isDirectoryEmpty?(path: string): Promise<boolean>;
+
   /** Delete a file at the given path */
   delete(path: string): Promise<void>;
 

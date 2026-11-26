@@ -8,4 +8,10 @@ export type {
   WebSocketOptions,
   UpdateInfo,
 } from "./platform";
-export { setPlatformService, getPlatformService, waitForPlatformService } from "./platform";
+export {
+  FileTransferError,
+  UnverifiableUploadTargetError,
+  setPlatformService,
+  getPlatformService,
+  waitForPlatformService,
+} from "./platform";

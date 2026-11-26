@@ -6,16 +6,18 @@
  *
  * All Tauri imports are dynamic so the module graph stays clean in SSR/test contexts.
  */
+import { FileTransferError } from "@readany/core/services";
 import type {
-  FileTransferOptions,
   FetchOptions,
   FilePickerOptions,
+  FileTransferOptions,
   IDatabase,
   IPlatformService,
   IWebSocket,
   UpdateInfo,
   WebSocketOptions,
 } from "@readany/core/services";
+import { isDavEpubDownload, isValidDavZip } from "@readany/core/sync/dav-response";
 
 const TAURI_LAN_RUNTIME_ERROR =
   "Tauri desktop runtime is required to use the LAN sender. Open the desktop app instead of the browser dev server.";
@@ -28,6 +30,23 @@ function ensureTauriRuntimeForLAN(): void {
   if (!isTauriRuntimeAvailable()) {
     throw new Error(TAURI_LAN_RUNTIME_ERROR);
   }
+}
+
+/**
+ * Tauri commands reject with the serialized Rust error. Preserve its HTTP
+ * status so the sync layer can branch without parsing message text.
+ */
+function toFileTransferError(error: unknown, url: string): FileTransferError {
+  if (error instanceof FileTransferError) return error;
+  if (typeof error === "object" && error !== null) {
+    const record = error as { status?: unknown; message?: unknown; redirectLocation?: unknown };
+    const status = typeof record.status === "number" ? record.status : undefined;
+    const message = typeof record.message === "string" ? record.message : String(error);
+    const redirectLocation =
+      typeof record.redirectLocation === "string" ? record.redirectLocation : undefined;
+    return new FileTransferError(message, { status, url, redirectLocation, cause: error });
+  }
+  return new FileTransferError(String(error), { url });
 }
 
 /** Adapter: wraps Tauri SQL plugin instance as IDatabase */
@@ -190,20 +209,29 @@ export class TauriPlatformService implements IPlatformService {
     const { fetch: tauriFetch } = await import("@tauri-apps/plugin-http");
     const {
       allowInsecure,
-      timeoutMs: _timeoutMs,
+      timeoutMs,
       responseType: _responseType,
       onDownloadProgress: _onDownloadProgress,
       ...fetchOptions
     } = options ?? {};
-    const tauriOptions = allowInsecure
-      ? {
-          ...fetchOptions,
-          danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true },
-        } as any
-      : fetchOptions;
+    const rejectRedirects = fetchOptions.redirect === "error";
+    const timeoutSignal = rejectRedirects && timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
+    const signal =
+      timeoutSignal && fetchOptions.signal
+        ? AbortSignal.any([timeoutSignal, fetchOptions.signal])
+        : (timeoutSignal ?? fetchOptions.signal);
+    const tauriOptions: Parameters<typeof tauriFetch>[1] = {
+      ...fetchOptions,
+      signal,
+      ...(rejectRedirects ? { maxRedirections: 0, connectTimeout: timeoutMs } : {}),
+      ...(allowInsecure
+        ? { danger: { acceptInvalidCerts: true, acceptInvalidHostnames: true } }
+        : {}),
+    };
     try {
       return await tauriFetch(url, tauriOptions);
     } catch (error: unknown) {
+      if (timeoutSignal?.aborted) throw timeoutSignal.reason;
       // Tauri's fetch (Chromium-based) rejects when the server sends response
       // headers containing characters outside the ISO-8859-1 range (e.g.
       // Chinese filenames in Content-Disposition from WebDAV servers like dufs).
@@ -211,14 +239,15 @@ export class TauriPlatformService implements IPlatformService {
       // behaviour with the mobile (XHR) implementation.
       const msg = (error as { message?: string })?.message ?? "";
       if (
-        msg.includes("ISO-8859-1") ||
-        msg.includes("non ISO") ||
-        msg.includes("Failed to construct 'Headers'")
+        (!rejectRedirects || fetchOptions.method === "GET") &&
+        (msg.includes("ISO-8859-1") ||
+          msg.includes("non ISO") ||
+          msg.includes("Failed to construct 'Headers'"))
       ) {
         console.warn(
           "[TauriPlatform] tauriFetch failed due to non-ASCII response headers; falling back to native fetch",
         );
-        return globalThis.fetch(url, fetchOptions);
+        return globalThis.fetch(url, { ...fetchOptions, signal });
       }
       throw error;
     }
@@ -229,11 +258,7 @@ export class TauriPlatformService implements IPlatformService {
    * multi-megabyte payloads never cross the webview main thread
    * (plugin-http serializes bodies as JS number arrays, which froze sync).
    */
-  async uploadFile(
-    url: string,
-    filePath: string,
-    options?: FileTransferOptions,
-  ): Promise<void> {
+  async uploadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const { invoke } = await import("@tauri-apps/api/core");
     try {
       await invoke("webdav_upload_file", {
@@ -243,18 +268,12 @@ export class TauriPlatformService implements IPlatformService {
         allowInsecure: options?.allowInsecure ?? false,
       });
     } catch (error) {
-      // Surface the server status inside the message — the sync layer's
-      // directory-heal retry matches on 403/404/409 in the message text.
-      throw new Error(error instanceof Error ? error.message : String(error));
+      throw toFileTransferError(error, url);
     }
   }
 
   /** Native streaming download to a local path, with progress via channel. */
-  async downloadFile(
-    url: string,
-    filePath: string,
-    options?: FileTransferOptions,
-  ): Promise<void> {
+  async downloadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const { invoke, Channel } = await import("@tauri-apps/api/core");
     const onProgress = options?.onProgress;
     const channel = new Channel<{ loaded: number; total: number }>();
@@ -269,8 +288,33 @@ export class TauriPlatformService implements IPlatformService {
         allowInsecure: options?.allowInsecure ?? false,
         onProgress: channel,
       });
+      const remotePath = new URL(url).pathname;
+      if (isDavEpubDownload(remotePath)) {
+        // Native ZIP support is built without deflate; use the same bounded
+        // container validation as Expo and core before returning the staged file.
+        const { open, SeekMode } = await import("@tauri-apps/plugin-fs");
+        const file = await open(filePath, { read: true });
+        try {
+          const size = await file.seek(0, SeekMode.End);
+          const valid = await isValidDavZip(remotePath, size, async (offset, length) => {
+            await file.seek(offset, SeekMode.Start);
+            const bytes = new Uint8Array(length);
+            let read = 0;
+            while (read < length) {
+              const count = await file.read(bytes.subarray(read));
+              if (!count) break;
+              read += count;
+            }
+            return bytes.subarray(0, read);
+          });
+          if (!valid)
+            throw new FileTransferError("Unexpected WebDAV download response", { status: 200 });
+        } finally {
+          await file.close();
+        }
+      }
     } catch (error) {
-      throw new Error(error instanceof Error ? error.message : String(error));
+      throw toFileTransferError(error, url);
     }
   }
 

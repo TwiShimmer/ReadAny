@@ -11,6 +11,7 @@ import i18n from "@readany/core/i18n";
  * - expo-sharing + expo-file-system for file sharing
  * - expo-constants for app version
  */
+import { FileTransferError, UnverifiableUploadTargetError } from "@readany/core/services";
 import type {
   FetchOptions,
   FilePickerOptions,
@@ -20,6 +21,25 @@ import type {
   IWebSocket,
   WebSocketOptions,
 } from "@readany/core/services";
+import {
+  MAX_EPUB_SPINE_ENTRY_BYTES,
+  MAX_STREAMED_DAV_DOWNLOAD_BYTES,
+  acceptsDavDownloadPrefix,
+  acceptsDavDownloadType,
+  hasUnsafeDavWriteBody,
+  isDavMissingStatus,
+  isDavWriteMethod,
+  isDavWriteSuccess,
+  isDavZipDownload,
+  isHtmlContentType,
+  isUnsafeDavFilePrefix,
+  isValidDavZip,
+  preserveDavMissingBody,
+  readDavBodyPrefix,
+  readDavDownloadBody,
+  readDavText,
+} from "@readany/core/sync/dav-response";
+import { configure as configureZip } from "@zip.js/zip.js";
 import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 import * as DocumentPicker from "expo-document-picker";
@@ -28,12 +48,49 @@ import * as LegacyFS from "expo-file-system/legacy";
 import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
 import * as Sharing from "expo-sharing";
+import { fetch as expoFetch } from "expo/fetch";
+import { Inflate } from "pako";
+import SyncFileTransfer from "../../../modules/sync-file-transfer";
 
 /** Simple KV storage keys tracking (SecureStore doesn't have getAllKeys) */
 const KV_KEYS_INDEX = "__readany_kv_keys__";
 const SQLITE_OPERATION_QUEUES = new Map<string, Promise<void>>();
 
+// Hermes has WHATWG streams but no native deflate or WebAssembly. Keep zip.js
+// in charge of ZIP framing/CRC and supply Expo's existing incremental codec.
+class ExpoDeflateStream extends TransformStream<Uint8Array, Uint8Array> {
+  constructor() {
+    const inflate = new Inflate({ raw: true });
+    let complete = false;
+    let produced = 0;
+    inflate.onEnd = (status) => {
+      if (status !== 0) throw new Error("Invalid ZIP deflate stream");
+      complete = true;
+    };
+    super({
+      transform(chunk, controller) {
+        inflate.onData = (bytes) => {
+          produced += bytes.byteLength;
+          if (produced > MAX_EPUB_SPINE_ENTRY_BYTES)
+            throw new Error("Oversized EPUB entry payload");
+          controller.enqueue(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        };
+        if (complete || !inflate.push(chunk)) throw new Error("Invalid ZIP deflate stream");
+      },
+      flush() {
+        if (!complete) throw new Error("Truncated ZIP deflate stream");
+      },
+    });
+  }
+}
+
 export class ExpoPlatformService implements IPlatformService {
+  constructor() {
+    if (typeof DecompressionStream === "undefined") {
+      configureZip({ DecompressionStream: ExpoDeflateStream });
+    }
+  }
+
   readonly platformType = "mobile" as const;
   readonly isMobile = true;
   readonly isDesktop = false;
@@ -287,6 +344,67 @@ export class ExpoPlatformService implements IPlatformService {
       options ?? {};
     const effectiveUrl = allowInsecure ? url.replace(/^https:\/\//i, "http://") : url;
     const method = fetchOptions?.method?.toUpperCase() || "GET";
+    if (fetchOptions.redirect === "error") {
+      return this.withDavResponse(effectiveUrl, fetchOptions, timeoutMs, async (response) => {
+        const { status, statusText, headers } = response;
+        const noBody =
+          status < 200 || status === 204 || status === 205 || status === 304 || method === "HEAD";
+        let body: BodyInit | null = null;
+        let snapshotBytes: Uint8Array<ArrayBuffer> | undefined;
+        let consumed = false;
+        const checkMissing =
+          (method === "GET" || method === "PROPFIND") && isDavMissingStatus(status);
+        const invalid = () =>
+          new FileTransferError("Unexpected WebDAV response", { url: effectiveUrl, status });
+        if (response.ok && !noBody && !isHtmlContentType(headers.get("Content-Type"))) {
+          if (isDavWriteMethod(method)) {
+            if (await hasUnsafeDavWriteBody(response)) {
+              throw new FileTransferError("Unexpected WebDAV write response", {
+                url: effectiveUrl,
+                status,
+              });
+            }
+            consumed = true;
+          } else if (responseType === "arraybuffer") {
+            const bytes = await readDavDownloadBody(
+              response,
+              new URL(effectiveUrl).pathname,
+              () =>
+                new FileTransferError("Unexpected WebDAV download response", {
+                  url: effectiveUrl,
+                  status,
+                }),
+            );
+            onDownloadProgress?.(bytes.byteLength, bytes.byteLength);
+            snapshotBytes = bytes;
+            body = bytes.buffer;
+          } else {
+            body = await readDavText(response, invalid);
+            snapshotBytes = new TextEncoder().encode(body);
+          }
+        }
+        const snapshot = new Response(body, { status, statusText, headers });
+        if (checkMissing) await preserveDavMissingBody(response, snapshot);
+        else if (!consumed && body === null) void response.body?.cancel().catch(() => {});
+        // Only synthesize a stream for bytes we actually read from the wire.
+        if (snapshotBytes && !snapshot.body) {
+          const bytes = snapshotBytes;
+          Object.defineProperty(snapshot, "body", {
+            value: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(bytes);
+                controller.close();
+              },
+            }),
+          });
+        }
+        Object.defineProperties(snapshot, {
+          url: { value: response.url },
+          redirected: { value: response.redirected },
+        });
+        return snapshot;
+      });
+    }
 
     // Always use XHR for WebDAV to handle large binary files properly
     // React Native's fetch has issues with large arrayBuffer responses
@@ -301,8 +419,127 @@ export class ExpoPlatformService implements IPlatformService {
     );
   }
 
+  private async withDavResponse<T>(
+    url: string,
+    options: RequestInit,
+    timeoutMs: number | undefined,
+    consume: (response: Response, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const timedOut = new Error("WebDAV request timed out");
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        reject(timedOut);
+        controller.abort();
+      }, timeoutMs ?? 15_000);
+    });
+    const readResponse = async () => {
+      const response = await expoFetch(url, {
+        ...options,
+        body: options.body ?? undefined,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) throw timedOut;
+      const { status } = response;
+      if (
+        response.redirected ||
+        !response.url ||
+        new URL(response.url).href !== new URL(url).href ||
+        (status >= 300 && status < 400)
+      ) {
+        throw new FileTransferError("Unable to verify the WebDAV response target", {
+          status,
+          url,
+          redirectLocation: response.headers.get("Location") ?? (response.url || undefined),
+        });
+      }
+      return consume(response, controller.signal);
+    };
+    try {
+      return await Promise.race([readResponse(), deadline]);
+    } finally {
+      clearTimeout(timeout);
+      controller.abort();
+    }
+  }
+
   async downloadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const effectiveUrl = options?.allowInsecure ? url.replace(/^https:\/\//i, "http://") : url;
+    if (options?.rejectRedirects) {
+      await this.withDavResponse(
+        effectiveUrl,
+        { method: "GET", headers: options.headers },
+        300_000,
+        async (response, signal) => {
+          const status = response.status;
+          const remotePath = new URL(effectiveUrl).pathname;
+          const invalid = () =>
+            new FileTransferError("Unexpected WebDAV download response", {
+              url: effectiveUrl,
+              status,
+            });
+          if (
+            status !== 200 ||
+            !response.body ||
+            !acceptsDavDownloadType(remotePath, response.headers.get("Content-Type"))
+          ) {
+            await response.body?.cancel().catch(() => {});
+            throw invalid();
+          }
+          const file = new File(filePath);
+          const total = Number(response.headers.get("Content-Length")) || 0;
+          const reader = response.body.getReader();
+          try {
+            if (total > MAX_STREAMED_DAV_DOWNLOAD_BYTES) throw invalid();
+            const { prefix, remainder } = await readDavBodyPrefix(reader);
+            if (signal.aborted) throw new Error("WebDAV download timed out");
+            if (!acceptsDavDownloadPrefix(remotePath, prefix)) throw invalid();
+            file.create({ overwrite: true });
+            const handle = file.open();
+            let loaded = 0;
+            const write = (bytes: Uint8Array) => {
+              if (loaded + bytes.length > MAX_STREAMED_DAV_DOWNLOAD_BYTES) throw invalid();
+              handle.writeBytes(bytes);
+              loaded += bytes.length;
+            };
+            try {
+              write(prefix);
+              if (remainder) write(remainder);
+              options.onProgress?.(loaded, total);
+              while (true) {
+                const { done, value } = await reader.read();
+                if (signal.aborted) throw new Error("WebDAV download timed out");
+                if (done) break;
+                write(value);
+                options.onProgress?.(loaded, total);
+              }
+            } finally {
+              handle.close();
+            }
+            if (isDavZipDownload(remotePath)) {
+              const handle = file.open();
+              try {
+                if (
+                  !(await isValidDavZip(remotePath, file.size, async (offset, length) => {
+                    if (signal.aborted) throw new Error("WebDAV download timed out");
+                    handle.offset = offset;
+                    return handle.readBytes(length);
+                  }))
+                )
+                  throw invalid();
+              } finally {
+                handle.close();
+              }
+            }
+          } finally {
+            await reader.cancel().catch(() => {});
+          }
+        },
+      );
+      return;
+    }
     const task = LegacyFS.createDownloadResumable(
       effectiveUrl,
       filePath,
@@ -323,12 +560,58 @@ export class ExpoPlatformService implements IPlatformService {
       throw new Error(`File download cancelled: ${effectiveUrl}`);
     }
     if (result.status < 200 || result.status >= 300) {
-      throw new Error(`File download failed: ${result.status}`);
+      throw new FileTransferError(`File download failed: ${result.status}`, {
+        status: result.status,
+        url: effectiveUrl,
+      });
     }
   }
 
   async uploadFile(url: string, filePath: string, options?: FileTransferOptions): Promise<void> {
     const effectiveUrl = options?.allowInsecure ? url.replace(/^https:\/\//i, "http://") : url;
+    if (options?.rejectRedirects) {
+      if (!SyncFileTransfer) {
+        throw new UnverifiableUploadTargetError(
+          "Update ReadAny to enable direct WebDAV file uploads",
+        );
+      }
+      const file = new File(filePath);
+      const size = file.size;
+      if (!file.exists || size > 2 * 1024 ** 3) {
+        throw new FileTransferError(`Cannot upload file (${size} bytes, limit 2 GiB)`);
+      }
+      const id = `${Date.now()}-${Math.random()}`;
+      const native = SyncFileTransfer;
+      const onProgress = options.onProgress;
+      const progress =
+        onProgress &&
+        native.addListener("uploadProgress", (event) => {
+          if (event.id === id) onProgress(event.loaded, event.total);
+        });
+      const response = await native
+        .upload(effectiveUrl, file.uri, options.headers ?? {}, id)
+        .finally(() => progress?.remove());
+      if (
+        !response.url ||
+        new URL(response.url).href !== new URL(effectiveUrl).href ||
+        (response.status >= 300 && response.status < 400)
+      ) {
+        throw new FileTransferError("Unable to verify the WebDAV upload target", {
+          status: response.status,
+          redirectLocation: response.location || response.url || undefined,
+        });
+      }
+      if (
+        !isDavWriteSuccess("PUT", response.status) ||
+        isHtmlContentType(response.contentType) ||
+        isUnsafeDavFilePrefix(Uint8Array.from(response.prefix))
+      ) {
+        throw new FileTransferError("Unexpected WebDAV upload response", {
+          status: response.status,
+        });
+      }
+      return;
+    }
     const task = LegacyFS.createUploadTask(
       effectiveUrl,
       filePath,
@@ -348,7 +631,10 @@ export class ExpoPlatformService implements IPlatformService {
       throw new Error(`File upload cancelled: ${effectiveUrl}`);
     }
     if (result.status < 200 || result.status >= 300) {
-      throw new Error(`File upload failed: ${result.status}`);
+      throw new FileTransferError(`File upload failed: ${result.status}`, {
+        status: result.status,
+        url: effectiveUrl,
+      });
     }
   }
 
@@ -408,12 +694,25 @@ export class ExpoPlatformService implements IPlatformService {
             textResponse = typeof xhr.responseText === "string" ? xhr.responseText : "";
           }
 
-          // Create a Response-like object
+          const responseHeaders = new Headers();
+          for (const line of xhr.getAllResponseHeaders().split(/\r?\n/)) {
+            const separator = line.indexOf(":");
+            if (separator > 0) {
+              try {
+                responseHeaders.append(line.slice(0, separator), line.slice(separator + 1).trim());
+              } catch {
+                // Some native servers return non-Latin-1 Content-Disposition.
+              }
+            }
+          }
+          const responseUrl = xhr.responseURL || "";
           const response = {
             status: xhr.status,
             statusText: xhr.statusText,
             ok: xhr.status >= 200 && xhr.status < 300,
-            headers: new Headers(),
+            headers: responseHeaders,
+            url: responseUrl,
+            redirected: !!responseUrl && new URL(responseUrl).href !== new URL(url).href,
             text: async () => {
               if (responseType !== "arraybuffer") {
                 return textResponse;
@@ -489,7 +788,7 @@ export class ExpoPlatformService implements IPlatformService {
         } else if (options.body instanceof Uint8Array) {
           xhr.send(options.body);
         } else {
-          xhr.send(options.body as any);
+          xhr.send(options.body as XMLHttpRequestBodyInit);
         }
       } else {
         xhr.send();

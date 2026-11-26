@@ -113,6 +113,23 @@ export function WebDavForm({
           </TouchableOpacity>
         </View>
 
+        {allowInsecure ? (
+          <Text
+            accessibilityRole="alert"
+            style={{
+              color: colors.destructive ?? "#b45309",
+              fontSize: 12,
+              lineHeight: 18,
+              marginBottom: 12,
+            }}
+          >
+            {t(
+              "settings.syncAllowInsecureWarning",
+              "已关闭 TLS 证书校验，HTTPS 也可能被降级为 HTTP。仅在信任的网络和服务器上使用。",
+            )}
+          </Text>
+        ) : null}
+
         <View style={styles.btnRow}>
           <TouchableOpacity
             style={[styles.outlineBtn, (!url || testing) && styles.btnDisabled]}
@@ -138,9 +155,7 @@ export function WebDavForm({
           <Text style={styles.successText}>{t("settings.syncTestSuccess")}</Text>
         )}
         {testResult === "error" && (
-          <Text style={styles.errorText}>
-            {t("settings.syncTestFailed", { error: testError })}
-          </Text>
+          <Text style={styles.errorText}>{t("settings.syncTestFailed", { error: testError })}</Text>
         )}
       </View>
     </View>

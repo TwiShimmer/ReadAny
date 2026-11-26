@@ -44,10 +44,10 @@ import {
   getDeviceId as getLocalDeviceId,
 } from "../db/database";
 type Row = Record<string, unknown>;
+import i18n from "../i18n";
 import { getPlatformService } from "../services/platform";
 import {
   applyChanges,
-  getLastSyncTimestamp,
   listRemoteDeviceFiles,
   localizeSyncedBookRecord,
   setLastSyncTimestamp,
@@ -56,9 +56,10 @@ import {
   withDatabaseLockRetry,
 } from "./simple-sync";
 import type { DeviceSyncPayload } from "./simple-sync";
-import type { ISyncBackend, RemoteFile } from "./sync-backend";
+import type { ISyncBackend } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
-import type { SyncProgress } from "./sync-types";
+import type { FileSyncFailure, SyncProgress } from "./sync-types";
+import { syncErrorDiagnostic } from "./webdav-client";
 
 export interface PerBookSyncOptions {
   receiveOnly?: boolean;
@@ -78,6 +79,7 @@ const SESSIONS_DIR = `${SYNC_ROOT}/sessions`;
 const CHAT_PULLED_DAY_KEY = "perbook:chat-pulled-day";
 const CHAT_MERGED_DAYS_KEY = "perbook:chat-merged-days";
 const CHAT_PUSHED_AT_KEY = "perbook:chat-pushed-at";
+const SESSIONS_PUSHED_AT_KEY = "perbook:sessions-pushed-at";
 
 const BOOK_LOCAL_EXCLUDED_COLUMNS = ["is_vectorized", "vectorize_progress"];
 const ANNOTATION_TABLES = ["highlights", "notes", "bookmarks"] as const;
@@ -166,7 +168,7 @@ export async function importLegacySnapshots(
     } catch (error) {
       console.warn(
         `[PerBookSync] Failed to import legacy snapshot from ${deviceId}:`,
-        error,
+        syncErrorDiagnostic(error),
       );
     }
   }
@@ -257,9 +259,10 @@ function emptyIndex(): SyncIndexFile {
 }
 
 /** Per-field max union of two index/thread entries (markers and tombstones). */
-function mergeIndexEntry<
-  T extends Partial<BookIndexEntry & ThreadIndexEntry>,
->(remote: T | undefined, ours: T | undefined): T {
+function mergeIndexEntry<T extends Partial<BookIndexEntry & ThreadIndexEntry>>(
+  remote: T | undefined,
+  ours: T | undefined,
+): T {
   const merged = { ...(remote ?? {}), ...(ours ?? {}) } as T;
   for (const key of ["b", "a", "t", "d"] as const) {
     const remoteValue = remote?.[key];
@@ -571,9 +574,11 @@ export async function runPerBookSync(
   filesDownloaded: number;
   filesUploadFailed: number;
   filesDownloadFailed: number;
+  fileFailures: FileSyncFailure[];
   error?: string;
 }> {
   const { receiveOnly = false, forceApply = false } = options;
+  const syncStartedAt = Date.now();
   try {
     const db = await getDB();
     const deviceId = await getLocalDeviceId();
@@ -608,7 +613,10 @@ export async function runPerBookSync(
       } catch (error) {
         // Flaky tunnels fail individual MKCOLs; per-file self-heal retries
         // later, so a missed directory must not abort the whole sync.
-        console.warn(`[PerBookSync] ensureDirectory ${dir} failed (continuing):`, error);
+        console.warn(
+          `[PerBookSync] ensureDirectory ${dir} failed (continuing):`,
+          syncErrorDiagnostic(error),
+        );
       }
     }
 
@@ -618,6 +626,8 @@ export async function runPerBookSync(
     if (!isPerBookIndex(rawRemoteIndex)) {
       const migration = await importLegacySnapshots(backend, progress, forceApply);
       legacyImported = migration.imported;
+      // Imported sessions can predate our cursor. Replay them if the import changed rows.
+      if (migration.applied > 0) await setMetadata(SESSIONS_PUSHED_AT_KEY, "0");
       changes += migration.applied;
     }
     const remoteIndex = isPerBookIndex(rawRemoteIndex) ? rawRemoteIndex : emptyIndex();
@@ -629,7 +639,7 @@ export async function runPerBookSync(
     for (const row of bookRows) localBooksById.set(String(row.id), row);
 
     progress("拉取书籍数据...");
-    let pullFailures = 0;
+    let _pullFailures = 0;
     for (const [bookId, entry] of Object.entries(remoteIndex.books ?? {})) {
       const localRow = localBooksById.get(bookId);
       const localB = Number(localRow?.updated_at ?? 0);
@@ -638,13 +648,10 @@ export async function runPerBookSync(
       // Remote deletion wins when newer than anything local.
       if (entry.d !== undefined && entry.d >= Math.max(localB, localA) && localRow) {
         const { deleteBook } = await import("../db/database");
-        await withDatabaseLockRetry(
-          async () => {
-            await ensureNoTransaction();
-            await deleteBook(bookId);
-          },
-          "apply remote book deletion",
-        );
+        await withDatabaseLockRetry(async () => {
+          await ensureNoTransaction();
+          await deleteBook(bookId);
+        }, "apply remote book deletion");
         localBooksById.delete(bookId);
         changes++;
         continue;
@@ -654,7 +661,9 @@ export async function runPerBookSync(
       const localMax = Math.max(localB, localA);
       if (!localRow && remoteMax === 0) continue;
       if (localRow && remoteMax <= localMax && !forceApply) {
-        console.log(`[PerBookSync] book ${bookId} in sync (remote=${remoteMax}, local=${localMax})`);
+        console.log(
+          `[PerBookSync] book ${bookId} in sync (remote=${remoteMax}, local=${localMax})`,
+        );
         continue;
       }
       console.log(
@@ -671,8 +680,11 @@ export async function runPerBookSync(
         changes += await applyBookFile(db, file, forceApply, deviceId);
         await sleep(0);
       } catch (error) {
-        pullFailures++;
-        console.warn(`[PerBookSync] Failed to pull book ${bookId} (will retry next sync):`, error);
+        _pullFailures++;
+        console.warn(
+          `[PerBookSync] Failed to pull book ${bookId} (will retry next sync):`,
+          syncErrorDiagnostic(error),
+        );
       }
     }
 
@@ -684,7 +696,7 @@ export async function runPerBookSync(
       progress("上传书籍数据...");
       const liveBooks = await tableRows(db, "books");
       let processed = 0;
-      let pushFailures = 0;
+      let _pushFailures = 0;
       for (const row of liveBooks) {
         const bookId = String(row.id);
         const entry = remoteIndex.books?.[bookId];
@@ -710,24 +722,24 @@ export async function runPerBookSync(
           const file = buildBookFile(local, remoteFile, deviceId);
           await backend.putJSON(`${BOOKS_DIR}/${bookId}.json`, file);
           pendingIndexBooks[bookId] = mergeIndexEntry(entry, {
-          b: markerB,
-          a: markerA,
-          d:
-            row.deleted_at === null || row.deleted_at === undefined
-              ? undefined
-              : Number(row.deleted_at),
-        });
-        processed++;
-        changes++;
-        if (processed % 5 === 0) {
-          progress(`上传书籍数据 (${processed})...`);
-          await sleep(0);
-        }
+            b: markerB,
+            a: markerA,
+            d:
+              row.deleted_at === null || row.deleted_at === undefined
+                ? undefined
+                : Number(row.deleted_at),
+          });
+          processed++;
+          changes++;
+          if (processed % 5 === 0) {
+            progress(`上传书籍数据 (${processed})...`);
+            await sleep(0);
+          }
         } catch (error) {
-          pushFailures++;
+          _pushFailures++;
           console.warn(
             `[PerBookSync] Failed to push book ${bookId} (will retry next sync):`,
-            error,
+            syncErrorDiagnostic(error),
           );
         }
       }
@@ -755,13 +767,10 @@ export async function runPerBookSync(
       const localT = threadMarkers.get(threadId) ?? 0;
       if (entry.d !== undefined && entry.d >= localT && threadMarkers.has(threadId)) {
         const { deleteThread } = await import("../db/database");
-        await withDatabaseLockRetry(
-          async () => {
-            await ensureNoTransaction();
-            await deleteThread(threadId);
-          },
-          "apply remote thread deletion",
-        );
+        await withDatabaseLockRetry(async () => {
+          await ensureNoTransaction();
+          await deleteThread(threadId);
+        }, "apply remote thread deletion");
         threadMarkers.delete(threadId);
         changes++;
         continue;
@@ -769,13 +778,10 @@ export async function runPerBookSync(
       if (entry.t === undefined || entry.t <= localT) continue;
       const file = await backend.getJSON<ThreadRowFile>(`${THREADS_DIR}/${threadId}.json`);
       if (!file || file.schemaVersion !== 1) continue;
-      await withDatabaseLockRetry(
-        async () => {
-          await ensureNoTransaction();
-          await upsertRecord(db, "threads", file.thread, "id");
-        },
-        "apply thread row",
-      );
+      await withDatabaseLockRetry(async () => {
+        await ensureNoTransaction();
+        await upsertRecord(db, "threads", file.thread, "id");
+      }, "apply thread row");
       changes++;
       await sleep(0);
     }
@@ -790,7 +796,11 @@ export async function runPerBookSync(
         const file: ThreadRowFile = {
           schemaVersion: 1,
           threadId,
-          thread: mergeItemRows([thread], remote?.thread ? [remote.thread] : undefined, "updated_at")[0],
+          thread: mergeItemRows(
+            [thread],
+            remote?.thread ? [remote.thread] : undefined,
+            "updated_at",
+          )[0],
           writerDeviceId: deviceId,
           updatedAt: Date.now(),
         };
@@ -817,14 +827,15 @@ export async function runPerBookSync(
 
       // Pull: every remote day file that is past our cursor, or whose file
       // changed under the cursor (offline devices write old days).
-      const dayEntries = await backend
-        .listDir(CHAT_DIR)
-        .catch(() => [] as RemoteFile[]);
+      const dayEntries = await backend.listDir(CHAT_DIR);
       const dayFiles = dayEntries
         .filter((e) => !e.isDirectory && /^\d{4}-\d{2}-\d{2}\.json$/.test(e.name))
         .map((e) => ({ day: e.name.replace(/\.json$/, ""), lastModified: e.lastModified }))
         .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0));
 
+      let nextPulledDay = pulledDay;
+      let mergedDaysChanged = false;
+      let pushedMessages = false;
       for (const { day, lastModified } of dayFiles) {
         const pastCursor = day > pulledDay;
         // Cheap up-front filter for the days under our cursor: the PROPFIND
@@ -845,45 +856,38 @@ export async function runPerBookSync(
         if (!file || file.schemaVersion !== 1) continue;
         // Now that the body is in hand, confirm against the real version.
         if (!pastCursor && !(file.updatedAt > mergedVersion)) continue;
-        await withDatabaseLockRetry(
-          async () => {
-            await ensureNoTransaction();
-            for (const message of file.messages ?? []) {
-              const rows = await db.select<{ created_at: number }>(
-                "SELECT created_at FROM messages WHERE id = ?",
-                [String(message.id)],
-              );
-              if (rows.length === 0) {
-                try {
-                  await upsertRecord(db, "messages", message, "id");
-                  changes++;
-                } catch (error) {
-                  if (!isForeignKeyConstraintError(error)) throw error;
-                }
-              } else if (Number(message.created_at ?? 0) > Number(rows[0].created_at ?? 0)) {
+        await withDatabaseLockRetry(async () => {
+          await ensureNoTransaction();
+          for (const message of file.messages ?? []) {
+            const rows = await db.select<{ created_at: number }>(
+              "SELECT created_at FROM messages WHERE id = ?",
+              [String(message.id)],
+            );
+            if (rows.length === 0) {
+              try {
                 await upsertRecord(db, "messages", message, "id");
+                changes++;
+              } catch (error) {
+                if (!isForeignKeyConstraintError(error)) throw error;
               }
+            } else if (Number(message.created_at ?? 0) > Number(rows[0].created_at ?? 0)) {
+              await upsertRecord(db, "messages", message, "id");
             }
-            await applyTombstoneMap(db, "messages", file.deleted, undefined, forceApply, deviceId);
-          },
-          "apply chat day file",
-        );
+          }
+          await applyTombstoneMap(db, "messages", file.deleted, undefined, forceApply, deviceId);
+        }, "apply chat day file");
         mergedDayVersions[day] = file.updatedAt;
-        if (day > pulledDay) {
-          await setMetadata(CHAT_PULLED_DAY_KEY, day);
-        }
-        await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
+        mergedDaysChanged = true;
+        if (day > nextPulledDay) nextPulledDay = day;
         await sleep(0);
       }
 
       // Push: day files containing messages created after our last push.
       if (!receiveOnly) {
-        const pushedAt = legacyImported
-          ? 0
-          : Number((await getMetadata(CHAT_PUSHED_AT_KEY)) ?? 0);
-        const newMessages = await db
-          .select<Row>("SELECT * FROM messages WHERE created_at > ?", [pushedAt])
-          .catch(() => [] as Row[]);
+        const pushedAt = legacyImported ? 0 : Number((await getMetadata(CHAT_PUSHED_AT_KEY)) ?? 0);
+        const newMessages = await db.select<Row>("SELECT * FROM messages WHERE created_at > ?", [
+          pushedAt,
+        ]);
         const byDay = new Map<string, Row[]>();
         for (const message of newMessages) {
           const day = dayKeyOf(Number(message.created_at ?? Date.now()));
@@ -901,15 +905,17 @@ export async function runPerBookSync(
             updatedAt: Date.now(),
           };
           await backend.putJSON(`${CHAT_DIR}/${day}.json`, file);
+          pushedMessages = true;
+          mergedDaysChanged = true;
           mergedDayVersions[day] = file.updatedAt;
           changes += localMessages.length;
           await sleep(0);
         }
-        if (byDay.size > 0) {
-          await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
-        }
-        await setMetadata(CHAT_PUSHED_AT_KEY, String(Date.now()));
       }
+      if (mergedDaysChanged)
+        await setMetadata(CHAT_MERGED_DAYS_KEY, JSON.stringify(mergedDayVersions));
+      if (nextPulledDay > pulledDay) await setMetadata(CHAT_PULLED_DAY_KEY, nextPulledDay);
+      if (pushedMessages) await setMetadata(CHAT_PUSHED_AT_KEY, String(syncStartedAt));
     }
 
     // 7. Profile files — one uniform single-table file per table
@@ -938,11 +944,15 @@ export async function runPerBookSync(
 
     // 8. Reading sessions — monthly shards
     progress("同步阅读统计...");
-    const lastSync = legacyImported ? 0 : await getLastSyncTimestamp();
-    const changedSessions = await db
-      .select<Row>("SELECT * FROM reading_sessions WHERE updated_at > ?", [lastSync])
-      .catch(() => [] as Row[]);
+    const shardEntries = await backend.listDir(SESSIONS_DIR);
     if (!receiveOnly) {
+      // The legacy global cursor may already have skipped local sessions during download-only sync.
+      // Replay once rather than using it to initialize the independent upload cursor.
+      const pushedAt = Number((await getMetadata(SESSIONS_PUSHED_AT_KEY)) ?? 0);
+      const changedSessions = await db.select<Row>(
+        "SELECT * FROM reading_sessions WHERE updated_at > ?",
+        [pushedAt],
+      );
       const byMonth = new Map<string, Row[]>();
       for (const session of changedSessions) {
         const startedAt = Number(session.started_at ?? session.updated_at ?? 0);
@@ -954,6 +964,23 @@ export async function runPerBookSync(
       for (const [month, sessions] of byMonth) {
         const path = `${SESSIONS_DIR}/${month}.json`;
         const remote = await backend.getJSON<SessionShardFile>(path);
+        // A retry may still be doing a full replay (e.g. the index was not
+        // published yet). Do not rewrite rows already covered by that shard.
+        if (remote?.schemaVersion === 1) {
+          const remoteById = new Map((remote.sessions ?? []).map((row) => [row.id, row]));
+          if (
+            sessions.every((row) => {
+              const existing = remoteById.get(row.id);
+              return (
+                existing &&
+                (Number(existing.updated_at) > Number(row.updated_at) ||
+                  (Object.keys(existing).length === Object.keys(row).length &&
+                    Object.entries(row).every(([key, value]) => existing[key] === value)))
+              );
+            })
+          )
+            continue;
+        }
         const merged = mergeItemRows(sessions, remote?.sessions, "updated_at");
         const file: SessionShardFile = {
           schemaVersion: 1,
@@ -965,38 +992,33 @@ export async function runPerBookSync(
         changes += sessions.length;
         await sleep(0);
       }
+      await setMetadata(SESSIONS_PUSHED_AT_KEY, String(syncStartedAt));
     }
-    const shardEntries = await backend
-      .listDir(SESSIONS_DIR)
-      .catch(() => [] as RemoteFile[]);
     for (const shard of shardEntries) {
       if (shard.isDirectory || !shard.name.endsWith(".json")) continue;
       const file = await backend.getJSON<SessionShardFile>(
         shard.path || `${SESSIONS_DIR}/${shard.name}`,
       );
       if (!file || file.schemaVersion !== 1) continue;
-      await withDatabaseLockRetry(
-        async () => {
-          await ensureNoTransaction();
-          for (const session of file.sessions ?? []) {
-            const rows = await db.select<{ updated_at: number }>(
-              "SELECT updated_at FROM reading_sessions WHERE id = ?",
-              [String(session.id)],
-            );
-            if (rows.length === 0) {
-              try {
-                await upsertRecord(db, "reading_sessions", session, "id");
-                changes++;
-              } catch (error) {
-                if (!isForeignKeyConstraintError(error)) throw error;
-              }
-            } else if (Number(session.updated_at ?? 0) > Number(rows[0].updated_at ?? 0)) {
+      await withDatabaseLockRetry(async () => {
+        await ensureNoTransaction();
+        for (const session of file.sessions ?? []) {
+          const rows = await db.select<{ updated_at: number }>(
+            "SELECT updated_at FROM reading_sessions WHERE id = ?",
+            [String(session.id)],
+          );
+          if (rows.length === 0) {
+            try {
               await upsertRecord(db, "reading_sessions", session, "id");
+              changes++;
+            } catch (error) {
+              if (!isForeignKeyConstraintError(error)) throw error;
             }
+          } else if (Number(session.updated_at ?? 0) > Number(rows[0].updated_at ?? 0)) {
+            await upsertRecord(db, "reading_sessions", session, "id");
           }
-        },
-        "apply session shard",
-      );
+        }
+      }, "apply session shard");
       await sleep(0);
     }
 
@@ -1026,6 +1048,7 @@ export async function runPerBookSync(
     let filesDownloaded = 0;
     let filesUploadFailed = 0;
     let filesDownloadFailed = 0;
+    let fileFailures: FileSyncFailure[] = [];
     progress("同步书籍和封面文件...");
     try {
       const { syncFiles } = await import("./sync-files");
@@ -1047,19 +1070,34 @@ export async function runPerBookSync(
       filesDownloaded = fileResult.filesDownloaded;
       filesUploadFailed = fileResult.filesUploadFailed;
       filesDownloadFailed = fileResult.filesDownloadFailed;
+      fileFailures = fileResult.failures;
     } catch (e) {
-      console.warn("[PerBookSync] File sync failed (non-fatal):", e);
+      console.warn("[PerBookSync] File sync phase failed", e instanceof Error ? e.name : typeof e);
       filesUploadFailed = Math.max(filesUploadFailed, 1);
+      fileFailures = [
+        {
+          path: "file-sync",
+          message: i18n.t("settings.syncFilePhaseFailure", {
+            defaultValue:
+              "File sync could not complete. Check the storage connection and try again.",
+          }),
+        },
+      ];
     }
 
-    await setLastSyncTimestamp(Date.now());
+    if (filesUploadFailed === 0 && filesDownloadFailed === 0) {
+      await setLastSyncTimestamp(syncStartedAt);
+    }
 
     onProgress?.({
       phase: "database",
       operation: receiveOnly ? "download" : "upload",
       completedFiles: 0,
       totalFiles: 0,
-      message: "同步完成",
+      ...(fileFailures[0] ? { failure: fileFailures[0] } : {}),
+      message: fileFailures[0]
+        ? `同步完成，但有 ${fileFailures.length} 个文件失败：${fileFailures[0].message}`
+        : "同步完成",
     });
     return {
       success: true,
@@ -1068,10 +1106,11 @@ export async function runPerBookSync(
       filesDownloaded,
       filesUploadFailed,
       filesDownloadFailed,
+      fileFailures,
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    console.error("[PerBookSync] Sync failed:", error);
+    console.error("[PerBookSync] Sync failed:", syncErrorDiagnostic(e));
     return {
       success: false,
       changes: 0,
@@ -1079,6 +1118,7 @@ export async function runPerBookSync(
       filesDownloaded: 0,
       filesUploadFailed: 0,
       filesDownloadFailed: 0,
+      fileFailures: [],
       error,
     };
   }

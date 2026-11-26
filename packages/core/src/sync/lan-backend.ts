@@ -6,6 +6,7 @@
 import { getPlatformService } from "../services/platform";
 import { generateId } from "../utils/generate-id";
 import type { ISyncBackend, RemoteFile } from "./sync-backend";
+import { WebDavError } from "./webdav-client";
 
 /** LAN sync QR code data */
 export interface LANQRData {
@@ -84,7 +85,11 @@ export class LANBackend implements ISyncBackend {
     });
 
     if (!response.ok) {
-      throw new Error(`LAN GET failed for ${path}: ${response.status}`);
+      throw new WebDavError(
+        response.status === 404 ? "not-found" : "http",
+        `LAN GET failed for ${path}: ${response.status}`,
+        { status: response.status, method: "GET" },
+      );
     }
 
     const buffer = await response.arrayBuffer();
@@ -97,8 +102,7 @@ export class LANBackend implements ISyncBackend {
       const text = new TextDecoder().decode(data);
       return JSON.parse(text) as T;
     } catch (e) {
-      const err = e as { message?: string };
-      if (err.message?.includes("404")) return null;
+      if (e instanceof WebDavError && e.status === 404) return null;
       throw e;
     }
   }
@@ -186,7 +190,12 @@ export function parseLANQRData(data: string): LANQRData | null {
       return null;
     }
     const parsed = JSON.parse(data);
-    if (parsed && typeof parsed === "object" && parsed.type === "readany-lan-sync" && parsed.v === 1) {
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      parsed.type === "readany-lan-sync" &&
+      parsed.v === 1
+    ) {
       return parsed as LANQRData;
     }
     return null;
