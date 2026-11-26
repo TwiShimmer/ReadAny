@@ -26,7 +26,6 @@ import {
   buildBookRemoteCover,
   buildBookRemoteDir,
   buildBookRemoteFile,
-  isCoverFileName,
   parseBookFolderName,
   sanitizeBookTitleForFs,
 } from "./sync-naming";
@@ -1193,9 +1192,31 @@ function ambiguousBookFolders(folders: string[]): MigrationBlocked {
   };
 }
 
+function selectLegacyBookFile(
+  entries: RemoteFile[],
+  expectedName: string,
+  ext: string,
+): RemoteFile | MigrationBlocked | undefined {
+  if (!ext) return undefined;
+  const matchingExtension = entries.filter(
+    (entry) => !entry.isDirectory && getExt(entry.name).toLowerCase() === ext.toLowerCase(),
+  );
+  const exact = matchingExtension.filter((entry) => entry.name === expectedName);
+  const candidates = exact.length > 0 ? exact : matchingExtension;
+  if (candidates.length < 2) return candidates[0];
+  return {
+    blocked: {
+      message: `Cannot select legacy source for ${expectedName}: ${candidates
+        .map((entry) => entry.name)
+        .sort()
+        .join(", ")}`,
+    },
+  };
+}
+
 /**
  * Bring the remote state for one book up to the current layout:
- *   - If a folder exists under a stale name (title changed) → rename folder contents.
+ *   - If a folder exists under a stale name (title changed) → move the book and cover.
  *   - If only legacy `/file/{id}.ext` / `/cover/{id}.ext` exist → move them into the per-book folder.
  *   - Otherwise inspect the existing folder to confirm what is already at the expected new path.
  *
@@ -1219,49 +1240,25 @@ async function migrateBookRemoteState(
 
   if (existingFolderName) {
     if (existingFolderName !== info.expectedFolderName) {
-      // Title changed (or sanitized form changed): rename folder by moving every child.
-      const oldDir = `${REMOTE_BOOKS_ROOT}/${existingFolderName}`;
-      let oldFiles: RemoteFile[];
-      try {
-        oldFiles = await backend.listDir(oldDir);
-      } catch (e) {
-        return {
-          blocked: {
-            message: `Cannot verify remote book folder: ${oldDir}`,
-            status: errorStatus(e),
-          },
-        };
+      const moved = await moveStaleBookFiles(
+        backend,
+        info,
+        existingFolderName,
+        info.hasFile,
+        info.hasCover,
+      );
+      if ("blocked" in moved) return moved;
+      if (moved.file) {
+        fileAtNew = true;
+        if (isPositiveFiniteNumber(moved.file.size)) fileSize = moved.file.size;
       }
-      let allMoved = true;
-      for (const f of oldFiles) {
-        const ext = getExt(f.name);
-        if (!ext || f.isDirectory) {
-          allMoved = false;
-          continue;
-        }
-        const cover = isCoverFileName(f.name);
-        const target = cover ? buildBookRemoteCover(book, ext) : buildBookRemoteFile(book, ext);
-        try {
-          await backend.move(`${oldDir}/${f.name}`, target);
-          if (cover) {
-            coverAtNew = true;
-            if (isPositiveFiniteNumber(f.size)) coverSize = f.size;
-          } else {
-            fileAtNew = true;
-            if (isPositiveFiniteNumber(f.size)) fileSize = f.size;
-          }
-        } catch (e) {
-          allMoved = false;
-          console.warn(
-            `[Sync] Folder-rename MOVE failed for ${book.id} (${f.name}, HTTP ${errorStatus(e) ?? "unknown"})`,
-          );
-        }
+      if (moved.cover) {
+        coverAtNew = true;
+        if (isPositiveFiniteNumber(moved.cover.size)) coverSize = moved.cover.size;
       }
       // Retain the old collection. A listing cannot make a later recursive DELETE
       // conditional on emptiness: another client could write a child in between.
-      if (allMoved) {
-        listings.bookDirByBookId.set(book.id, info.expectedFolderName);
-      }
+      listings.bookDirByBookId.set(book.id, info.expectedFolderName);
     } else {
       if (listings.source === "manifest") {
         fileAtNew = listings.filePathByBookId.get(book.id) === info.remoteFilePath;
@@ -1300,7 +1297,7 @@ async function migrateBookRemoteState(
       const missingCover = info.hasCover && !coverAtNew;
       if (backend.type === "webdav" && staleDirs.length > 0 && (missingFile || missingCover)) {
         if (staleDirs.length > 1) return ambiguousBookFolders(staleDirs);
-        const recovered = await recoverStaleBookFiles(
+        const recovered = await moveStaleBookFiles(
           backend,
           info,
           staleDirs[0],
@@ -1350,7 +1347,7 @@ async function migrateBookRemoteState(
   return { fileAtNew, coverAtNew, fileSize, coverSize, coverHash, coverSourcePath };
 }
 
-async function recoverStaleBookFiles(
+async function moveStaleBookFiles(
   backend: ISyncBackend,
   info: BookInfo,
   staleFolderName: string,
@@ -1368,26 +1365,32 @@ async function recoverStaleBookFiles(
   }
 
   const staleTitle = staleFolderName.slice(0, -(info.book.id.length + 1));
-  const findChild = (ext: string) =>
-    contents.find((entry) => !entry.isDirectory && entry.name === `${staleTitle}.${ext}`);
-  const file = missingFile ? findChild(info.fileExt) : undefined;
-  const cover = missingCover ? findChild(info.coverExt) : undefined;
+  const selectChild = (ext: string) => selectLegacyBookFile(contents, `${staleTitle}.${ext}`, ext);
+  const file = missingFile ? selectChild(info.fileExt) : undefined;
+  if (file && "blocked" in file) return file;
+  const cover = missingCover ? selectChild(info.coverExt) : undefined;
+  if (cover && "blocked" in cover) return cover;
+  if (file && file === cover) {
+    return { blocked: { message: `Cannot use ${dir}/${file.name} as both book and cover` } };
+  }
   const moves = [
     { entry: file, target: info.remoteFilePath },
     { entry: cover, target: info.remoteCoverPath },
   ];
+  // Try each child independently, but a partial migration must block transfers for this book.
+  let failure: MigrationBlocked | undefined;
   for (const { entry, target } of moves) {
     if (!entry) continue;
     const source = `${dir}/${entry.name}`;
     try {
       await backend.move(source, target);
     } catch (e) {
-      return {
+      failure ??= {
         blocked: { message: `Cannot MOVE remote book data: ${source}`, status: errorStatus(e) },
       };
     }
   }
-  return { file, cover };
+  return failure ?? { file, cover };
 }
 
 function buildUploadFileTask(backend: ISyncBackend, info: BookInfo): FileTask {

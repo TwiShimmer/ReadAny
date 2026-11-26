@@ -1369,27 +1369,54 @@ describe("sync-files", () => {
       { name: "uploads enabled", forceDownloadAll: false, failAgain: false, cover: false },
       { name: "MOVE fails again", forceDownloadAll: true, failAgain: true, cover: false },
       { name: "only the cover is left", forceDownloadAll: true, failAgain: false, cover: true },
+      {
+        name: "Export.epub with forced download",
+        forceDownloadAll: true,
+        sourceName: "Export.epub",
+      },
+      {
+        name: "Export.epub with uploads enabled",
+        forceDownloadAll: false,
+        sourceName: "Export.epub",
+      },
+      {
+        name: "Export.epub MOVE fails again",
+        forceDownloadAll: true,
+        failAgain: true,
+        sourceName: "Export.epub",
+      },
+      {
+        name: "ambiguous EPUB files",
+        forceDownloadAll: true,
+        sourceName: "Export.epub",
+        backup: true,
+      },
+      { name: "exact name with a backup EPUB", forceDownloadAll: true, backup: true },
     ])(
       "recovers a WebDAV rename on a later scan with no manifest ($name)",
-      async ({ forceDownloadAll, failAgain, cover }) => {
-        mockSelect.mockResolvedValue([
-          {
-            id: "book-1",
-            file_path: "books/book-1.epub",
-            title: "New Title",
-            cover_url: cover ? "covers/book-1.jpg" : null,
-          },
-        ]);
+      async ({ forceDownloadAll, failAgain, cover, sourceName = "Old Title.epub", backup }) => {
+        const book = {
+          id: "book-1",
+          file_path: "books/book-1.epub",
+          title: "New Title",
+          cover_url: cover ? "covers/book-1.jpg" : null,
+        };
+        const ambiguous = backup && sourceName === "Export.epub";
+        const blocked = failAgain || ambiguous;
+        mockSelect.mockResolvedValue([book]);
         mockAdapter.fileExists.mockResolvedValue(true);
 
         const root = `/dav${REMOTE_BOOKS_ROOT}/`;
         const manifest = `/dav${REMOTE_FILE_MANIFEST}`;
         const oldDir = `${root}Old%20Title-book-1/`;
         const currentDir = `${root}New%20Title-book-1/`;
-        const source = `${oldDir}Old%20Title.epub`;
+        const source = `${oldDir}${encodeURIComponent(sourceName)}`;
+        const backupSource = `${oldDir}Backup.epub`;
         const target = `${currentDir}New%20Title.epub`;
         const coverSource = `${oldDir}Old%20Title.jpg`;
         const coverTarget = `${currentDir}New%20Title.jpg`;
+        const otherDir = `${root}Other-book-2/`;
+        const otherFile = `${otherDir}Other.epub`;
         const paths = new Map([[source, target]]);
         if (cover) paths.set(coverSource, coverTarget);
         const failedSource = cover ? coverSource : source;
@@ -1404,17 +1431,24 @@ describe("sync-files", () => {
           switch (options?.method) {
             case "GET":
               if (path === manifest) return absent();
+              if (path === otherFile) return new Response(epubBytes);
               if ([...moved].some((from) => paths.get(from) === path))
                 return new Response(epubBytes);
               throw new Error(`Unexpected GET ${path}`);
             case "PROPFIND": {
               if (path === root) {
-                return currentCreated
-                  ? davListing([root, true], [currentDir, true], [oldDir, true])
-                  : davListing([root, true], [oldDir, true]);
+                const entries: Array<[string, boolean]> = [
+                  [root, true],
+                  [oldDir, true],
+                ];
+                if (currentCreated) entries.push([currentDir, true]);
+                if (!firstScan && blocked) entries.push([otherDir, true]);
+                return davListing(...entries);
               }
               if (path === currentDir && !currentCreated) return absent();
+              if (path === otherDir) return davListing([otherDir, true], [otherFile, false]);
               const entries: Array<[string, boolean]> = [[path, true]];
+              if (path === oldDir && backup) entries.push([backupSource, false]);
               for (const [from, to] of paths) {
                 if (path === oldDir && !moved.has(from)) entries.push([from, false]);
                 if (path === currentDir && moved.has(from)) entries.push([to, false]);
@@ -1444,13 +1478,36 @@ describe("sync-files", () => {
         });
         setPlatformService({ fetch } as unknown as IPlatformService);
 
-        await syncFiles(new WebDavBackend(config, "secret"), undefined, { disableUploads: true });
+        const firstResult = await syncFiles(new WebDavBackend(config, "secret"), undefined, {
+          disableUploads: true,
+        });
         const requests = () =>
           fetch.mock.calls.map(([url, options]) => [options?.method, new URL(url).pathname]);
-        expect(requests()).toContainEqual(["MKCOL", currentDir]);
-        expect(requests()).toContainEqual(["MOVE", failedSource]);
+        const firstRequests = requests();
+        expect(firstRequests.filter(([method]) => method === "MOVE")).toEqual(
+          ambiguous ? [] : [...paths.keys()].map((path) => ["MOVE", path]),
+        );
+        expect(firstRequests.filter(([method]) => method === "PUT")).toEqual([]);
+        if (ambiguous) {
+          expect(firstResult.failures).toEqual([
+            expect.objectContaining({
+              message: expect.stringContaining("Backup.epub, Export.epub"),
+            }),
+          ]);
+          // Another client may create the current collection even when this scan is blocked.
+          currentCreated = true;
+        } else {
+          expect(firstRequests).toContainEqual(["MKCOL", currentDir]);
+        }
         expect(moved.has(failedSource)).toBe(false);
 
+        if (blocked) {
+          // A healthy book would otherwise give this scan a nonempty manifest to write.
+          mockSelect.mockResolvedValue([
+            book,
+            { id: "book-2", file_path: "books/book-2.epub", title: "Other" },
+          ]);
+        }
         firstScan = false;
         const laterRequestsStart = fetch.mock.calls.length;
         const result = await syncFiles(new WebDavBackend(config, "secret"), undefined, {
@@ -1459,27 +1516,28 @@ describe("sync-files", () => {
 
         const laterRequests = requests().slice(laterRequestsStart);
         expect(laterRequests).toContainEqual(["GET", manifest]);
-        expect(laterRequests.filter(([method]) => method === "MOVE")).toEqual([
-          ["MOVE", failedSource],
-        ]);
+        expect(laterRequests.filter(([method]) => method === "MOVE")).toEqual(
+          ambiguous ? [] : [["MOVE", failedSource]],
+        );
         expect(requests().filter(([method]) => method === "DELETE")).toEqual([]);
         const downloads = laterRequests.filter(
           ([method, path]) => method === "GET" && path !== manifest,
         );
         const uploads = laterRequests.filter(([method]) => method === "PUT");
-        if (failAgain) {
-          expect(downloads).toEqual([]);
+        if (blocked) {
+          expect(downloads).toEqual([["GET", otherFile]]);
           expect(uploads).toEqual([]);
           expect(result).toEqual({
             filesUploaded: 0,
-            filesDownloaded: 0,
+            filesDownloaded: 1,
             filesUploadFailed: 1,
             filesDownloadFailed: 1,
             failures: [
               {
                 path: `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.epub`,
-                status: 403,
-                message: expect.stringContaining("MOVE"),
+                ...(ambiguous
+                  ? { message: expect.stringContaining("Backup.epub, Export.epub") }
+                  : { status: 403, message: expect.stringContaining("MOVE") }),
               },
             ],
           });
