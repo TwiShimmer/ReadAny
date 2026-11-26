@@ -29,6 +29,20 @@
     }
   },
   "files": {
-    "ignore": ["node_modules", "dist", "target", "src-tauri/gen", "*.sql"]
+    "ignore": [
+      "node_modules",
+      "**/node_modules",
+      "dist",
+      "**/dist",
+      "target",
+      "**/target",
+      "src-tauri/gen",
+      "**/src-tauri/gen",
+      "*.sql",
+      "packages/app/public/vendor/**",
+      "packages/foliate-js/**",
+      "**/.expo/**",
+      "**/coverage/**"
+    ]
   }
 }

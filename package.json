@@ -22,6 +22,7 @@
     "eas:build:android": "pnpm --filter @readany/app-expo eas:build:android",
     "eas:build:ios": "pnpm --filter @readany/app-expo eas:build:ios",
     "lint": "biome check .",
+    "lint:changed": "node scripts/lint-changed.mjs",
     "lint:fix": "biome check --write .",
     "version:check": "node scripts/bump-version.js --check",
     "version:set": "node scripts/bump-version.js"
