@@ -1204,22 +1204,10 @@ async function migrateBookRemoteState(
           );
         }
       }
+      // Retain the old collection. A listing cannot make a later recursive DELETE
+      // conditional on emptiness: another client could write a child in between.
       if (allMoved) {
-        if (backend.type === "webdav") {
-          try {
-            if (await backend.isDirectoryEmpty?.(oldDir)) {
-              await backend.delete(oldDir);
-              listings.bookDirByBookId.set(book.id, info.expectedFolderName);
-            }
-          } catch {
-            // No confirmation means the former collection must be retained.
-          }
-        } else if (oldFiles?.length) {
-          try {
-            await backend.delete(oldDir);
-          } catch {}
-          listings.bookDirByBookId.set(book.id, info.expectedFolderName);
-        }
+        listings.bookDirByBookId.set(book.id, info.expectedFolderName);
       }
     } else {
       if (listings.source === "manifest") {

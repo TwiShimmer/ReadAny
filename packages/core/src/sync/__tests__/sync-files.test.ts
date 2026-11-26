@@ -1239,8 +1239,8 @@ describe("sync-files", () => {
       },
     );
 
-    it.each(["empty", "encoded child", "unverifiable", "new child"])(
-      "only deletes the former WebDAV collection after a successful MOVE and a confirmed empty listing (%s)",
+    it.each(["empty", "encoded child", "unverifiable", "new child", "initially empty"])(
+      "keeps the former WebDAV collection without a recursive DELETE (%s)",
       async (remaining) => {
         mockSelect.mockResolvedValue([
           {
@@ -1250,6 +1250,7 @@ describe("sync-files", () => {
           },
         ]);
         let moved = false;
+        let oldCollectionExists = true;
         const root = `/dav${REMOTE_BOOKS_ROOT}/`;
         const oldDir = `${root}Old%20Title-book-1/`;
         const source = `${oldDir}Old%20Title.epub`;
@@ -1259,13 +1260,13 @@ describe("sync-files", () => {
             case "GET":
               return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
             case "PROPFIND": {
-              if (path === root && options.headers?.Depth === "1")
+              if (path === root && new Headers(options.headers).get("Depth") === "1")
                 return davListing([root, true], [oldDir, true]);
               if (path !== oldDir) return davListing([path, true]);
               if (moved && remaining === "unverifiable")
                 return new Response("<html>Login</html>", { status: 404 });
               const entries: Array<[string, boolean]> = [[oldDir, true]];
-              if (!moved) entries.push([source, false]);
+              if (!moved && remaining !== "initially empty") entries.push([source, false]);
               if (remaining === "encoded child") entries.push([`${oldDir}extra%2Fdata`, false]);
               if (moved && remaining === "new child") entries.push([`${oldDir}new.txt`, false]);
               return davListing(...entries);
@@ -1275,6 +1276,7 @@ describe("sync-files", () => {
               moved = true;
               return new Response(null, { status: 201 });
             case "DELETE":
+              if (path === oldDir.slice(0, -1)) oldCollectionExists = false;
               return new Response(null, { status: 204 });
             case "PUT":
               return new Response(null, { status: 201 });
@@ -1285,16 +1287,15 @@ describe("sync-files", () => {
         setPlatformService({ fetch } as unknown as IPlatformService);
         const backend = new WebDavBackend(config, "secret");
         await syncFiles(backend, undefined, { disableUploads: true });
-        expect(moved).toBe(true);
+        expect(moved).toBe(remaining !== "initially empty");
+        expect(oldCollectionExists).toBe(true);
         const deletes = fetch.mock.calls.filter(([, options]) => options?.method === "DELETE");
-        expect(deletes.map(([url]) => new URL(url).pathname)).toEqual(
-          remaining === "empty" ? [oldDir.slice(0, -1)] : [],
-        );
+        expect(deletes).toEqual([]);
       },
     );
 
     it.each([true, false])(
-      "checks for an empty old folder only when all files moved (all moved: %s)",
+      "never probes or deletes the old folder (all moved: %s)",
       async (allMoved) => {
         mockSelect.mockResolvedValue([
           {
@@ -1361,13 +1362,8 @@ describe("sync-files", () => {
           `${oldDirPath}/Old Title.jpg`,
           `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.jpg`,
         );
-        if (allMoved) {
-          expect(backend.isDirectoryEmpty).toHaveBeenCalledWith(oldDirPath);
-          expect(backend.delete).toHaveBeenCalledWith(oldDirPath);
-        } else {
-          expect(backend.isDirectoryEmpty).not.toHaveBeenCalled();
-          expect(backend.delete).not.toHaveBeenCalled();
-        }
+        expect(backend.isDirectoryEmpty).not.toHaveBeenCalled();
+        expect(backend.delete).not.toHaveBeenCalled();
       },
     );
 
