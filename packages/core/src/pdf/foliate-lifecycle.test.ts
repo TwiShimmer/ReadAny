@@ -7,6 +7,23 @@ const foliateRequire = createRequire(new URL("../../../foliate-js/pdf.js", impor
 
 const file = new File(["%PDF-1.7"], "sample.pdf");
 
+const activeWorkers = new Set<EventTarget>();
+const destroyWorker = vi.fn();
+
+class TrackedWorker extends EventTarget {
+  static created = vi.fn();
+
+  constructor() {
+    super();
+    activeWorkers.add(this);
+    TrackedWorker.created(this);
+  }
+
+  terminate() {
+    activeWorkers.delete(this);
+  }
+}
+
 function createTask(promise: Promise<unknown>) {
   void promise.catch(() => {});
   const task = { promise, destroy: vi.fn(async () => {}) };
@@ -30,12 +47,21 @@ describe("Foliate PDF document lifecycle", () => {
       version: "4.0.0",
       getDocument,
       GlobalWorkerOptions: workerOptions,
+      PDFWorker: class {
+        destroy = destroyWorker;
+      },
     }));
     getDocument.mockReset();
+    destroyWorker.mockReset();
+    TrackedWorker.created.mockReset();
+    activeWorkers.clear();
     workerOptions.workerSrc = "";
   });
 
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   it("releases each loading task exactly once when its book is closed", async () => {
     const { makePDF } = await import("../../../foliate-js/pdf.js");
@@ -130,6 +156,56 @@ describe("Foliate PDF document lifecycle", () => {
     controller.abort();
     await cancelled;
     expect(task.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminates the native worker when opening is aborted before the handshake", async () => {
+    const { configurePDFWorker, makePDF } = await import("../../../foliate-js/pdf.js");
+    vi.stubGlobal("Worker", TrackedWorker);
+    configurePDFWorker({ workerSrc: "/pdf-worker.js" });
+    const controller = new AbortController();
+    const started = Promise.withResolvers<EventTarget>();
+    TrackedWorker.created.mockImplementationOnce(started.resolve);
+    const opening = makePDF(file, { signal: controller.signal });
+    const cancelled = expect(opening).rejects.toMatchObject({ name: "AbortError" });
+
+    await started.promise;
+    expect(activeWorkers.size).toBe(1);
+    controller.abort();
+    await cancelled;
+    expect(activeWorkers.size).toBe(0);
+    expect(getDocument).not.toHaveBeenCalled();
+  });
+
+  it("terminates the owned native worker if PDF.js transport destruction rejects", async () => {
+    const { configurePDFWorker, makePDF } = await import("../../../foliate-js/pdf.js");
+    vi.stubGlobal("Worker", TrackedWorker);
+    configurePDFWorker({ workerSrc: "/pdf-worker.js" });
+    const started = Promise.withResolvers<EventTarget>();
+    TrackedWorker.created.mockImplementationOnce(started.resolve);
+    const task = createTask(Promise.resolve(createPdf()));
+    const teardown = Promise.withResolvers<void>();
+    task.destroy.mockReturnValueOnce(teardown.promise);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const opening = makePDF(file);
+    const worker = await started.promise;
+    worker.dispatchEvent(
+      new MessageEvent("message", {
+        data: { sourceName: "worker", targetName: "main", action: "ready" },
+      }),
+    );
+    const book = await opening;
+    const closing = book.destroy();
+    expect(book.destroy()).toBe(closing);
+    expect(activeWorkers.size).toBe(1);
+    expect(destroyWorker).not.toHaveBeenCalled();
+
+    const failure = new Error("Transport destruction failed");
+    teardown.reject(failure);
+    await closing;
+    expect(destroyWorker).toHaveBeenCalledExactlyOnceWith();
+    expect(activeWorkers.size).toBe(0);
+    expect(warning).toHaveBeenCalledExactlyOnceWith("Failed to release PDF loading task:", failure);
   });
 
   it("does not create a loading task for an already cancelled open", async () => {
