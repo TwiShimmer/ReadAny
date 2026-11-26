@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getDocument = vi.fn();
 const workerOptions = { workerSrc: "" };
@@ -35,6 +35,8 @@ describe("Foliate PDF document lifecycle", () => {
     workerOptions.workerSrc = "";
   });
 
+  afterEach(() => vi.restoreAllMocks());
+
   it("releases each loading task exactly once when its book is closed", async () => {
     const { makePDF } = await import("../../../foliate-js/pdf.js");
     for (let i = 0; i < 3; i++) {
@@ -62,6 +64,60 @@ describe("Foliate PDF document lifecycle", () => {
     const incomplete = createTask(Promise.resolve(pdf));
     await expect(makePDF(file)).rejects.toBe(failure);
     expect(incomplete.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns to the worker baseline after repeated corrupt PDF retries", async () => {
+    const { makePDF } = await import("../../../foliate-js/pdf.js");
+    const workers = new Set<object>();
+    const failure = new Error("Corrupt PDF");
+    getDocument.mockImplementation(() => {
+      const worker = {};
+      workers.add(worker);
+      return {
+        promise: Promise.reject(failure),
+        destroy: async () => {
+          expect(workers.delete(worker)).toBe(true);
+        },
+      };
+    });
+
+    for (let i = 0; i < 3; i++) {
+      await expect(makePDF(file)).rejects.toBe(failure);
+      expect(workers.size).toBe(0);
+    }
+    expect(getDocument).toHaveBeenCalledTimes(3);
+  });
+
+  it("shares an in-flight URL between callers and revokes it after the final release", async () => {
+    const { makePDF } = await import("../../../foliate-js/pdf.js");
+    const pdf = createPdf();
+    const page = await pdf.getPage();
+    let complete!: (value: typeof page) => void;
+    const pending = new Promise<typeof page>((resolve) => {
+      complete = resolve;
+    });
+    const getPage = vi.fn().mockResolvedValueOnce(page).mockReturnValue(pending);
+    const task = createTask(Promise.resolve({ ...pdf, getPage }));
+    const source = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:shared");
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const book = await makePDF(file);
+
+    const left = book.sections[0].load();
+    const right = book.sections[0].load();
+    complete(page);
+    const [first, second] = await Promise.all([left, right]);
+    expect(getPage).toHaveBeenCalledTimes(2);
+    expect(source).toHaveBeenCalledTimes(1);
+    expect(first.src).toBe(second.src);
+
+    first.release();
+    first.release();
+    expect(revoke).not.toHaveBeenCalled();
+    await book.destroy();
+    expect(revoke).not.toHaveBeenCalled();
+    second.release();
+    expect(revoke).toHaveBeenCalledExactlyOnceWith("blob:shared");
+    expect(task.destroy).toHaveBeenCalledTimes(1);
   });
 
   it("aborts a pending open even if PDF.js leaves its loading promise pending", async () => {
