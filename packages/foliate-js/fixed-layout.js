@@ -43,6 +43,9 @@ export class FixedLayout extends HTMLElement {
   #side;
   #zoom;
   #zoomFactor = 1;
+  #pendingSpread;
+  #displayedSpread;
+  #destroyed = false;
   constructor() {
     super();
 
@@ -130,7 +133,8 @@ export class FixedLayout extends HTMLElement {
       "layout",
     );
   }
-  async #createFrame({ index, src: srcOption }) {
+  async #createFrame({ index, src: srcOption }, signal) {
+    signal.throwIfAborted();
     const srcOptionIsString = typeof srcOption === "string";
     const src = srcOptionIsString ? srcOption : srcOption?.src;
     const onZoom = srcOptionIsString ? null : srcOption?.onZoom;
@@ -150,22 +154,30 @@ export class FixedLayout extends HTMLElement {
     iframe.setAttribute("part", "filter");
     this.#root.append(element);
     if (!src) return { blank: true, element, iframe };
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
       iframe.addEventListener(
         "load",
         () => {
-          const doc = iframe.contentDocument;
-          this.dispatchEvent(new CustomEvent("load", { detail: { doc, index } }));
-          const { width, height } = getViewport(doc, this.defaultViewport);
-          resolve({
-            element,
-            iframe,
-            width: Number.parseFloat(width),
-            height: Number.parseFloat(height),
-            onZoom,
-          });
+          signal.removeEventListener("abort", abort);
+          try {
+            const doc = iframe.contentDocument;
+            this.dispatchEvent(new CustomEvent("load", { detail: { doc, index } }));
+            const { width, height } = getViewport(doc, this.defaultViewport);
+            resolve({
+              element,
+              iframe,
+              width: Number.parseFloat(width),
+              height: Number.parseFloat(height),
+              onZoom,
+              signal,
+            });
+          } catch (error) {
+            reject(error);
+          }
         },
-        { once: true },
+        { once: true, signal },
       );
       iframe.src = src;
     });
@@ -203,9 +215,19 @@ export class FixedLayout extends HTMLElement {
         : fitScale * this.#zoomFactor;
 
     const transform = (frame) => {
-      const { element, iframe, width, height, blank, onZoom } = frame;
+      const { element, iframe, width, height, blank, onZoom, signal } = frame;
       if (!iframe) return;
-      if (onZoom) onZoom({ doc: frame.iframe.contentDocument, scale });
+      if (onZoom) {
+        Promise.resolve()
+          .then(() => {
+            if (!signal.aborted) return onZoom({ doc: iframe.contentDocument, scale });
+          })
+          .catch((error) => {
+            if (signal.aborted) return;
+            if (this.book.reportRenderError) this.book.reportRenderError(error);
+            else console.error("Failed to render fixed-layout page:", error);
+          });
+      }
       const iframeScale = onZoom ? scale : 1;
       Object.assign(iframe.style, {
         width: `${width * iframeScale}px`,
@@ -233,21 +255,33 @@ export class FixedLayout extends HTMLElement {
       transform(right);
     }
   }
-  async #showSpread({ left, right, center, side }) {
+  #clearFrames() {
     this.#root.replaceChildren();
     this.#left = null;
     this.#right = null;
     this.#center = null;
+    this.#displayedSpread?.abort();
+    this.#displayedSpread = undefined;
+  }
+  async #showSpread({ left, right, center, side }, controller) {
+    const { signal } = controller;
+    signal.throwIfAborted();
+    this.#clearFrames();
+    this.#displayedSpread = controller;
     if (center) {
-      this.#center = await this.#createFrame(center);
+      const frame = await this.#createFrame(center, signal);
+      signal.throwIfAborted();
+      this.#center = frame;
       this.#side = "center";
-      this.#render();
     } else {
-      this.#left = await this.#createFrame(left);
-      this.#right = await this.#createFrame(right);
+      const leftFrame = await this.#createFrame(left, signal);
+      const rightFrame = await this.#createFrame(right, signal);
+      signal.throwIfAborted();
+      this.#left = leftFrame;
+      this.#right = rightFrame;
       this.#side = this.#left.blank ? "right" : this.#right.blank ? "left" : side;
-      this.#render();
     }
+    this.#render();
   }
   #goLeft() {
     if (this.#center || this.#left?.blank) return;
@@ -303,27 +337,46 @@ export class FixedLayout extends HTMLElement {
     }
   }
   async goToSpread(index, side, reason) {
-    if (index < 0 || index > this.#spreads.length - 1) return;
+    if (this.#destroyed || index < 0 || index > this.#spreads.length - 1) return;
     if (index === this.#index) {
       this.#render(side);
       return;
     }
+    if (this.#pendingSpread && this.#pendingSpread === this.#displayedSpread) this.#clearFrames();
+    this.#pendingSpread?.abort();
+    const controller = new AbortController();
+    const { signal } = controller;
+    this.#pendingSpread = controller;
+    const loadFrame = async (section) => {
+      signal.throwIfAborted();
+      const src = await section?.load?.();
+      if (signal.aborted) {
+        src?.release?.();
+        signal.throwIfAborted();
+      }
+      if (src?.release) signal.addEventListener("abort", src.release, { once: true });
+      return { src, index: this.book.sections.indexOf(section) };
+    };
     this.#index = index;
     const spread = this.#spreads[index];
-    if (spread.center) {
-      const index = this.book.sections.indexOf(spread.center);
-      const src = await spread.center?.load?.();
-      await this.#showSpread({ center: { index, src } });
-    } else {
-      const indexL = this.book.sections.indexOf(spread.left);
-      const indexR = this.book.sections.indexOf(spread.right);
-      const srcL = await spread.left?.load?.();
-      const srcR = await spread.right?.load?.();
-      const left = { index: indexL, src: srcL };
-      const right = { index: indexR, src: srcR };
-      await this.#showSpread({ left, right, side });
+    try {
+      if (spread.center) {
+        const center = await loadFrame(spread.center);
+        await this.#showSpread({ center }, controller);
+      } else {
+        const left = await loadFrame(spread.left);
+        const right = await loadFrame(spread.right);
+        await this.#showSpread({ left, right, side }, controller);
+      }
+      if (!signal.aborted) this.#reportLocation(reason);
+    } catch (error) {
+      if (signal.aborted) return;
+      if (this.#displayedSpread === controller) this.#clearFrames();
+      controller.abort();
+      throw error;
+    } finally {
+      if (this.#pendingSpread === controller) this.#pendingSpread = undefined;
     }
-    this.#reportLocation(reason);
   }
   async select(target) {
     await this.goTo(target);
@@ -355,7 +408,10 @@ export class FixedLayout extends HTMLElement {
     }));
   }
   destroy() {
+    this.#destroyed = true;
     this.#observer.unobserve(this);
+    this.#clearFrames();
+    this.#pendingSpread?.abort();
   }
 }
 

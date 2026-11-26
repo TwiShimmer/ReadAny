@@ -524,7 +524,7 @@ const render = async (page, doc, zoom) => {
 /**
  * Render a single PDF page and return src/onZoom for the fixed-layout renderer.
  */
-const renderPage = async (page) => {
+const renderPage = (page) => {
   const viewport = page.getViewport({ scale: 1 });
 
   const data = `<!DOCTYPE html>
@@ -641,17 +641,9 @@ const createPageTextDocument = async (page, pageNumber) => {
 
 const fakePageCfi = (pageIndex) => `epubcfi(/6/${(pageIndex + 1) * 2})`;
 
-// Bounded because each cached HTML skeleton owns a Blob URL and each section
-// closure keeps a pdf.js page proxy alive. This does NOT cache iframe
-// documents, canvases, or rendered bitmaps; those are owned by the renderer.
-const PAGE_HTML_CACHE_LIMIT = 8;
+// The text cache holds detached documents for search. HTML page URLs instead
+// live only while a pending spread or displayed iframe holds a lease.
 const PAGE_TEXT_CACHE_LIMIT = 16;
-
-const disposeCachedPage = (value) => {
-  if (value && typeof value.src === "string" && value.src.startsWith("blob:")) {
-    URL.revokeObjectURL(value.src);
-  }
-};
 
 const readCachedPage = (cache, key) => {
   const cached = cache.get(key);
@@ -662,19 +654,13 @@ const readCachedPage = (cache, key) => {
   return cached;
 };
 
-const writeCachedPage = (cache, key, value, limit, onEvict) => {
-  if (cache.has(key)) {
-    const previous = cache.get(key);
-    cache.delete(key);
-    if (previous !== value) onEvict?.(previous);
-  }
+const writeCachedPage = (cache, key, value, limit) => {
+  cache.delete(key);
   cache.set(key, value);
   while (cache.size > limit) {
     const oldest = cache.keys().next().value;
     if (oldest === undefined) break;
-    const evicted = cache.get(oldest);
     cache.delete(oldest);
-    onEvict?.(evicted);
   }
 };
 
@@ -833,22 +819,48 @@ async function _buildPDFBook(pdf, fileName, destroy) {
   }
 
   // Sections - one per page
-  const cache = new Map();
+  const pageLoads = new Map();
   const textDocumentCache = new Map();
   let destroyed = false;
+
+  async function acquirePage(index) {
+    if (destroyed) throw new Error("PDF book is closed");
+    let load = pageLoads.get(index);
+    if (!load) {
+      const entry = { users: 0, src: undefined, promise: undefined };
+      entry.promise = pdf.getPage(index + 1).then((page) => {
+        if (destroyed) throw new Error("PDF book is closed");
+        const result = renderPage(page);
+        entry.src = result.src;
+        return result;
+      });
+      pageLoads.set(index, entry);
+      load = entry;
+    }
+    load.users++;
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (--load.users !== 0) return;
+      pageLoads.delete(index);
+      if (load.src) URL.revokeObjectURL(load.src);
+    };
+
+    try {
+      const page = await load.promise;
+      if (destroyed) throw new Error("PDF book is closed");
+      return { ...page, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   book.sections = Array.from({ length: numPages }, (_, i) => ({
     id: i,
-    load: async () => {
-      const cached = readCachedPage(cache, i);
-      if (cached !== undefined) return cached;
-      const result = await renderPage(await pdf.getPage(i + 1));
-      if (destroyed) {
-        disposeCachedPage(result);
-        throw new Error("PDF book is closed");
-      }
-      writeCachedPage(cache, i, result, PAGE_HTML_CACHE_LIMIT, disposeCachedPage);
-      return result;
-    },
+    load: () => acquirePage(i),
     createDocument: async () => {
       const cached = readCachedPage(textDocumentCache, i);
       if (cached !== undefined) return cached.cloneNode(true);
@@ -900,8 +912,6 @@ async function _buildPDFBook(pdf, fileName, destroy) {
   book.getCover = async () => renderPageAsBlob(await pdf.getPage(1));
   book.destroy = () => {
     destroyed = true;
-    for (const value of cache.values()) disposeCachedPage(value);
-    cache.clear();
     textDocumentCache.clear();
     return destroy();
   };
