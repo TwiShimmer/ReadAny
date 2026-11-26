@@ -1,7 +1,7 @@
 import { type Entry, type FileEntry, Reader, ZipReader } from "@zip.js/zip.js";
 import {
   getPackageDir,
-  parseEpubReadingManifest,
+  parseEpubReadingPackage,
   parseEpubReadingPackagePaths,
   resolvePackagePath,
 } from "../epub/inspect";
@@ -17,7 +17,9 @@ const MAX_ZIP_ENTRIES = 10_000;
 const MAX_EPUB_ENTRY_BYTES = 128 * 1024 * 1024;
 const MAX_EPUB_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_EPUB_CONTAINER_BYTES = 64 * 1024;
-export const MAX_EPUB_PACKAGE_BYTES = 4 * 1024 * 1024;
+const MAX_EPUB_PACKAGE_BYTES = 4 * 1024 * 1024;
+export const MAX_EPUB_SPINE_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_EPUB_SPINE_TOTAL_BYTES = 128 * 1024 * 1024;
 
 export function isDavWriteMethod(method: string): boolean {
   return method === "PUT" || method === "MKCOL" || method === "MOVE" || method === "DELETE";
@@ -235,28 +237,35 @@ function safeEpubPath(path: string): boolean {
   return path.split("/").every((part) => part && part !== "." && part !== "..");
 }
 
-async function readEpubMetadata(entry: FileEntry, limit: number): Promise<string> {
-  if (
-    entry.uncompressedSize === 0 ||
-    entry.uncompressedSize > limit ||
-    entry.compressedSize > limit
-  ) {
-    throw new Error("Invalid or oversized EPUB metadata");
-  }
-  const bytes = new Uint8Array(entry.uncompressedSize);
+function fitsEpubEntryBudget(entry: FileEntry, limit: number): boolean {
+  return (
+    entry.uncompressedSize > 0 &&
+    entry.uncompressedSize <= limit &&
+    entry.compressedSize > 0 &&
+    entry.compressedSize <= limit
+  );
+}
+
+async function checkEpubEntry(entry: FileEntry, bytes?: Uint8Array): Promise<void> {
   let length = 0;
   await entry.getData(
     new WritableStream<Uint8Array>({
       write(chunk) {
-        if (length + chunk.length > bytes.length)
-          throw new Error("Oversized EPUB metadata payload");
-        bytes.set(chunk, length);
+        if (length + chunk.length > entry.uncompressedSize)
+          throw new Error("Oversized EPUB entry payload");
+        bytes?.set(chunk, length);
         length += chunk.length;
       },
     }),
     { checkSignature: true, useWebWorkers: false },
   );
-  if (length !== bytes.length) throw new Error("Truncated EPUB metadata");
+  if (length !== entry.uncompressedSize) throw new Error("Truncated EPUB entry payload");
+}
+
+async function readEpubMetadata(entry: FileEntry, limit: number): Promise<string> {
+  if (!fitsEpubEntryBudget(entry, limit)) throw new Error("Invalid or oversized EPUB metadata");
+  const bytes = new Uint8Array(entry.uncompressedSize);
+  await checkEpubEntry(entry, bytes);
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
@@ -269,6 +278,17 @@ function resolveEpubManifestHref(packageDir: string, href: string): string | und
   const relative = parts.filter((part) => part !== ".").join("/");
   if (!safeEpubPath(relative)) return;
   return resolvePackagePath(packageDir, relative);
+}
+
+async function checkEpubSpine(entries: Set<FileEntry>): Promise<boolean> {
+  let remaining = MAX_EPUB_SPINE_TOTAL_BYTES;
+  for (const entry of entries) {
+    if (!fitsEpubEntryBudget(entry, Math.min(MAX_EPUB_SPINE_ENTRY_BYTES, remaining))) return false;
+    remaining -= Math.max(entry.uncompressedSize, entry.compressedSize);
+  }
+  // Read each distinct spine member to EOF for its CRC, never collecting chapter bytes.
+  for (const entry of entries) await checkEpubEntry(entry);
+  return true;
 }
 
 async function hasReadableEpubPackage(entries: Map<string, FileEntry>): Promise<boolean> {
@@ -295,15 +315,21 @@ async function hasReadableEpubPackage(entries: Map<string, FileEntry>): Promise<
   const opf = entries.get(paths[0]);
   if (!opf) return false;
   const packageDir = getPackageDir(opf.filename);
-  const manifest = parseEpubReadingManifest(await readEpubMetadata(opf, MAX_EPUB_PACKAGE_BYTES));
-  return manifest.every(({ href }) => {
+  const { manifestHrefs, spineHrefs } = parseEpubReadingPackage(
+    await readEpubMetadata(opf, MAX_EPUB_PACKAGE_BYTES),
+  );
+  const spineHrefSet = new Set(spineHrefs);
+  const spineEntries = new Set<FileEntry>();
+  for (const href of manifestHrefs) {
     const path = resolveEpubManifestHref(packageDir, href);
     const entry = path && entries.get(path);
-    return !!entry && entry.uncompressedSize > 0 && entry.compressedSize > 0;
-  });
+    if (!entry || entry.uncompressedSize === 0 || entry.compressedSize === 0) return false;
+    if (spineHrefSet.has(href)) spineEntries.add(entry);
+  }
+  return checkEpubSpine(spineEntries);
 }
 
-/** Scan ZIP headers and, for EPUB, read and CRC-check only the bounded OCF metadata. */
+/** Scan ZIP headers and, for EPUB, CRC-check the bounded OCF metadata and spine. */
 export async function isValidDavZip(
   path: string,
   size: number,

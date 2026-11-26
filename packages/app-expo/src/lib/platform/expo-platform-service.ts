@@ -22,7 +22,7 @@ import type {
   WebSocketOptions,
 } from "@readany/core/services";
 import {
-  MAX_EPUB_PACKAGE_BYTES,
+  MAX_EPUB_SPINE_ENTRY_BYTES,
   MAX_STREAMED_DAV_DOWNLOAD_BYTES,
   acceptsDavDownloadPrefix,
   acceptsDavDownloadType,
@@ -71,7 +71,8 @@ class ExpoDeflateStream extends TransformStream<Uint8Array, Uint8Array> {
       transform(chunk, controller) {
         inflate.onData = (bytes) => {
           produced += bytes.byteLength;
-          if (produced > MAX_EPUB_PACKAGE_BYTES) throw new Error("Oversized EPUB metadata");
+          if (produced > MAX_EPUB_SPINE_ENTRY_BYTES)
+            throw new Error("Oversized EPUB entry payload");
           controller.enqueue(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
         };
         if (complete || !inflate.push(chunk)) throw new Error("Invalid ZIP deflate stream");

@@ -1,7 +1,7 @@
 import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 
 const packagePath = "OPS/book.opf";
-const chapterPath = "OPS/chapter one.xhtml";
+const defaultChapterPath = "OPS/chapter one.xhtml";
 
 export const epubPackageXml = `<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -20,6 +20,9 @@ export async function epubFixture({
   opfPath = packagePath,
   opf = epubPackageXml,
   chapter = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><p>Text</p></body></html>',
+  chapterPath = defaultChapterPath,
+  chapterLevel = 6,
+  extraChapters = [] as Array<[path: string, text: string]>,
   mime = "application/epub+zip",
   mimeLevel = 0,
 } = {}) {
@@ -34,7 +37,8 @@ export async function epubFixture({
     );
   if (opfPath) {
     await zip.add(opfPath, new TextReader(opf));
-    await zip.add(chapterPath, new TextReader(chapter));
+    await zip.add(chapterPath, new TextReader(chapter), { level: chapterLevel });
+    for (const [path, text] of extraChapters) await zip.add(path, new TextReader(text));
     await zip.add(
       "OPS/toc.ncx",
       new TextReader(`<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">

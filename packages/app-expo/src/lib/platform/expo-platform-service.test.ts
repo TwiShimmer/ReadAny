@@ -185,8 +185,11 @@ describe("Expo WebDAV transport", () => {
     ).rejects.toMatchObject({ status: 200 });
   });
 
-  it("validates deflated EPUB metadata and mimetype without a native DecompressionStream", async () => {
-    const bytes = await epubFixture({ mimeLevel: 6 });
+  it("validates deflated EPUB metadata and chapters without a native DecompressionStream", async () => {
+    const text = Array.from({ length: 1024 }, (_, i) => `<p>Sample paragraph ${i}.</p>`).join("");
+    // A chapter can exceed the OPF metadata limit without exceeding the spine limit.
+    const chapter = `<html><body>${text.repeat(200)}</body></html>`;
+    const bytes = await epubFixture({ mimeLevel: 6, chapter });
     fetch.mockResolvedValueOnce(response(url, bytes));
     vi.stubGlobal("DecompressionStream", undefined);
     const hermesPlatform = new ExpoPlatformService();

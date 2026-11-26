@@ -52,6 +52,55 @@ const { syncFiles, downloadBookFile } = await import("../sync-files");
 
 const epubBytes = await epubFixture();
 const emptyOpf = '<package xmlns="http://www.idpf.org/2007/opf"/>';
+const spineEntryLimit = 16 * 1024 * 1024;
+
+async function corruptChapter(bytes: Uint8Array<ArrayBuffer>, path: string, method = 8) {
+  const zip = new ZipReader(new Uint8ArrayReader(bytes));
+  try {
+    const chapter = (await zip.getEntries()).find((entry) => entry.filename === path);
+    if (!chapter || chapter.compressionMethod !== method) throw new Error("Unexpected ZIP chapter");
+    const broken = bytes.slice();
+    const view = new DataView(broken.buffer);
+    const offset = chapter.offset;
+    const dataOffset =
+      offset + 30 + view.getUint16(offset + 26, true) + view.getUint16(offset + 28, true);
+    // For Deflate, BTYPE=3 is invalid. For Stored data, change a byte without changing the size.
+    // Only touch the chapter data, not any ZIP headers or checksums.
+    broken[dataOffset] = method === 8 ? 0x07 : broken[dataOffset] ^ 1;
+    return broken;
+  } finally {
+    await zip.close();
+  }
+}
+
+function addSpineChapters(extraChapters: Array<[path: string, text: string]>) {
+  const opf = epubPackageXml
+    .replace(
+      "</manifest>",
+      `${extraChapters.map(([path], i) => `<item id="extra${i}" href="${path}" media-type="application/xhtml+xml"/>`).join("")}</manifest>`,
+    )
+    .replace(
+      "</spine>",
+      `${extraChapters.map((_, i) => `<itemref idref="extra${i}" linear="no"/>`).join("")}</spine>`,
+    );
+  return epubFixture({
+    opf,
+    extraChapters: extraChapters.map(([path, text]) => [`OPS/${path}`, text]),
+  });
+}
+
+function largeChapter(bytes: number) {
+  // Keep the compressed fixture small without triggering the existing ZIP compression-ratio limit.
+  const paragraphs = Array.from({ length: 1024 }, (_, i) => `<p>Sample paragraph ${i}.</p>`).join(
+    "",
+  );
+  const start = '<html xmlns="http://www.w3.org/1999/xhtml"><body>';
+  const end = "</body></html>";
+  const bodySize = bytes - start.length - end.length;
+  const body = paragraphs.repeat(Math.floor(bodySize / paragraphs.length));
+  return `${start}${body}${" ".repeat(bodySize - body.length)}${end}`;
+}
+
 const config = {
   type: "webdav",
   url: "https://dav.example.com/dav",
@@ -577,6 +626,48 @@ describe("sync-files", () => {
       },
       { name: "EPUB with an empty chapter", body: epubFixture({ chapter: "" }) },
       {
+        name: "EPUB with a missing spine chapter",
+        body: epubFixture({ chapterPath: "OPS/other.xhtml" }),
+      },
+      {
+        name: "EPUB with a corrupt Deflate chapter and intact ZIP headers (buffered)",
+        body: corruptChapter(epubBytes, "OPS/chapter one.xhtml"),
+      },
+      {
+        name: "EPUB with a corrupt Deflate chapter and intact ZIP headers (native)",
+        body: corruptChapter(epubBytes, "OPS/chapter one.xhtml"),
+        native: true,
+      },
+      {
+        name: "EPUB with a corrupt second, non-linear chapter",
+        body: addSpineChapters([["second.xhtml", "<html><body>Second chapter</body></html>"]]).then(
+          (bytes) => corruptChapter(bytes, "OPS/second.xhtml"),
+        ),
+      },
+      {
+        name: "EPUB with a mismatched chapter CRC",
+        body: epubFixture({ chapterLevel: 0 }).then((bytes) =>
+          corruptChapter(bytes, "OPS/chapter one.xhtml", 0),
+        ),
+      },
+      {
+        name: "EPUB with only NCX in the spine",
+        body: epubFixture({ opf: epubPackageXml.replace('idref="chapter"', 'idref="ncx"') }),
+      },
+      {
+        name: "EPUB with an oversized chapter",
+        body: epubFixture({ chapter: largeChapter(spineEntryLimit + 1) }),
+      },
+      {
+        name: "EPUB with oversized combined spine resources",
+        body: (() => {
+          const chapter = largeChapter(spineEntryLimit);
+          return addSpineChapters(
+            Array.from({ length: 8 }, (_, i) => [`extra${i}.xhtml`, chapter]),
+          );
+        })(),
+      },
+      {
         name: "EPUB with a traversing manifest href",
         body: epubFixture({
           opf: epubPackageXml.replace("./chapter%20one.xhtml", "%2e%2e/OPS/chapter%20one.xhtml"),
@@ -717,6 +808,7 @@ describe("sync-files", () => {
           mockAdapter.hashFile.mockReset().mockResolvedValue("local-hash");
         }
       },
+      20_000, // The aggregate-budget fixture compresses 128 MiB of chapter data.
     );
 
     it("uses the remote file manifest for downloads without scanning remote directories", async () => {

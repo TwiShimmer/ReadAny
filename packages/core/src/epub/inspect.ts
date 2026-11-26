@@ -5,6 +5,7 @@ import { toArrayBuffer } from "./zip";
 const CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container";
 const PACKAGE_MEDIA_TYPE = "application/oebps-package+xml";
 const OPF_NS = "http://www.idpf.org/2007/opf";
+const SPINE_DOCUMENT_MEDIA_TYPES = new Set(["application/xhtml+xml", "text/html", "image/svg+xml"]);
 
 export type EpubInspectManifestItem = {
   id: string;
@@ -191,7 +192,10 @@ function parseManifestItem(item: Element): EpubInspectManifestItem {
 }
 
 /** Inspect the untruncated OPF structure, without loading TOC or book resources. */
-export function parseEpubReadingManifest(xml: string): EpubInspectManifestItem[] {
+export function parseEpubReadingPackage(xml: string): {
+  manifestHrefs: string[];
+  spineHrefs: string[];
+} {
   const root = parseEpubXmlRoot(xml);
   if (root.localName !== "package") throw new Error("Invalid EPUB package root");
   // Foliate uses the OPF namespace when declared, but also handles older unnamespaced packages.
@@ -208,15 +212,25 @@ export function parseEpubReadingManifest(xml: string): EpubInspectManifestItem[]
   const items = children(manifest, "item").map(parseManifestItem);
   const idrefs = children(spine, "itemref");
   if (!items.length || !idrefs.length) throw new Error("Empty EPUB manifest or spine");
-  const ids = new Set<string>();
-  for (const { id, href, mediaType } of items) {
-    if (!id.trim() || !href.trim() || !mediaType.trim() || ids.has(id))
+  const itemsById = new Map<string, EpubInspectManifestItem>();
+  for (const item of items) {
+    const { id, href, mediaType } = item;
+    if (!id.trim() || !href.trim() || !mediaType.trim() || itemsById.has(id))
       throw new Error("Invalid EPUB manifest item");
-    ids.add(id);
+    itemsById.set(id, item);
   }
-  if (idrefs.some((item) => !ids.has(item.getAttribute("idref") ?? "")))
-    throw new Error("Invalid EPUB spine reference");
-  return items;
+  const spineItems = idrefs.map((itemref) => {
+    const item = itemsById.get(itemref.getAttribute("idref") ?? "");
+    if (!item) throw new Error("Invalid EPUB spine reference");
+    return item;
+  });
+  if (!spineItems.some(({ mediaType }) => SPINE_DOCUMENT_MEDIA_TYPES.has(mediaType)))
+    throw new Error("No renderable EPUB spine document");
+  // NCX does not count as a chapter, but every referenced spine member needs an integrity check.
+  return {
+    manifestHrefs: items.map(({ href }) => href),
+    spineHrefs: spineItems.map(({ href }) => href),
+  };
 }
 
 async function inspectPackageDocument(options: {
