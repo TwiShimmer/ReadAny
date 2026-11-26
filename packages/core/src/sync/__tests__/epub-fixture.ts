@@ -22,6 +22,7 @@ export async function epubFixture({
   chapter = '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter</title></head><body><p>Text</p></body></html>',
   chapterPath = defaultChapterPath,
   chapterLevel = 6,
+  ncxChapterHref = "chapter%20one.xhtml",
   extraChapters = [] as Array<[path: string, text: string]>,
   mime = "application/epub+zip",
   mimeLevel = 0,
@@ -44,7 +45,7 @@ export async function epubFixture({
       new TextReader(`<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
         <head><meta name="dtb:uid" content="test-book"/><meta name="dtb:depth" content="1"/><meta name="dtb:totalPageCount" content="0"/><meta name="dtb:maxPageNumber" content="0"/></head>
         <docTitle><text>Test Book</text></docTitle>
-        <navMap><navPoint id="chapter" playOrder="1"><navLabel><text>Chapter</text></navLabel><content src="chapter%20one.xhtml"/></navPoint></navMap>
+        <navMap><navPoint id="chapter" playOrder="1"><navLabel><text>Chapter</text></navLabel><content src="${ncxChapterHref}"/></navPoint></navMap>
       </ncx>`),
     );
   }

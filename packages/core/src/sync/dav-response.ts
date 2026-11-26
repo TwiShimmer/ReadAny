@@ -3,7 +3,6 @@ import {
   getPackageDir,
   parseEpubReadingPackage,
   parseEpubReadingPackagePaths,
-  resolvePackagePath,
 } from "../epub/inspect";
 import { getPathExtension } from "./local-book-paths";
 
@@ -228,13 +227,17 @@ export function isDavEpubDownload(path: string): boolean {
   return getPathExtension(path) === "epub";
 }
 
-function safeEpubPath(path: string): boolean {
-  if (path.includes("\\") || path.includes(":")) return false;
-  for (const char of path) {
+function safeEpubPathSegment(segment: string): boolean {
+  if (!segment || segment.includes("\\") || segment.includes(":")) return false;
+  for (const char of segment) {
     const code = char.charCodeAt(0);
     if (code < 32 || code === 127) return false;
   }
-  return path.split("/").every((part) => part && part !== "." && part !== "..");
+  return segment !== "." && segment !== "..";
+}
+
+function safeEpubPath(path: string): boolean {
+  return path.split("/").every(safeEpubPathSegment);
 }
 
 function fitsEpubEntryBudget(entry: FileEntry, limit: number): boolean {
@@ -270,14 +273,23 @@ async function readEpubMetadata(entry: FileEntry, limit: number): Promise<string
 }
 
 function resolveEpubManifestHref(packageDir: string, href: string): string | undefined {
-  // Foliate resolves the URI relative to the package and decodes each path segment.
-  // Do not allow absolute paths, traversal or encoded path separators to be normalized away.
+  // Allow parent-relative references inside the archive, not URL normalization that
+  // would silently clamp traversal above the ZIP root.
   if (href !== href.trim() || /[\t\r\n?#]|%(?:2f|5c|23)/i.test(href)) return;
   const parts = decodeURIComponent(href).split("/");
-  if (parts[parts.length - 1] === ".") return;
-  const relative = parts.filter((part) => part !== ".").join("/");
-  if (!safeEpubPath(relative)) return;
-  return resolvePackagePath(packageDir, relative);
+  if (!safeEpubPathSegment(parts[parts.length - 1])) return;
+  const resolved = packageDir ? packageDir.slice(0, -1).split("/") : [];
+  for (const part of parts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      if (!resolved.length) return;
+      resolved.pop();
+    } else {
+      if (!safeEpubPathSegment(part)) return;
+      resolved.push(part);
+    }
+  }
+  return resolved.join("/");
 }
 
 async function checkEpubSpine(entries: Set<FileEntry>): Promise<boolean> {

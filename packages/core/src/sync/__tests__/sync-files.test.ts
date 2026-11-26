@@ -52,7 +52,21 @@ const { syncFiles, downloadBookFile } = await import("../sync-files");
 
 const epubBytes = await epubFixture();
 const emptyOpf = '<package xmlns="http://www.idpf.org/2007/opf"/>';
+const nestedOpfPath = "OPS/pkg/book.opf";
+const nestedChapterPath = "OPS/text/chapter.xhtml";
 const spineEntryLimit = 16 * 1024 * 1024;
+
+function nestedEpub(href: string, chapterPath = nestedChapterPath) {
+  return epubFixture({
+    rootfile: nestedOpfPath,
+    opfPath: nestedOpfPath,
+    opf: epubPackageXml
+      .replace("./chapter%20one.xhtml", href)
+      .replace('href="toc.ncx"', 'href="../toc.ncx"'),
+    chapterPath,
+    ncxChapterHref: "text/chapter.xhtml",
+  });
+}
 
 async function corruptChapter(bytes: Uint8Array<ArrayBuffer>, path: string, method = 8) {
   const zip = new ZipReader(new Uint8ArrayReader(bytes));
@@ -668,9 +682,47 @@ describe("sync-files", () => {
         })(),
       },
       {
-        name: "EPUB with a traversing manifest href",
+        name: "EPUB with percent-encoded traversal beyond the ZIP root",
         body: epubFixture({
-          opf: epubPackageXml.replace("./chapter%20one.xhtml", "%2e%2e/OPS/chapter%20one.xhtml"),
+          opf: epubPackageXml.replace(
+            "./chapter%20one.xhtml",
+            "%2e%2e/%2e%2e/OPS/chapter%20one.xhtml",
+          ),
+        }),
+      },
+      {
+        name: "EPUB with an absolute chapter path",
+        body: nestedEpub("/OPS/text/chapter.xhtml"),
+      },
+      {
+        name: "EPUB with a parent-relative chapter",
+        body: nestedEpub("../text/chapter.xhtml"),
+        valid: true,
+      },
+      {
+        name: "EPUB with a parent-relative chapter using the wrong case",
+        body: nestedEpub("../Text/chapter.xhtml"),
+      },
+      {
+        name: "EPUB with a parent-relative chapter using Windows separators",
+        body: nestedEpub("..\\text\\chapter.xhtml"),
+      },
+      {
+        name: "EPUB with a parent-relative chapter path that escapes the root",
+        body: epubFixture({
+          opf: epubPackageXml.replace("./chapter%20one.xhtml", "../../outside"),
+          chapterPath: "outside",
+        }),
+      },
+      {
+        name: "EPUB with an embedded traversal that escapes the root",
+        body: epubFixture({
+          opfPath: "book.opf",
+          rootfile: "book.opf",
+          opf: epubPackageXml
+            .replace("./chapter%20one.xhtml", "OPS/../../outside")
+            .replace('href="toc.ncx"', 'href="OPS/toc.ncx"'),
+          chapterPath: "outside",
         }),
       },
       {
