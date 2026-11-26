@@ -1353,6 +1353,7 @@ describe("sync-files", () => {
           .slice(laterRequestsStart)
           .map(([url, options]) => [options?.method, new URL(url).pathname]);
         if (forceDownloadAll) expect(requests).toContainEqual(["GET", target]);
+        expect(requests).not.toContainEqual(["PROPFIND", oldDir]);
         expect(requests).not.toContainEqual(["PUT", target]);
         expect(result).toMatchObject({
           filesDownloaded: forceDownloadAll ? 1 : 0,
@@ -1363,17 +1364,157 @@ describe("sync-files", () => {
       },
     );
 
-    it.each([false, true])(
-      "reports unverifiable scan results without transferring or deleting book data (current folder listed: %s)",
-      async (currentListed) => {
+    it.each([
+      { name: "forced download", forceDownloadAll: true, failAgain: false, cover: false },
+      { name: "uploads enabled", forceDownloadAll: false, failAgain: false, cover: false },
+      { name: "MOVE fails again", forceDownloadAll: true, failAgain: true, cover: false },
+      { name: "only the cover is left", forceDownloadAll: true, failAgain: false, cover: true },
+    ])(
+      "recovers a WebDAV rename on a later scan with no manifest ($name)",
+      async ({ forceDownloadAll, failAgain, cover }) => {
+        mockSelect.mockResolvedValue([
+          {
+            id: "book-1",
+            file_path: "books/book-1.epub",
+            title: "New Title",
+            cover_url: cover ? "covers/book-1.jpg" : null,
+          },
+        ]);
+        mockAdapter.fileExists.mockResolvedValue(true);
+
+        const root = `/dav${REMOTE_BOOKS_ROOT}/`;
+        const manifest = `/dav${REMOTE_FILE_MANIFEST}`;
+        const oldDir = `${root}Old%20Title-book-1/`;
+        const currentDir = `${root}New%20Title-book-1/`;
+        const source = `${oldDir}Old%20Title.epub`;
+        const target = `${currentDir}New%20Title.epub`;
+        const coverSource = `${oldDir}Old%20Title.jpg`;
+        const coverTarget = `${currentDir}New%20Title.jpg`;
+        const paths = new Map([[source, target]]);
+        if (cover) paths.set(coverSource, coverTarget);
+        const failedSource = cover ? coverSource : source;
+        const absent = () =>
+          new Response(null, { status: 404, headers: { "Content-Length": "0" } });
+        const moved = new Set<string>();
+        let currentCreated = false;
+        let firstScan = true;
+
+        const fetch = vi.fn((url: string, options?: FetchOptions) => {
+          const path = new URL(url).pathname;
+          switch (options?.method) {
+            case "GET":
+              if (path === manifest) return absent();
+              if ([...moved].some((from) => paths.get(from) === path))
+                return new Response(epubBytes);
+              throw new Error(`Unexpected GET ${path}`);
+            case "PROPFIND": {
+              if (path === root) {
+                return currentCreated
+                  ? davListing([root, true], [currentDir, true], [oldDir, true])
+                  : davListing([root, true], [oldDir, true]);
+              }
+              if (path === currentDir && !currentCreated) return absent();
+              const entries: Array<[string, boolean]> = [[path, true]];
+              for (const [from, to] of paths) {
+                if (path === oldDir && !moved.has(from)) entries.push([from, false]);
+                if (path === currentDir && moved.has(from)) entries.push([to, false]);
+              }
+              return davListing(...entries);
+            }
+            case "MKCOL":
+              expect(path).toBe(currentDir);
+              currentCreated = true;
+              return new Response(null, { status: 201 });
+            case "MOVE":
+              expect(currentCreated).toBe(true);
+              expect(moved.has(path)).toBe(false);
+              expect(new URL(new Headers(options.headers).get("Destination") ?? "").pathname).toBe(
+                paths.get(path),
+              );
+              if (path === failedSource && (firstScan || failAgain)) {
+                return new Response(null, { status: 403 });
+              }
+              moved.add(path);
+              return new Response(null, { status: 201 });
+            case "PUT":
+              return new Response(null, { status: 201 });
+            default:
+              throw new Error(`Unexpected method ${options?.method}`);
+          }
+        });
+        setPlatformService({ fetch } as unknown as IPlatformService);
+
+        await syncFiles(new WebDavBackend(config, "secret"), undefined, { disableUploads: true });
+        const requests = () =>
+          fetch.mock.calls.map(([url, options]) => [options?.method, new URL(url).pathname]);
+        expect(requests()).toContainEqual(["MKCOL", currentDir]);
+        expect(requests()).toContainEqual(["MOVE", failedSource]);
+        expect(moved.has(failedSource)).toBe(false);
+
+        firstScan = false;
+        const laterRequestsStart = fetch.mock.calls.length;
+        const result = await syncFiles(new WebDavBackend(config, "secret"), undefined, {
+          forceDownloadAll,
+        });
+
+        const laterRequests = requests().slice(laterRequestsStart);
+        expect(laterRequests).toContainEqual(["GET", manifest]);
+        expect(laterRequests.filter(([method]) => method === "MOVE")).toEqual([
+          ["MOVE", failedSource],
+        ]);
+        expect(requests().filter(([method]) => method === "DELETE")).toEqual([]);
+        const downloads = laterRequests.filter(
+          ([method, path]) => method === "GET" && path !== manifest,
+        );
+        const uploads = laterRequests.filter(([method]) => method === "PUT");
+        if (failAgain) {
+          expect(downloads).toEqual([]);
+          expect(uploads).toEqual([]);
+          expect(result).toEqual({
+            filesUploaded: 0,
+            filesDownloaded: 0,
+            filesUploadFailed: 1,
+            filesDownloadFailed: 1,
+            failures: [
+              {
+                path: `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.epub`,
+                status: 403,
+                message: expect.stringContaining("MOVE"),
+              },
+            ],
+          });
+        } else {
+          expect(downloads.map(([, path]) => path).sort()).toEqual(
+            forceDownloadAll ? [...paths.values()].sort() : [],
+          );
+          expect(uploads).toEqual([["PUT", manifest]]);
+          expect(result).toMatchObject({
+            filesDownloaded: forceDownloadAll ? paths.size : 0,
+            filesUploaded: 0,
+            failures: [],
+          });
+        }
+      },
+    );
+
+    it.each(["ambiguous", "current unreadable", "fallback ambiguous", "fallback unreadable"])(
+      "reports unverifiable scan results without transferring or deleting book data (%s)",
+      async (scenario) => {
         const id = "550e8400-e29b-41d4-a716-446655440000";
         mockSelect.mockResolvedValue([
           { id, file_path: `books/${id}.epub`, title: "Current Title" },
         ]);
         mockAdapter.fileExists.mockResolvedValue(true);
 
-        const names = [`Old Title-${id}`, `${currentListed ? "Current" : "Older"} Title-${id}`];
-        const currentDir = `${REMOTE_BOOKS_ROOT}/Current Title-${id}`;
+        const currentName = `Current Title-${id}`;
+        const oldName = `Old Title-${id}`;
+        const currentDir = `${REMOTE_BOOKS_ROOT}/${currentName}`;
+        const oldDir = `${REMOTE_BOOKS_ROOT}/${oldName}`;
+        const names = [oldName];
+        if (scenario !== "ambiguous") names.unshift(currentName);
+        if (scenario.endsWith("ambiguous")) names.push(`Older Title-${id}`);
+        const unreadableDir = scenario === "current unreadable" ? currentDir : oldDir;
+        const ambiguous = scenario.endsWith("ambiguous");
         const backend = createMockBackend({
           listDir: vi.fn(async (path: string) => {
             if (path === REMOTE_BOOKS_ROOT) {
@@ -1385,7 +1526,7 @@ describe("sync-files", () => {
                 isDirectory: true,
               }));
             }
-            if (path === currentDir)
+            if (!ambiguous && path === unreadableDir)
               throw new WebDavError("forbidden", "Cannot list collection", { status: 403 });
             return [];
           }),
@@ -1401,9 +1542,16 @@ describe("sync-files", () => {
           failures: [
             {
               path: `${currentDir}/Current Title.epub`,
-              ...(currentListed
-                ? { message: `Cannot verify remote book folder: ${currentDir}`, status: 403 }
-                : { message: expect.stringContaining([...names].sort().join(", ")) }),
+              ...(ambiguous
+                ? {
+                    message: expect.stringContaining(
+                      names
+                        .filter((name) => name !== currentName)
+                        .sort()
+                        .join(", "),
+                    ),
+                  }
+                : { message: `Cannot verify remote book folder: ${unreadableDir}`, status: 403 }),
             },
           ],
         });
