@@ -23,6 +23,7 @@ function installFetchStub(
 function installTransferStub(options: {
   fetch: (url: string, options?: FetchOptions) => Response | Promise<Response>;
   uploadFile?: (url: string, filePath: string, options?: FileTransferOptions) => Promise<void>;
+  downloadFile?: (url: string, filePath: string, options?: FileTransferOptions) => Promise<void>;
 }): void {
   setPlatformService({
     platformType: "web",
@@ -30,7 +31,15 @@ function installTransferStub(options: {
     isDesktop: false,
     fetch: options.fetch,
     uploadFile: options.uploadFile,
+    downloadFile: options.downloadFile,
   } as unknown as IPlatformService);
+}
+
+function collectionResponse(url: string): Response {
+  return new Response(
+    `<d:multistatus xmlns:d="DAV:"><d:response><d:href>${new URL(url).pathname}</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>`,
+    { status: 207 },
+  );
 }
 
 describe("WebDavClient PROPFIND parsing", () => {
@@ -43,23 +52,23 @@ describe("WebDavClient PROPFIND parsing", () => {
       <d:multistatus xmlns:d="DAV:">
         <d:response>
           <d:href>/dav/readany/sync/</d:href>
-          <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
+          <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
         </d:response>
         <d:response>
           <d:href>/dav/readany/sync/device-a.json</d:href>
-          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>12</d:getcontentlength></d:prop></d:propstat>
+          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>12</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
         </d:response>
         <d:response>
           <d:href>/dav/readany/sync/archive/</d:href>
-          <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
+          <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
         </d:response>
         <d:response>
           <d:href>/dav/readany/sync/archive/device-old.json</d:href>
-          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>99</d:getcontentlength></d:prop></d:propstat>
+          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>99</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
         </d:response>
         <d:response>
           <d:href>/dav/other/sync/device-foreign.json</d:href>
-          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>99</d:getcontentlength></d:prop></d:propstat>
+          <d:propstat><d:prop><d:resourcetype/><d:getcontentlength>99</d:getcontentlength></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
         </d:response>
       </d:multistatus>`;
 
@@ -92,7 +101,7 @@ describe("WebDavClient PROPFIND parsing", () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       calls.push({ method: String(options?.method ?? "GET"), url });
-      return new Response("", { status: 207 });
+      return collectionResponse(url);
     });
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
@@ -110,7 +119,7 @@ describe("WebDavClient PROPFIND parsing", () => {
       if (method === "MKCOL") {
         throw new Error("XHR request failed with status 0");
       }
-      return new Response("", { status: calls.length === 1 ? 404 : 207 });
+      return calls.length === 1 ? new Response("", { status: 404 }) : collectionResponse(url);
     });
 
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -146,11 +155,11 @@ describe("WebDavClient PROPFIND parsing", () => {
         <d:multistatus xmlns:d="DAV:">
           <d:response>
             <d:href>/dav/</d:href>
-            <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
+            <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
           </d:response>
           <d:response>
             <d:href>/dav/readany/</d:href>
-            <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop></d:propstat>
+            <d:propstat><d:prop><d:resourcetype><d:collection /></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
           </d:response>
         </d:multistatus>`,
         { status: 207 },
@@ -178,9 +187,7 @@ describe("WebDavClient PROPFIND parsing", () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       calls.push({ method: String(options?.method ?? "GET"), url });
-      return new Response('<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" />', {
-        status: 207,
-      });
+      return collectionResponse(url);
     });
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
@@ -265,7 +272,9 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
       const method = String(options?.method ?? "GET");
       calls.push({ method, url });
       if (method === "PROPFIND") {
-        return new Response("", { status: url.endsWith("/readany/") ? 207 : 404 });
+        return url.endsWith("/readany/")
+          ? collectionResponse(url)
+          : new Response("", { status: 404 });
       }
       if (method === "MKCOL") {
         const isBooksCall = url.endsWith("/readany/data/books/");
@@ -304,6 +313,25 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     expect(calls.filter((call) => call.method === "MKCOL").map((call) => call.url)).toEqual([
       "https://dav.example.com/dav/readany/sync/",
       "https://dav.example.com/dav/readany/",
+    ]);
+  });
+
+  it("does not retry a conflicted MKCOL when all ancestors already exist", async () => {
+    const fetch = vi.fn((url: string, options?: FetchOptions) =>
+      options?.method === "PROPFIND"
+        ? collectionResponse(url)
+        : new Response(null, { status: 409 }),
+    );
+    installFetchStub(fetch);
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+    await expect(client.mkcol("/readany/data/books")).rejects.toMatchObject({ status: 409 });
+    expect(
+      fetch.mock.calls.map(([url, options]) => [new URL(url).pathname, options?.method]),
+    ).toEqual([
+      ["/dav/readany/data/books/", "MKCOL"],
+      ["/dav/readany/", "PROPFIND"],
+      ["/dav/readany/data/", "PROPFIND"],
     ]);
   });
 
@@ -373,8 +401,8 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     });
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
-    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBeUndefined();
-    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBeUndefined();
+    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBe(false);
+    await expect(client.ensureDirectory("/readany/data/books")).resolves.toBe(false);
 
     expect(calls.filter((call) => call.method === "MKCOL")).toHaveLength(6);
   });
@@ -441,13 +469,10 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
   it("retries once when a streamed upload gets a 401 after successful auth", async () => {
     let uploads = 0;
     installTransferStub({
-      fetch: (_url, options) => {
-        const method = String(options?.method ?? "GET");
-        return new Response("", {
-          status: method === "PROPFIND" ? 207 : 201,
-          headers: { DAV: "1" },
-        });
-      },
+      fetch: (url, options) =>
+        options?.method === "PROPFIND"
+          ? collectionResponse(url)
+          : new Response(null, { status: 201 }),
       uploadFile: async () => {
         uploads++;
         if (uploads === 1) {
@@ -472,7 +497,8 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
           mkcolUrls.push(url);
           return new Response("", { status: 201 });
         }
-        if (method === "PROPFIND") return new Response("", { status: uploads > 0 ? 404 : 207 });
+        if (method === "PROPFIND")
+          return uploads > 0 ? new Response(null, { status: 404 }) : collectionResponse(url);
         return new Response("", { status: 404 });
       },
       uploadFile: async (url) => {
@@ -559,7 +585,7 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
           if (options?.method === "MKCOL") return new Response("", { status: 201 });
           return url.endsWith("/chat/")
             ? new Response("", { status: 404 })
-            : new Response("", { status: 207, headers: { DAV: "1" } });
+            : collectionResponse(url);
         });
         const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
         await client.ping();
@@ -575,17 +601,15 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     },
   );
 
-  it("handles a localized 404 by status instead of matching the message text", async () => {
+  it.each([404, 410])("lists a missing collection as empty (HTTP %s)", async (status) => {
+    const fetch = vi.fn(() => new Response(null, { status, statusText: "Indisponible" }));
+    installFetchStub(fetch);
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
-    vi.spyOn(client, "propfind").mockRejectedValueOnce(
-      new WebDavError("not-found", "WebDAV 地址或路径不存在，请检查服务器地址和根路径。", {
-        status: 404,
-      }),
-    );
-    const ensureSpy = vi.spyOn(client, "ensureDirectory").mockResolvedValueOnce();
-
     await expect(client.safeReadDir("/readany/sync")).resolves.toEqual([]);
-    expect(ensureSpy).toHaveBeenCalledWith("/readany/sync/");
+    expect(fetch).toHaveBeenCalledExactlyOnceWith(
+      "https://dav.example.com/dav/readany/sync/",
+      expect.objectContaining({ method: "PROPFIND" }),
+    );
   });
 
   it("does not treat an unrelated localized error containing 404 as a missing collection", async () => {
@@ -616,7 +640,7 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     const calls: { method: string; url: string }[] = [];
     installFetchStub((url, options) => {
       calls.push({ method: String(options?.method ?? "GET"), url });
-      return new Response("", { status: 207 });
+      return collectionResponse(url);
     });
 
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
@@ -635,4 +659,56 @@ describe("sanitizeWebDavRemoteRoot", () => {
   it("trims unsafe path noise without lowercasing user folders", () => {
     expect(sanitizeWebDavRemoteRoot(" /\u0000ReadAny//Sync/ ")).toBe("ReadAny/Sync");
   });
+});
+it("uses the target href and the status of its resourcetype in a mixed 207", async () => {
+  const fetch = vi.fn((url: string, options?: FetchOptions) => {
+    if (options?.method === "PUT") return new Response(null, { status: 401 });
+    const path = new URL(url).pathname;
+    return new Response(
+      `
+        <d:multistatus xmlns:d="DAV:">
+          <d:response><d:href>${path}other/</d:href><d:propstat>
+            <d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+            <d:status>HTTP/1.1 200 OK</d:status>
+          </d:propstat></d:response>
+          <d:response><d:href>${path}</d:href>
+            <d:propstat><d:prop><d:getetag>etag</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+            <d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>
+          </d:response>
+        </d:multistatus>`,
+      { status: 207 },
+    );
+  });
+  installFetchStub(fetch);
+  const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+  await expect(client.ping("/root/")).rejects.toMatchObject({ status: 403 });
+  await expect(client.safeReadDir("/root/")).rejects.toMatchObject({ status: 403 });
+  await expect(client.putJSON("/root/day.json", {})).rejects.toMatchObject({ status: 401 });
+  expect(fetch.mock.calls.filter(([, options]) => options?.method === "PUT")).toHaveLength(1);
+});
+
+it.each([
+  [200, "<!-- gateway branding -->\n<html>Login</html>", "unexpected-response"],
+  [200, "<?xml version='1.0'?><login/>", "unexpected-response"],
+  [302, "", "redirect"],
+  [207, "", "unexpected-response"],
+])("rejects an invalid PUT acknowledgement (HTTP %s, %s)", async (status, body, kind) => {
+  const fetch = vi.fn(
+    () => new Response(body, { status, headers: { "Content-Type": "text/plain" } }),
+  );
+  installFetchStub(fetch);
+  const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+
+  await expect(client.putJSON("/readany/sync/device.json", {})).rejects.toMatchObject({
+    kind,
+    status,
+  });
+  expect(fetch).toHaveBeenCalledOnce();
+});
+
+it("accepts a normal PUT 204", async () => {
+  installFetchStub(() => new Response(null, { status: 204 }));
+  const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+  await expect(client.putJSON("/readany/sync/device.json", {})).resolves.toBeUndefined();
 });

@@ -69,6 +69,7 @@ const syncFileMocks = vi.hoisted(() => ({
     filesDownloaded: 0,
     filesUploadFailed: 0,
     filesDownloadFailed: 0,
+    failures: [] as { path: string; message: string }[],
   })),
 }));
 
@@ -227,8 +228,9 @@ class FakePerBookDb {
       /^INSERT OR REPLACE INTO sync_metadata \(key, value\) VALUES \((?:'[^']+'|\?), (?:'[^']+'|\?)\)$/,
     );
     if (metadataSet) {
-      const values = [...normalized.matchAll(/(?:'([^']+)'|\?)/g)].map((m, i) =>
-        m[1] !== undefined ? m[1] : String(params[i]),
+      let parameterIndex = 0;
+      const values = [...normalized.matchAll(/(?:'([^']+)'|\?)/g)].map((m) =>
+        m[1] !== undefined ? m[1] : String(params[parameterIndex++]),
       );
       this.syncMetadata.set(values[0], values[1]);
       return;
@@ -346,7 +348,7 @@ const T3 = T1 + 120_000;
 describe("runPerBookSync (per-book cloud engine)", () => {
   let db: FakePerBookDb;
 
-  it.each([200, 302])(
+  it.each([200, 302, 207])(
     "keeps the chat push cursor when the DAV write gets a login response (HTTP %s)",
     async (status) => {
       db.syncMetadata.set("perbook:chat-pushed-at", String(T1));
@@ -365,10 +367,10 @@ describe("runPerBookSync (per-book cloud engine)", () => {
         path.startsWith("/readany/sync/chat/") ? client.putJSON(path, data) : storeJSON(path, data),
       );
       networkMocks.fetch.mockResolvedValueOnce(
-        new Response("<html>Login</html>", {
+        new Response(status === 200 ? "<!-- gateway --><html>Login</html>" : null, {
           status,
           headers: {
-            "Content-Type": "text/html",
+            "Content-Type": "text/plain",
             Location: "/login?token=redacted-in-diagnostics",
           },
         }),
@@ -385,12 +387,74 @@ describe("runPerBookSync (per-book cloud engine)", () => {
     },
   );
 
+  it.each([
+    ["chat", 302],
+    ["chat", 200],
+    ["sessions", 302],
+    ["sessions", 200],
+  ])(
+    "keeps cursors when the %s PROPFIND returns HTTP %s and advances after a successful retry",
+    async (folder, status) => {
+      db.syncMetadata.set("last_sync_at", String(T1));
+      db.syncMetadata.set("perbook:chat-pulled-day", "2024-04-01");
+      db.syncMetadata.set("perbook:chat-pushed-at", String(T1));
+      const backend = new FakeBackend({
+        "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+      });
+      const client = new WebDavClient("https://dav.example.com", "alice", "test-secret");
+      const listDir = backend.listDir.bind(backend);
+      vi.spyOn(backend, "listDir").mockImplementation(async (path) => {
+        if (path !== `/readany/sync/${folder}`) return listDir(path);
+        await client.safeReadDir(path);
+        return [];
+      });
+      networkMocks.fetch.mockResolvedValueOnce(
+        new Response("<!-- login --><html>Sign in</html>", {
+          status,
+          headers: { "Content-Type": "text/plain", Location: "/login" },
+        }),
+      );
+
+      const failed = await runPerBookSync(backend, undefined, { receiveOnly: true });
+      expect(failed.success).toBe(false);
+      expect(db.syncMetadata.get("last_sync_at")).toBe(String(T1));
+      expect(db.syncMetadata.get("perbook:chat-pulled-day")).toBe("2024-04-01");
+      expect(db.syncMetadata.get("perbook:chat-pushed-at")).toBe(String(T1));
+
+      networkMocks.fetch.mockResolvedValueOnce(new Response(null, { status: 404 }));
+      const retried = await runPerBookSync(backend, undefined, { receiveOnly: true });
+      expect(retried.success).toBe(true);
+      expect(Number(db.syncMetadata.get("last_sync_at"))).toBeGreaterThan(T1);
+    },
+  );
+
   beforeEach(() => {
     db = new FakePerBookDb();
     networkMocks.fetch.mockReset();
     dbMocks.currentDb = db;
     dbMocks.getDB.mockResolvedValue(db);
     dbMocks.getDeviceId.mockResolvedValue("device-a");
+  });
+
+  it("keeps the global cursor when a book download fails and advances it on retry", async () => {
+    db.syncMetadata.set("last_sync_at", String(T1));
+    const backend = new FakeBackend({
+      "/readany/sync/index.json": { schemaVersion: 2, books: {}, threads: {} },
+    });
+    syncFileMocks.syncFiles.mockResolvedValueOnce({
+      filesUploaded: 0,
+      filesDownloaded: 0,
+      filesUploadFailed: 0,
+      filesDownloadFailed: 1,
+      failures: [{ path: "/book.epub", message: "Unexpected WebDAV response" }],
+    });
+
+    const failed = await runPerBookSync(backend, undefined, { receiveOnly: true });
+    expect(failed.filesDownloadFailed).toBe(1);
+    expect(db.syncMetadata.get("last_sync_at")).toBe(String(T1));
+
+    await runPerBookSync(backend, undefined, { receiveOnly: true });
+    expect(Number(db.syncMetadata.get("last_sync_at"))).toBeGreaterThan(T1);
   });
 
   afterEach(() => {

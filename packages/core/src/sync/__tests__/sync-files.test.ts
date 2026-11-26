@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  FileTransferError,
+  type IPlatformService,
+  setPlatformService,
+} from "../../services/platform";
 import type { ISyncBackend, RemoteFile } from "../sync-backend";
 import {
   REMOTE_BOOKS_ROOT,
@@ -6,7 +11,7 @@ import {
   REMOTE_FILES,
   REMOTE_FILE_MANIFEST,
 } from "../sync-types";
-import { WebDavError } from "../webdav-client";
+import { WebDavClient, WebDavError } from "../webdav-client";
 
 const mockAdapter = {
   getAppDataDir: vi.fn().mockResolvedValue("/appdata"),
@@ -15,10 +20,12 @@ const mockAdapter = {
   fileExists: vi.fn(),
   hashFile: vi.fn().mockResolvedValue("local-hash"),
   readFileBytes: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
+  readFilePrefix: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3])),
   getFileSize: vi.fn().mockResolvedValue(null),
   maxBufferedTransferBytes: undefined as number | undefined,
   writeFileBytes: vi.fn(),
   copyFile: vi.fn(),
+  replaceFile: vi.fn(),
   deleteFile: vi.fn(),
   ensureDir: vi.fn(),
   listFiles: vi.fn().mockResolvedValue([]),
@@ -60,6 +67,7 @@ describe("sync-files", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockSelect.mockResolvedValue([]);
+    mockAdapter.fileExists.mockResolvedValue(false);
     mockAdapter.listFiles.mockResolvedValue([]);
     mockAdapter.getFileSize.mockResolvedValue(3);
     mockAdapter.maxBufferedTransferBytes = undefined;
@@ -67,6 +75,7 @@ describe("sync-files", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    setPlatformService(null as unknown as IPlatformService);
   });
 
   describe("syncFiles", () => {
@@ -420,6 +429,97 @@ describe("sync-files", () => {
       expect(result.filesDownloaded).toBe(1);
     });
 
+    it.each(["buffered login page", "native login page", "redirect to login"])(
+      "keeps the local book and sync status on a forced download with a %s",
+      async (scenario) => {
+        const localPath = "/appdata/books/book-1.epub";
+        const oldBytes = new Uint8Array([1, 2, 3]);
+        const loginBytes = new TextEncoder().encode("<!-- sign in --><html>Login</html>");
+        const files = new Map([[localPath, oldBytes]]);
+        mockAdapter.fileExists.mockImplementation(async (path: string) => files.has(path));
+        mockAdapter.writeFileBytes.mockImplementation(
+          async (path: string, bytes: Uint8Array<ArrayBuffer>) => {
+            files.set(path, bytes);
+          },
+        );
+        const replaceFile = async (source: string, destination: string) => {
+          const bytes = files.get(source);
+          if (!bytes) throw new Error("Missing staged test file");
+          files.set(destination, bytes);
+        };
+        mockAdapter.replaceFile.mockImplementation(replaceFile);
+        mockAdapter.copyFile.mockImplementation(replaceFile);
+        mockAdapter.readFilePrefix.mockImplementation(async (path: string, limit: number) =>
+          files.get(path)?.subarray(0, limit),
+        );
+        mockAdapter.deleteFile.mockImplementation(async (path: string) => files.delete(path));
+        mockSelect.mockResolvedValue([
+          {
+            id: "book-1",
+            file_path: "books/book-1.epub",
+            file_hash: "h1",
+            cover_url: null,
+            title: "Test Book",
+            sync_status: "remote",
+          },
+        ]);
+
+        const isRedirect = scenario === "redirect to login";
+        setPlatformService({
+          fetch: vi.fn(
+            async () =>
+              new Response(loginBytes, {
+                status: isRedirect ? 302 : 200,
+                headers: { "Content-Type": "text/plain", Location: "/login" },
+              }),
+          ),
+        } as unknown as IPlatformService);
+        const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+        const backend = createMockBackend({
+          get: client.get.bind(client),
+          ...(scenario === "native login page" && {
+            getFileToPath: async (_remotePath: string, path: string) => {
+              files.set(path, loginBytes);
+            },
+          }),
+          getJSON: vi.fn().mockResolvedValue({
+            version: 1,
+            generatedAt: 1000,
+            books: {
+              "book-1": {
+                folderName: "Test Book-book-1",
+                filePath: `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.epub`,
+                fileSize: 100,
+              },
+            },
+          }),
+        });
+
+        try {
+          const result = await syncFiles(backend, undefined, {
+            forceDownloadAll: true,
+            disableUploads: true,
+          });
+          expect(result.filesDownloaded).toBe(0);
+          expect(result.filesDownloadFailed).toBe(1);
+          expect(files).toEqual(new Map([[localPath, oldBytes]]));
+          expect(mockSetBookSyncStatus).not.toHaveBeenCalled();
+          expect(mockUpdateBook).not.toHaveBeenCalled();
+          expect(mockAdapter.deleteFile).not.toHaveBeenCalledWith(localPath);
+        } finally {
+          for (const method of [
+            mockAdapter.writeFileBytes,
+            mockAdapter.replaceFile,
+            mockAdapter.copyFile,
+            mockAdapter.deleteFile,
+          ]) {
+            method.mockReset();
+          }
+          mockAdapter.readFilePrefix.mockReset().mockResolvedValue(oldBytes);
+        }
+      },
+    );
+
     it("uses the remote file manifest for downloads without scanning remote directories", async () => {
       mockSelect.mockResolvedValue([
         {
@@ -607,11 +707,11 @@ describe("sync-files", () => {
       expect(result.filesDownloaded).toBe(1);
       expect(backend.getFileToPath).toHaveBeenCalledWith(
         `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.epub`,
-        expect.stringMatching(/^\/tmp\/readany-transfer-.*\.epub$/),
+        expect.stringMatching(/^\/appdata\/books\/\.readany-transfer-.*\.tmp$/),
         expect.any(Function),
       );
-      expect(mockAdapter.copyFile).toHaveBeenCalledWith(
-        expect.stringMatching(/^\/tmp\/readany-transfer-.*\.epub$/),
+      expect(mockAdapter.replaceFile).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/appdata\/books\/\.readany-transfer-.*\.tmp$/),
         "/appdata/books/book-1.epub",
       );
       expect(mockAdapter.writeFileBytes).not.toHaveBeenCalled();
@@ -1095,8 +1195,12 @@ describe("sync-files", () => {
         `${REMOTE_BOOKS_ROOT}/Text Book-book-1/Text Book.jpg`,
       );
       expect(mockAdapter.writeFileBytes).toHaveBeenCalledWith(
-        "/appdata/covers/book-1-custom-123.jpg",
+        expect.stringMatching(/^\/appdata\/covers\/\.readany-transfer-.*\.tmp$/),
         expect.any(Uint8Array),
+      );
+      expect(mockAdapter.replaceFile).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/appdata\/covers\/\.readany-transfer-.*\.tmp$/),
+        "/appdata/covers/book-1-custom-123.jpg",
       );
     });
 
@@ -1187,11 +1291,11 @@ describe("sync-files", () => {
       expect(result).toBe("ok");
       expect(backend.getFileToPath).toHaveBeenCalledWith(
         `${REMOTE_BOOKS_ROOT}/Test Book-book-1/Test Book.epub`,
-        expect.stringMatching(/^\/tmp\/readany-transfer-.*\.epub$/),
+        expect.stringMatching(/^\/appdata\/books\/\.readany-transfer-.*\.tmp$/),
         expect.any(Function),
       );
-      expect(mockAdapter.copyFile).toHaveBeenCalledWith(
-        expect.stringMatching(/^\/tmp\/readany-transfer-.*\.epub$/),
+      expect(mockAdapter.replaceFile).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/appdata\/books\/\.readany-transfer-.*\.tmp$/),
         "/appdata/books/book-1.epub",
       );
       expect(mockAdapter.writeFileBytes).not.toHaveBeenCalled();
@@ -1216,8 +1320,8 @@ describe("sync-files", () => {
       );
 
       expect(result).toBe("ok");
-      expect(mockAdapter.copyFile).toHaveBeenCalledWith(
-        expect.stringMatching(/^\/tmp\/readany-transfer-.*\.epub$/),
+      expect(mockAdapter.replaceFile).toHaveBeenCalledWith(
+        expect.stringMatching(/^\/appdata\/books\/\.readany-transfer-.*\.tmp$/),
         "/appdata/books/book-1.epub",
       );
       expect(mockUpdateBook).toHaveBeenCalledWith("book-1", {
@@ -1254,16 +1358,20 @@ describe("sync-files", () => {
 
     it("returns 'not-found' and marks book as remote when neither path has the file", async () => {
       mockSelect.mockResolvedValue([{ id: "book-1", title: "Test Book" }]);
+      const downloadFile = vi
+        .fn()
+        .mockRejectedValue(new FileTransferError("远端文件不存在", { status: 404 }));
+      setPlatformService({ downloadFile } as unknown as IPlatformService);
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
 
       const backend = createMockBackend({
-        getFileToPath: vi
-          .fn()
-          .mockRejectedValue(new WebDavError("not-found", "远端文件不存在", { status: 404 })),
+        getFileToPath: client.getFileToPath.bind(client),
       });
 
       const result = await downloadBookFile(backend, "book-1", "books/book-1.epub");
 
       expect(result).toBe("not-found");
+      expect(downloadFile).toHaveBeenCalledTimes(2);
       expect(mockSetBookSyncStatus).toHaveBeenCalledWith("book-1", "remote");
     });
 

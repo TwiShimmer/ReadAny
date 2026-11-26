@@ -177,4 +177,22 @@ describe("WebDavBackend directory healing", () => {
       "https://dav.example.com/dav/readany/data/books/",
     ]);
   });
+
+  it("rechecks the directory group after an unconfirmed MKCOL 405", async () => {
+    const createSyncDirectory = vi
+      .fn(() => new Response(null, { status: 405 }))
+      .mockImplementationOnce(() => new Response(null, { status: 405 }))
+      .mockImplementationOnce(() => new Response(null, { status: 201 }));
+    installFetchStub((url, options) => {
+      if (options?.method !== "MKCOL") return new Response(null, { status: 404 });
+      if (url.endsWith("/sync/")) return createSyncDirectory();
+      return new Response(null, { status: 201 });
+    });
+
+    const backend = new WebDavBackend(webDavConfig(), "secret");
+    await backend.ensureDirectories();
+    await backend.ensureDirectories();
+    await backend.ensureDirectories();
+    expect(createSyncDirectory).toHaveBeenCalledTimes(2);
+  });
 });
