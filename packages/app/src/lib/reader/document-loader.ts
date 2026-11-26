@@ -52,6 +52,8 @@ export interface BookDoc {
   splitTOCHref(href: string): Array<string | number>;
   getCover(): Promise<Blob | null>;
   destroy?(): void | Promise<void>;
+  renderSignal?: AbortSignal;
+  reportRenderError?(error: unknown): void;
 }
 
 /** File extension map */

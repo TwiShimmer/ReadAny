@@ -243,16 +243,62 @@ export class View extends HTMLElement {
       this.renderer.goTo(resolved);
     });
   }
+  #renderController;
+  #detachAbort;
+  #closed = false;
+
+  disconnectedCallback() {
+    if (this.#detachAbort) this.close();
+  }
+
   async open(book) {
     if (typeof book === "string" || typeof book.arrayBuffer === "function" || book.isDirectory)
       book = await makeBook(book);
+    if (this.#renderController) this.close();
+    const ownerSignal = book.renderSignal;
+    const controller = new AbortController();
+    const { signal } = controller;
+    this.#renderController = controller;
+    this.#closed = false;
+    const closeView = () => {
+      try {
+        this.close();
+      } finally {
+        this.remove();
+      }
+    };
+    let finishOnClose;
+    const closed = new Promise((resolve) => {
+      finishOnClose = () => resolve();
+    });
+    signal.addEventListener("abort", finishOnClose, { once: true });
+    try {
+      ownerSignal?.throwIfAborted();
+      if (ownerSignal) {
+        ownerSignal.addEventListener("abort", closeView, { once: true });
+        this.#detachAbort = () => ownerSignal.removeEventListener("abort", closeView);
+      }
+      await Promise.race([this.#open(book, signal), closed]);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (this.#renderController === controller && !this.#closed) closeView();
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", finishOnClose);
+    }
+  }
+
+  async #open(book, signal) {
     this.book = book;
     this.language = languageInfo(book.metadata?.language);
 
     if (book.splitTOCHref && book.getTOCFragment) {
       const ids = book.sections.map((s) => s.id);
       this.#sectionProgress = new SectionProgress(book.sections, 1500, 1600);
-      const splitHref = book.splitTOCHref.bind(book);
+      const splitHref = (href) => {
+        signal.throwIfAborted();
+        return book.splitTOCHref(href);
+      };
       const getFragment = book.getTOCFragment.bind(book);
       this.#tocProgress = new TOCProgress();
       await this.#tocProgress.init({
@@ -261,6 +307,7 @@ export class View extends HTMLElement {
         splitHref,
         getFragment,
       });
+      signal.throwIfAborted();
       this.#pageProgress = new TOCProgress();
       await this.#pageProgress.init({
         toc: book.pageList ?? [],
@@ -268,14 +315,17 @@ export class View extends HTMLElement {
         splitHref,
         getFragment,
       });
+      signal.throwIfAborted();
     }
 
     this.isFixedLayout = this.book.rendition?.layout === "pre-paginated";
     if (this.isFixedLayout) {
       await import("./fixed-layout.js");
+      signal.throwIfAborted();
       this.renderer = document.createElement("foliate-fxl");
     } else {
       await import("./paginator.js");
+      signal.throwIfAborted();
       this.renderer = document.createElement("foliate-paginator");
     }
     this.renderer.setAttribute("exportparts", "head,foot,filter");
@@ -314,8 +364,18 @@ export class View extends HTMLElement {
     }
   }
   close() {
-    this.renderer?.destroy();
-    this.renderer?.remove();
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#renderController?.abort();
+    this.#detachAbort?.();
+    this.#detachAbort = undefined;
+    const renderer = this.renderer;
+    this.renderer = null;
+    try {
+      renderer?.destroy();
+    } finally {
+      renderer?.remove();
+    }
     this.#sectionProgress = null;
     this.#tocProgress = null;
     this.#pageProgress = null;
@@ -332,15 +392,19 @@ export class View extends HTMLElement {
     );
   }
   async init({ lastLocation, showTextStart }) {
+    const signal = this.#renderController?.signal;
+    signal?.throwIfAborted();
     const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null;
     if (resolved) {
       await this.renderer.goTo(resolved);
+      signal?.throwIfAborted();
       this.history.pushState(lastLocation);
     } else if (showTextStart) await this.goToTextStart();
     else {
       this.history.pushState(0);
       await this.next();
     }
+    signal?.throwIfAborted();
   }
   #emit(name, detail, cancelable) {
     return this.dispatchEvent(new CustomEvent(name, { detail, cancelable }));

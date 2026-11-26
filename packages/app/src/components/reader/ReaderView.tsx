@@ -34,6 +34,7 @@ import { useSettingsStore } from "@/stores/settings-store";
 import { useTTSStore } from "@/stores/tts-store";
 import { useChapterTranslation } from "@readany/core/hooks";
 import i18n from "@readany/core/i18n";
+import { createDocumentAttempt } from "@readany/core/reader/document-attempt";
 import { getPlatformService } from "@readany/core/services";
 import { getCSSFontFace, useFontStore, useReadingSessionStore } from "@readany/core/stores";
 import { useRubyStore } from "@readany/core/stores/ruby-store";
@@ -1078,14 +1079,29 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     };
   }, [flushLatestProgress]);
 
-  // ReaderView owns the document for this load attempt. FoliateViewer only
-  // borrows it to render and closes its renderer on unmount.
+  // Each attempt owns its PDF. The borrowed view closes synchronously on abort,
+  // before the attempt releases the PDF.js document and loading task.
   useEffect(() => {
     const filePath = book?.filePath;
     if (!filePath || !bookId) return;
-    const controller = new AbortController();
-    const { signal } = controller;
-    let ownedPdf: BookDoc | undefined;
+    const {
+      signal,
+      own,
+      release,
+      fail: reportFailure,
+    } = createDocumentAttempt((error) => {
+      setLoadedBook(null);
+      setFoliateReady(false);
+      setTranslationReady(false);
+      console.error("[ReaderView] Failed to open book:", error);
+      lastLoadErrorRef.current = error;
+      setError(
+        i18n.t("reader.loadFailedMessage", {
+          defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
+        }),
+      );
+      setIsLoading(false);
+    });
 
     const initBook = async () => {
       try {
@@ -1094,12 +1110,10 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         setError(null);
         lastLoadErrorRef.current = null;
         const parsed = await loadAndParseBook(filePath, signal);
-        if (parsed?.format === "PDF") ownedPdf = parsed.bookDoc;
-        if (signal.aborted) {
-          await ownedPdf?.destroy?.();
-          return;
-        }
+        if (parsed?.format === "PDF") own(parsed.bookDoc);
+        if (signal.aborted) return;
         if (!parsed) {
+          release();
           setIsLoading(false);
           toast.info(
             i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
@@ -1108,29 +1122,22 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
           removeReaderTab(tabId);
           return;
         }
-        setLoadedBook({ doc: parsed.bookDoc, bookId, filePath, attempt: loadAttempt, signal });
+        const doc = parsed.bookDoc;
+        doc.renderSignal = signal;
+        doc.reportRenderError = (error) => {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          reportFailure(error);
+        };
+        setLoadedBook({ doc, bookId, filePath, attempt: loadAttempt, signal });
         setBookFormat(parsed.format);
       } catch (err) {
-        if (signal.aborted) return;
-        console.error("[ReaderView] Failed to load book:", err);
-        lastLoadErrorRef.current = err;
-        setError(
-          i18n.t("reader.loadFailedMessage", {
-            defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
-          }),
-        );
-        setIsLoading(false);
+        reportFailure(err);
       }
     };
 
     initBook();
 
-    return () => {
-      controller.abort();
-      const pdf = ownedPdf;
-      // Let the child renderer close before releasing the document backing it.
-      if (pdf) queueMicrotask(() => void pdf.destroy?.());
-    };
+    return release;
   }, [book?.filePath, bookId, tabId, closeAppTab, removeReaderTab, loadAttempt]);
 
   useEffect(() => {
@@ -1483,21 +1490,6 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       }, 100);
     },
     [highlights, bookId, chapterTranslation.reset],
-  );
-
-  const handleError = useCallback(
-    (err: Error) => {
-      if (documentSignal?.aborted) return;
-      console.error("[ReaderView] Renderer error:", err);
-      lastLoadErrorRef.current = err;
-      setError(
-        t("reader.loadFailedMessage", {
-          defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
-        }),
-      );
-      setIsLoading(false);
-    },
-    [documentSignal, t],
   );
 
   // Sync chapter translation visibility with DOM
@@ -3001,7 +2993,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                 onTocReady={handleTocReady}
                 onLoaded={handleLoaded}
                 onSectionLoad={handleSectionLoad}
-                onError={handleError}
+                onError={bookDoc.reportRenderError}
                 onSelection={handleSelection}
                 onShowAnnotation={handleShowAnnotation}
                 onToggleSearch={handleToggleSearch}
