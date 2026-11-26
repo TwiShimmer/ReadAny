@@ -16,7 +16,7 @@ import {
   DAV_BODY_PREFIX_BYTES,
   acceptsDavDownloadPrefix,
   isDavZipDownload,
-  isNonemptyDavZip,
+  isValidDavZip,
 } from "./dav-response";
 import { canonicalBookFilePath } from "./local-book-paths";
 import { getSyncAdapter } from "./sync-adapter";
@@ -217,7 +217,7 @@ async function downloadRemoteFileToPath(
       if (
         !acceptsDavDownloadPrefix(localPath, await read(0, DAV_BODY_PREFIX_BYTES)) ||
         (isDavZipDownload(localPath) &&
-          !(await isNonemptyDavZip((await adapter.getFileSize(tempPath)) ?? 0, read)))
+          !(await isValidDavZip(localPath, (await adapter.getFileSize(tempPath)) ?? 0, read)))
       ) {
         throw invalid("Unexpected WebDAV download response");
       }

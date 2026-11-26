@@ -22,6 +22,8 @@ import type {
   WebSocketOptions,
 } from "@readany/core/services";
 import {
+  MAX_EPUB_PACKAGE_BYTES,
+  MAX_STREAMED_DAV_DOWNLOAD_BYTES,
   acceptsDavDownloadPrefix,
   acceptsDavDownloadType,
   hasUnsafeDavWriteBody,
@@ -30,12 +32,14 @@ import {
   isDavWriteSuccess,
   isDavZipDownload,
   isHtmlContentType,
-  isNonemptyDavZip,
   isUnsafeDavFilePrefix,
-  readAndCancelDavBodyPrefix,
+  isValidDavZip,
+  preserveDavMissingBody,
   readDavBodyPrefix,
   readDavDownloadBody,
+  readDavText,
 } from "@readany/core/sync/dav-response";
+import { configure as configureZip } from "@zip.js/zip.js";
 import * as Clipboard from "expo-clipboard";
 import Constants from "expo-constants";
 import * as DocumentPicker from "expo-document-picker";
@@ -45,13 +49,47 @@ import * as Network from "expo-network";
 import * as SecureStore from "expo-secure-store";
 import * as Sharing from "expo-sharing";
 import { fetch as expoFetch } from "expo/fetch";
+import { Inflate } from "pako";
 import SyncFileTransfer from "../../../modules/sync-file-transfer";
 
 /** Simple KV storage keys tracking (SecureStore doesn't have getAllKeys) */
 const KV_KEYS_INDEX = "__readany_kv_keys__";
 const SQLITE_OPERATION_QUEUES = new Map<string, Promise<void>>();
 
+// Hermes has WHATWG streams but no native deflate or WebAssembly. Keep zip.js
+// in charge of ZIP framing/CRC and supply Expo's existing incremental codec.
+class ExpoDeflateStream extends TransformStream<Uint8Array, Uint8Array> {
+  constructor() {
+    const inflate = new Inflate({ raw: true });
+    let complete = false;
+    let produced = 0;
+    inflate.onEnd = (status) => {
+      if (status !== 0) throw new Error("Invalid ZIP deflate stream");
+      complete = true;
+    };
+    super({
+      transform(chunk, controller) {
+        inflate.onData = (bytes) => {
+          produced += bytes.byteLength;
+          if (produced > MAX_EPUB_PACKAGE_BYTES) throw new Error("Oversized EPUB metadata");
+          controller.enqueue(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        };
+        if (complete || !inflate.push(chunk)) throw new Error("Invalid ZIP deflate stream");
+      },
+      flush() {
+        if (!complete) throw new Error("Truncated ZIP deflate stream");
+      },
+    });
+  }
+}
+
 export class ExpoPlatformService implements IPlatformService {
+  constructor() {
+    if (typeof DecompressionStream === "undefined") {
+      configureZip({ DecompressionStream: ExpoDeflateStream });
+    }
+  }
+
   readonly platformType = "mobile" as const;
   readonly isMobile = true;
   readonly isDesktop = false;
@@ -311,12 +349,13 @@ export class ExpoPlatformService implements IPlatformService {
         const noBody =
           status < 200 || status === 204 || status === 205 || status === 304 || method === "HEAD";
         let body: BodyInit | null = null;
-        let missingPrefix: Uint8Array<ArrayBuffer> | undefined;
+        let snapshotBytes: Uint8Array<ArrayBuffer> | undefined;
         let consumed = false;
-        if (method === "PROPFIND" && isDavMissingStatus(status) && !noBody) {
-          missingPrefix = await readAndCancelDavBodyPrefix(response);
-          body = missingPrefix.buffer;
-        } else if (response.ok && !noBody && !isHtmlContentType(headers.get("Content-Type"))) {
+        const checkMissing =
+          (method === "GET" || method === "PROPFIND") && isDavMissingStatus(status);
+        const invalid = () =>
+          new FileTransferError("Unexpected WebDAV response", { url: effectiveUrl, status });
+        if (response.ok && !noBody && !isHtmlContentType(headers.get("Content-Type"))) {
           if (isDavWriteMethod(method)) {
             if (await hasUnsafeDavWriteBody(response)) {
               throw new FileTransferError("Unexpected WebDAV write response", {
@@ -336,18 +375,23 @@ export class ExpoPlatformService implements IPlatformService {
                 }),
             );
             onDownloadProgress?.(bytes.byteLength, bytes.byteLength);
+            snapshotBytes = bytes;
             body = bytes.buffer;
-          } else body = await response.text();
+          } else {
+            body = await readDavText(response, invalid);
+            snapshotBytes = new TextEncoder().encode(body);
+          }
         }
-        if (!consumed && body === null) await response.body?.cancel().catch(() => {});
         const snapshot = new Response(body, { status, statusText, headers });
-        // RN's Response polyfill exposes arrayBuffer() but no body stream.
-        if (missingPrefix && !snapshot.body) {
-          const prefix = missingPrefix;
+        if (checkMissing) await preserveDavMissingBody(response, snapshot);
+        else if (!consumed && body === null) void response.body?.cancel().catch(() => {});
+        // Only synthesize a stream for bytes we actually read from the wire.
+        if (snapshotBytes && !snapshot.body) {
+          const bytes = snapshotBytes;
           Object.defineProperty(snapshot, "body", {
             value: new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(prefix);
+                controller.enqueue(bytes);
                 controller.close();
               },
             }),
@@ -444,29 +488,30 @@ export class ExpoPlatformService implements IPlatformService {
             throw invalid();
           }
           const file = new File(filePath);
+          const total = Number(response.headers.get("Content-Length")) || 0;
           const reader = response.body.getReader();
           try {
+            if (total > MAX_STREAMED_DAV_DOWNLOAD_BYTES) throw invalid();
             const { prefix, remainder } = await readDavBodyPrefix(reader);
             if (signal.aborted) throw new Error("WebDAV download timed out");
             if (!acceptsDavDownloadPrefix(remotePath, prefix)) throw invalid();
             file.create({ overwrite: true });
             const handle = file.open();
-            const total = Number(response.headers.get("Content-Length")) || 0;
             let loaded = 0;
+            const write = (bytes: Uint8Array) => {
+              if (loaded + bytes.length > MAX_STREAMED_DAV_DOWNLOAD_BYTES) throw invalid();
+              handle.writeBytes(bytes);
+              loaded += bytes.length;
+            };
             try {
-              handle.writeBytes(prefix);
-              loaded += prefix.length;
-              if (remainder) {
-                handle.writeBytes(remainder);
-                loaded += remainder.length;
-              }
+              write(prefix);
+              if (remainder) write(remainder);
               options.onProgress?.(loaded, total);
               while (true) {
                 const { done, value } = await reader.read();
                 if (signal.aborted) throw new Error("WebDAV download timed out");
                 if (done) break;
-                handle.writeBytes(value);
-                loaded += value.length;
+                write(value);
                 options.onProgress?.(loaded, total);
               }
             } finally {
@@ -476,7 +521,7 @@ export class ExpoPlatformService implements IPlatformService {
               const handle = file.open();
               try {
                 if (
-                  !(await isNonemptyDavZip(file.size, async (offset, length) => {
+                  !(await isValidDavZip(remotePath, file.size, async (offset, length) => {
                     if (signal.aborted) throw new Error("WebDAV download timed out");
                     handle.offset = offset;
                     return handle.readBytes(length);

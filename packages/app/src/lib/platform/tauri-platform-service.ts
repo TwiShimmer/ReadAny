@@ -17,6 +17,7 @@ import type {
   UpdateInfo,
   WebSocketOptions,
 } from "@readany/core/services";
+import { isDavEpubDownload, isValidDavZip } from "@readany/core/sync/dav-response";
 
 const TAURI_LAN_RUNTIME_ERROR =
   "Tauri desktop runtime is required to use the LAN sender. Open the desktop app instead of the browser dev server.";
@@ -287,6 +288,31 @@ export class TauriPlatformService implements IPlatformService {
         allowInsecure: options?.allowInsecure ?? false,
         onProgress: channel,
       });
+      const remotePath = new URL(url).pathname;
+      if (isDavEpubDownload(remotePath)) {
+        // Native ZIP support is built without deflate; use the same bounded
+        // container validation as Expo and core before returning the staged file.
+        const { open, SeekMode } = await import("@tauri-apps/plugin-fs");
+        const file = await open(filePath, { read: true });
+        try {
+          const size = await file.seek(0, SeekMode.End);
+          const valid = await isValidDavZip(remotePath, size, async (offset, length) => {
+            await file.seek(offset, SeekMode.Start);
+            const bytes = new Uint8Array(length);
+            let read = 0;
+            while (read < length) {
+              const count = await file.read(bytes.subarray(read));
+              if (!count) break;
+              read += count;
+            }
+            return bytes.subarray(0, read);
+          });
+          if (!valid)
+            throw new FileTransferError("Unexpected WebDAV download response", { status: 200 });
+        } finally {
+          await file.close();
+        }
+      }
     } catch (error) {
       throw toFileTransferError(error, url);
     }

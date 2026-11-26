@@ -21,6 +21,7 @@ import {
   isDavWriteSuccess,
   isHtmlContentType,
   readDavDownloadBody,
+  readDavText,
 } from "./dav-response";
 import type { DavResource } from "./sync-types";
 
@@ -469,7 +470,7 @@ export class WebDavClient {
       (method === "GET" && response.status !== 200) ||
       (writes && !isDavWriteSuccess(method, response.status))
     ) {
-      await response.body?.cancel().catch(() => {});
+      void response.body?.cancel().catch(() => {});
       throw unexpectedResponse(method, url, response.status);
     }
     if (writes) {
@@ -896,23 +897,21 @@ export class WebDavClient {
     if (!resp.ok) {
       throw this.createStatusError("GET", path, resp);
     }
-    return resp.text();
+    return readDavText(resp, () => unexpectedResponse("GET", this.buildUrl(path), resp.status));
   }
 
   /** Download and parse JSON from a path */
   async getJSON<T>(path: string): Promise<T | null> {
-    try {
-      const text = await this.getText(path);
-      return JSON.parse(text) as T;
-    } catch (e: unknown) {
-      // 404/409 mean "not there yet" for callers like the device snapshot and
-      // the remote file manifest. Check the attached status instead of string
-      // matching so paths that happen to contain "404" can't fake a miss.
-      if (e instanceof WebDavError && e.kind !== "redirect" && isMissingParentStatus(e.status)) {
-        return null;
-      }
-      throw e;
+    const resp = await this.request("GET", path, { responseType: "text" });
+    const invalid = () => unexpectedResponse("GET", this.buildUrl(path), resp.status);
+    if (isDavMissingStatus(resp.status)) {
+      if (await isDavMissingResponse(resp)) return null;
+      throw invalid();
     }
+    if (!resp.ok) throw this.createStatusError("GET", path, resp);
+    const data = JSON.parse(await readDavText(resp, invalid)) as T | null;
+    if (data === null) throw invalid();
+    return data;
   }
 
   /** Delete a resource (DELETE) */
@@ -1002,7 +1001,8 @@ export class WebDavClient {
       throw unexpectedResponse("PROPFIND", url, resp.status);
     }
     if (!resp.ok) throw this.createStatusError("PROPFIND", path, resp);
-    const listing = parsePropfindResponse(await resp.text(), resp.url || url, depth);
+    const xml = await readDavText(resp, () => unexpectedResponse("PROPFIND", url, resp.status));
+    const listing = parsePropfindResponse(xml, resp.url || url, depth);
     if (typeof listing === "number") {
       throw createHttpWebDavError(listing, undefined, "PROPFIND", url);
     }

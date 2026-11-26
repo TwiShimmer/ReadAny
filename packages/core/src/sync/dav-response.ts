@@ -1,8 +1,18 @@
-import { Reader, ZipReader } from "@zip.js/zip.js";
+import { type Entry, type FileEntry, Reader, ZipReader } from "@zip.js/zip.js";
+import { parseEpubContainerPaths, parseEpubXmlRoot } from "../epub/inspect";
 import { getPathExtension } from "./local-book-paths";
 
 export const DAV_BODY_PREFIX_BYTES = 1024;
+const DAV_PREFIX_TIMEOUT_MS = 15_000;
+const MAX_DAV_TEXT_BYTES = 32 * 1024 * 1024;
+const MAX_BUFFERED_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+export const MAX_STREAMED_DAV_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_ZIP_DIRECTORY_BYTES = 16 * 1024 * 1024;
+const MAX_ZIP_ENTRIES = 10_000;
+const MAX_EPUB_ENTRY_BYTES = 128 * 1024 * 1024;
+const MAX_EPUB_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+const MAX_EPUB_CONTAINER_BYTES = 64 * 1024;
+export const MAX_EPUB_PACKAGE_BYTES = 4 * 1024 * 1024;
 
 export function isDavWriteMethod(method: string): boolean {
   return method === "PUT" || method === "MKCOL" || method === "MOVE" || method === "DELETE";
@@ -39,34 +49,69 @@ export function isDavMissingStatus(status: number): boolean {
   return status === 404 || status === 410;
 }
 
-export async function readAndCancelDavBodyPrefix(
-  response: Response,
-): Promise<Uint8Array<ArrayBuffer>> {
-  if (!response.body) return new Uint8Array();
-  const reader = response.body.getReader();
+async function withBodyDeadline<T>(read: () => Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return Uint8Array.from((await readDavBodyPrefix(reader)).prefix);
+    return await Promise.race([
+      read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("WebDAV response body timed out")), timeoutMs);
+      }),
+    ]);
   } finally {
-    await reader.cancel().catch(() => {});
+    clearTimeout(timer);
   }
 }
 
-export async function isDavMissingResponse(response: Response): Promise<boolean> {
+type DavMissingBody = "confirmed-empty" | "html/xml" | "unknown";
+
+// Expo releases the native fetch/timeout before returning the Response snapshot.
+// Keep the original classification rather than inventing a body or changing headers.
+const missingBodySnapshots = new WeakMap<Response, DavMissingBody>();
+
+export async function preserveDavMissingBody(
+  original: Response,
+  snapshot: Response,
+): Promise<void> {
+  missingBodySnapshots.set(snapshot, await classifyDavMissingBody(original));
+}
+
+async function classifyDavMissingBody(response: Response): Promise<DavMissingBody> {
   const contentType = response.headers.get("Content-Type");
-  if (
-    /\/(?:xml|[^/]+\+xml)$/i.test(mediaType(contentType)) ||
-    isHtmlContentType(contentType) ||
-    isJsonContentType(contentType)
-  ) {
-    await response.body?.cancel().catch(() => {});
-    return false;
+  if (isHtmlContentType(contentType) || /\/(?:xml|[^/]+\+xml)$/i.test(mediaType(contentType))) {
+    void response.body?.cancel().catch(() => {});
+    return "html/xml";
   }
-  return !isUnsafeDavFilePrefix(await readAndCancelDavBodyPrefix(response));
+  const length = response.headers.get("Content-Length")?.trim();
+  const declaredEmpty =
+    response.status === 204 || (length === "0" && !response.headers.has("Transfer-Encoding"));
+  const prefix = await readAndCancelDavBodyPrefix(response);
+  if (!prefix) return declaredEmpty ? "confirmed-empty" : "unknown";
+  if (/^(?:<|!doctype\b)/i.test(decodeDavBodyPrefix(prefix).trimStart())) return "html/xml";
+  return prefix.length === 0 && (length == null || declaredEmpty) ? "confirmed-empty" : "unknown";
+}
+
+export async function isDavMissingResponse(response: Response): Promise<boolean> {
+  return (
+    isDavMissingStatus(response.status) &&
+    (missingBodySnapshots.get(response) ?? (await classifyDavMissingBody(response))) ===
+      "confirmed-empty"
+  );
+}
+
+async function readAndCancelDavBodyPrefix(response: Response): Promise<Uint8Array | undefined> {
+  const reader = response.body?.getReader();
+  if (!reader) return undefined;
+  try {
+    return (await withBodyDeadline(() => readDavBodyPrefix(reader), DAV_PREFIX_TIMEOUT_MS)).prefix;
+  } finally {
+    void reader.cancel().catch(() => {});
+  }
 }
 
 function isUnexpectedMarkup(prefix: string, filePath?: string): boolean {
   const start = prefix.trimStart();
-  if (!/^<\s*[!?/\p{L}]/u.test(start)) return false;
+  if (!/^(?:<\s*(?:[!?/\p{L}]|$)|!doctype\b)/iu.test(start)) return false;
 
   // FB2 books are XML. Require the actual FictionBook root after the prologue.
   if (filePath && /\.fb2$/i.test(filePath)) {
@@ -110,7 +155,8 @@ export async function readDavBodyPrefix(reader: ReadableStreamDefaultReader<Uint
 
 /** Validates the prefix and releases the rest of a write response. */
 export async function hasUnsafeDavWriteBody(response: Response): Promise<boolean> {
-  return isUnsafeDavFilePrefix(await readAndCancelDavBodyPrefix(response));
+  const prefix = await readAndCancelDavBodyPrefix(response);
+  return prefix !== undefined && isUnsafeDavFilePrefix(prefix);
 }
 
 export function isUnsafeDavFilePrefix(bytes: Uint8Array): boolean {
@@ -153,12 +199,80 @@ export function acceptsDavDownloadPrefix(filePath: string, bytes: Uint8Array): b
   );
 }
 
-/** Read ZIP directory/entry headers without buffering or inflating book payloads. */
-export async function isNonemptyDavZip(
+export function isDavEpubDownload(path: string): boolean {
+  return getPathExtension(path) === "epub";
+}
+
+function safeEpubPath(path: string): boolean {
+  if (path.includes("\\") || path.includes(":")) return false;
+  for (const char of path) {
+    const code = char.charCodeAt(0);
+    if (code < 32 || code === 127) return false;
+  }
+  return path.split("/").every((part) => part && part !== "." && part !== "..");
+}
+
+async function readEpubMetadata(entry: FileEntry, limit: number): Promise<string> {
+  if (
+    entry.uncompressedSize === 0 ||
+    entry.uncompressedSize > limit ||
+    entry.compressedSize > limit
+  ) {
+    throw new Error("Invalid or oversized EPUB metadata");
+  }
+  const bytes = new Uint8Array(entry.uncompressedSize);
+  let length = 0;
+  await entry.getData(
+    new WritableStream<Uint8Array>({
+      write(chunk) {
+        if (length + chunk.length > bytes.length)
+          throw new Error("Oversized EPUB metadata payload");
+        bytes.set(chunk, length);
+        length += chunk.length;
+      },
+    }),
+    { checkSignature: true, useWebWorkers: false },
+  );
+  if (length !== bytes.length) throw new Error("Truncated EPUB metadata");
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+async function hasEpubContainer(entries: Map<string, FileEntry>): Promise<boolean> {
+  const mime = entries.get("mimetype");
+  const container = entries.get("META-INF/container.xml");
+  if (
+    !mime ||
+    mime.compressionMethod !== 0 ||
+    !container ||
+    (await readEpubMetadata(mime, 20)) !== "application/epub+zip"
+  )
+    return false;
+  const paths = parseEpubContainerPaths(
+    await readEpubMetadata(container, MAX_EPUB_CONTAINER_BYTES),
+  );
+  if (
+    !paths.length ||
+    paths.some((path) => !safeEpubPath(path) || !safeEpubPath(decodeURIComponent(path)))
+  )
+    return false;
+  // Inspect uses the first rootfile as the primary reading rendition.
+  const opf = entries.get(paths[0]);
+  return (
+    !!opf &&
+    parseEpubXmlRoot(await readEpubMetadata(opf, MAX_EPUB_PACKAGE_BYTES)).localName === "package"
+  );
+}
+
+/** Scan ZIP headers and, for EPUB, read and CRC-check only the bounded OCF metadata. */
+export async function isValidDavZip(
+  path: string,
   size: number,
   read: (offset: number, length: number) => Promise<Uint8Array>,
 ): Promise<boolean> {
   if (!Number.isSafeInteger(size) || size < 22) return false;
+  const epub = isDavEpubDownload(path);
+  let directoryStart = size;
+  let enumerating = true;
   class FileReader extends Reader<undefined> {
     size = size;
 
@@ -173,7 +287,12 @@ export async function isNonemptyDavZip(
       )
         throw new Error("Invalid or oversized ZIP directory");
       // zip.js also accesses the backing buffer directly.
-      const bytes = await read(offset, Math.min(length, size - offset));
+      const count = Math.min(length, size - offset);
+      const bytes = await read(offset, count);
+      if (bytes.length !== count) throw new Error("Truncated ZIP read");
+      // zip.js loads the central directory in one range starting at its first header.
+      if (enumerating && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 1 && bytes[3] === 2)
+        directoryStart = Math.min(directoryStart, offset);
       return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
         ? bytes
         : Uint8Array.from(bytes);
@@ -181,9 +300,17 @@ export async function isNonemptyDavZip(
   }
   const zip = new ZipReader(new FileReader(undefined));
   try {
-    const entries = (await zip.getEntries()).sort((a, b) => a.offset - b.offset);
-    // Each central directory header needs at least 46 bytes, plus the 22-byte end record.
-    const latestPayloadEnd = size - 22 - entries.length * 46;
+    const entries: Entry[] = [];
+    for await (const entry of zip.getEntriesGenerator()) {
+      entries.push(entry);
+      if (entries.length > MAX_ZIP_ENTRIES) return false;
+    }
+    enumerating = false;
+    if (directoryStart === size) return false;
+    entries.sort((a, b) => a.offset - b.offset);
+    const files = new Map<string, FileEntry>();
+    const names = new Set<string>();
+    let expandedSize = 0;
     let hasFile = false;
     for (const [index, entry] of entries.entries()) {
       if (
@@ -196,12 +323,52 @@ export async function isNonemptyDavZip(
       const header = await read(entry.offset, 30);
       if (header.length !== 30 || !hasZipSignature(header)) return false;
       const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
-      const dataOffset = entry.offset + 30 + view.getUint16(26, true) + view.getUint16(28, true);
-      if (dataOffset + entry.compressedSize > (entries[index + 1]?.offset ?? latestPayloadEnd))
+      const nameLength = view.getUint16(26, true);
+      const dataOffset = entry.offset + 30 + nameLength + view.getUint16(28, true);
+      if (dataOffset + entry.compressedSize > (entries[index + 1]?.offset ?? directoryStart))
         return false;
       hasFile ||= !entry.directory && entry.uncompressedSize > 0;
+      if (!epub) continue;
+
+      const path = entry.directory ? entry.filename.replace(/\/$/, "") : entry.filename;
+      const flags = view.getUint16(6, true);
+      expandedSize += entry.uncompressedSize;
+      if (
+        names.has(path) ||
+        !safeEpubPath(path) ||
+        entry.encrypted ||
+        (flags & 0x2041) !== 0 ||
+        ((entry.unixMode ?? 0) & 0xf000) === 0xa000 ||
+        ![0, 8].includes(entry.compressionMethod) ||
+        view.getUint16(8, true) !== entry.compressionMethod ||
+        !Number.isSafeInteger(entry.uncompressedSize) ||
+        entry.uncompressedSize < 0 ||
+        (entry.compressionMethod === 0 && entry.compressedSize !== entry.uncompressedSize) ||
+        entry.uncompressedSize > MAX_EPUB_ENTRY_BYTES ||
+        expandedSize > MAX_EPUB_TOTAL_BYTES ||
+        entry.uncompressedSize > Math.max(1024 * 1024, entry.compressedSize * 1000) ||
+        entry.rawFilename.length !== nameLength
+      )
+        return false;
+      // With no data descriptor the local header must agree with the directory.
+      // ZIP64 sizes use the sentinel and are already resolved by zip.js.
+      if (
+        !(flags & 8) &&
+        (view.getUint32(14, true) !== entry.signature ||
+          ![entry.compressedSize, 0xffffffff].includes(view.getUint32(18, true)) ||
+          ![entry.uncompressedSize, 0xffffffff].includes(view.getUint32(22, true)))
+      )
+        return false;
+      const localName = await read(entry.offset + 30, nameLength);
+      if (
+        localName.length !== nameLength ||
+        localName.some((byte, i) => byte !== entry.rawFilename[i])
+      )
+        return false;
+      names.add(path);
+      if (!entry.directory) files.set(path, entry);
     }
-    return hasFile;
+    return hasFile && (!epub || (await hasEpubContainer(files)));
   } catch {
     return false;
   } finally {
@@ -220,7 +387,7 @@ export async function readDavDownloadBody(
   const checkZip = async (bytes: Uint8Array<ArrayBuffer>) => {
     if (
       isDavZipDownload(filePath) &&
-      !(await isNonemptyDavZip(bytes.length, async (offset, length) =>
+      !(await isValidDavZip(filePath, bytes.length, async (offset, length) =>
         bytes.subarray(offset, offset + length),
       ))
     )
@@ -231,33 +398,65 @@ export async function readDavDownloadBody(
     await response.body?.cancel().catch(() => {});
     throw invalidResponse();
   }
-  // React Native's Response snapshots can expose arrayBuffer() but no body stream.
-  if (!response.body) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    checkPrefix(bytes);
-    return checkZip(bytes);
-  }
+  return checkZip(
+    await readBoundedDavBody(
+      response,
+      MAX_BUFFERED_DOWNLOAD_BYTES,
+      120_000,
+      invalidResponse,
+      checkPrefix,
+    ),
+  );
+}
 
-  const reader = response.body.getReader();
+export async function readDavText(
+  response: Response,
+  invalidResponse: () => Error,
+): Promise<string> {
+  return new TextDecoder().decode(
+    await readBoundedDavBody(response, MAX_DAV_TEXT_BYTES, 30_000, invalidResponse),
+  );
+}
+
+async function readBoundedDavBody(
+  response: Response,
+  maxBytes: number,
+  timeoutMs: number,
+  invalidResponse: () => Error,
+  checkPrefix?: (bytes: Uint8Array) => void,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const reader = response.body?.getReader();
+  if (!reader) throw invalidResponse();
   try {
-    const { prefix, remainder } = await readDavBodyPrefix(reader);
-    checkPrefix(prefix);
-    const chunks = remainder ? [prefix, remainder] : [prefix];
-    let length = prefix.length + (remainder?.length ?? 0);
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      length += value.length;
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return await checkZip(bytes);
+    return await withBodyDeadline(async () => {
+      if (Number(response.headers.get("Content-Length")) > maxBytes) throw invalidResponse();
+      let bytes = new Uint8Array(0);
+      let length = 0;
+      const append = (chunk: Uint8Array) => {
+        const end = length + chunk.length;
+        if (end > maxBytes) throw invalidResponse();
+        if (end > bytes.length) {
+          const grown = new Uint8Array(Math.min(maxBytes, Math.max(end, bytes.length * 2, 65536)));
+          grown.set(bytes);
+          bytes = grown;
+        }
+        bytes.set(chunk, length);
+        length = end;
+      };
+      if (checkPrefix) {
+        const { prefix, remainder } = await readDavBodyPrefix(reader);
+        checkPrefix(prefix);
+        append(prefix);
+        if (remainder) append(remainder);
+      }
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        append(value);
+      }
+      return bytes.length === length ? bytes : bytes.slice(0, length);
+    }, timeoutMs);
   } finally {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
   }
 }

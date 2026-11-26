@@ -6,7 +6,7 @@
 //! thread, which froze the whole app during library sync.
 
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 
 use tauri::ipc::Channel;
 use tauri_plugin_http::reqwest;
@@ -21,6 +21,9 @@ const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
 const UPLOAD_MAX_ATTEMPTS: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
 const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_EPUB_ZIP_DIRECTORY: u32 = 16 * 1024 * 1024;
+const MAX_EPUB_ZIP_ENTRIES: u16 = 10_000;
 const BODY_PREFIX_BYTES: usize = 1024;
 
 /// Serialized to the webview as `{ status, message }` so the JS layer can
@@ -306,6 +309,9 @@ fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
     if prefix.len() >= BODY_PREFIX_BYTES && start.is_empty() {
         return true;
     }
+    if start == "<" || start.eq_ignore_ascii_case("!doctype") {
+        return true;
+    }
     if !start
         .strip_prefix('<')
         .and_then(|s| s.trim_start().chars().next())
@@ -372,15 +378,56 @@ fn accepts_download_prefix(extension: &str, prefix: &[u8]) -> bool {
     )
 }
 
-fn is_nonempty_zip(path: &str) -> bool {
-    let Ok(file) = std::fs::File::open(path) else {
+fn has_bounded_epub_directory(file: &mut std::fs::File) -> std::io::Result<bool> {
+    const END_RECORD: usize = 22;
+    let size = file.seek(SeekFrom::End(0))?;
+    let tail_size = size.min((END_RECORD + u16::MAX as usize) as u64) as usize;
+    let mut tail = vec![0; tail_size];
+    file.seek(SeekFrom::End(-(tail_size as i64)))?;
+    file.read_exact(&mut tail)?;
+    file.rewind()?;
+    // Check allocation-driving fields before handing the file to zip::ZipArchive.
+    // Our size and entry limits fit ZIP32; ZIP64 sentinels here are not needed.
+    Ok(tail
+        .windows(END_RECORD)
+        .enumerate()
+        .rev()
+        .find_map(|(i, end)| {
+            let u16_at = |j| u16::from_le_bytes([end[j], end[j + 1]]);
+            let u32_at = |j| u32::from_le_bytes([end[j], end[j + 1], end[j + 2], end[j + 3]]);
+            if &end[..4] != b"PK\x05\x06" || i + END_RECORD + u16_at(20) as usize != tail_size {
+                return None;
+            }
+            let entries = u16_at(10);
+            let directory_size = u32_at(12);
+            Some(
+                u16_at(4) == 0
+                    && u16_at(6) == 0
+                    && u16_at(8) == entries
+                    && (1..=MAX_EPUB_ZIP_ENTRIES).contains(&entries)
+                    && directory_size <= MAX_EPUB_ZIP_DIRECTORY
+                    && u64::from(u32_at(16)) + u64::from(directory_size)
+                        == size - tail_size as u64 + i as u64,
+            )
+        })
+        .unwrap_or(false))
+}
+
+fn is_nonempty_zip(path: &str, epub: bool) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
+    if epub && !has_bounded_epub_directory(&mut file).unwrap_or(false) {
+        return false;
+    }
     let Ok(mut zip) = zip::ZipArchive::new(BufReader::new(file)) else {
         return false;
     };
     let mut has_file = false;
     let central_directory = zip.central_directory_start();
+    if epub && zip.len() > usize::from(MAX_EPUB_ZIP_ENTRIES) {
+        return false;
+    }
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index_raw(i) else {
             return false;
@@ -388,9 +435,33 @@ fn is_nonempty_zip(path: &str) -> bool {
         if entry.data_start().saturating_add(entry.compressed_size()) > central_directory {
             return false;
         }
+        if epub && (entry.encrypted() || entry.is_symlink() || entry.enclosed_name().is_none()) {
+            return false;
+        }
         has_file |= entry.is_file() && entry.size() > 0;
     }
-    has_file
+    if !epub {
+        return has_file;
+    }
+    // The Tauri platform service runs the shared OCF/OPF validator on this
+    // staging file. Do not maintain a separate XML/deflate implementation here.
+    let Some(container_index) = zip.index_for_name("META-INF/container.xml") else {
+        return false;
+    };
+    if !zip.by_index_raw(container_index).is_ok_and(|entry| {
+        entry.is_file() && (1..=65536).contains(&entry.size()) && entry.compressed_size() <= 65536
+    }) {
+        return false;
+    }
+    let Ok(mime) = zip.by_name("mimetype") else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(21);
+    mime.is_file()
+        && mime.size() == 20
+        && mime.compression() == zip::CompressionMethod::Stored
+        && mime.take(21).read_to_end(&mut bytes).is_ok()
+        && bytes == b"application/epub+zip"
 }
 
 async fn validate_upload_response(mut response: reqwest::Response) -> Result<(), TransferError> {
@@ -578,6 +649,9 @@ pub async fn webdav_download_file(
     }
 
     let total = response.content_length().unwrap_or(0);
+    if total > MAX_DOWNLOAD_BYTES {
+        return Err(unexpected_response(&response));
+    }
     let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
     let mut remainder = None;
     while prefix.len() < BODY_PREFIX_BYTES {
@@ -622,6 +696,9 @@ pub async fn webdav_download_file(
         .await
         .map_err(|e| TransferError::new(format!("download read failed: {}", e.without_url())))?
     {
+        if loaded + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(unexpected_response(&response));
+        }
         file.write_all(&chunk)
             .await
             .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
@@ -632,8 +709,9 @@ pub async fn webdav_download_file(
         .await
         .map_err(|e| TransferError::new(format!("download flush failed: {e}")))?;
     drop(file);
+    let epub = extension == "epub";
     if is_zip_download(&extension)
-        && !tokio::task::spawn_blocking(move || is_nonempty_zip(&file_path))
+        && !tokio::task::spawn_blocking(move || is_nonempty_zip(&file_path, epub))
             .await
             .unwrap_or(false)
     {

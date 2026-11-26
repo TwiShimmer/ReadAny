@@ -132,13 +132,35 @@ function elementsByLocalName(root: Document | Element, localName?: string): Elem
 }
 
 function parsePackagePath(containerXml: string): string {
-  const doc = parseXml(containerXml);
-  const rootfile = elementsByLocalName(doc, "rootfile")[0];
-  const packagePath = rootfile?.getAttribute("full-path")?.trim();
+  const [packagePath] = parseEpubContainerPaths(containerXml);
   if (!packagePath) {
     throw new Error("EPUB container.xml does not declare a package document.");
   }
   return packagePath;
+}
+
+/** Parse OCF metadata without resolving external resources. */
+export function parseEpubContainerPaths(xml: string): string[] {
+  const root = parseEpubXmlRoot(xml);
+  if (root.localName !== "container") throw new Error("Invalid EPUB container.xml");
+  return childElements(root)
+    .filter((element) => element.localName === "rootfiles")
+    .flatMap(childElements)
+    .filter((element) => element.localName === "rootfile")
+    .map((element) => element.getAttribute("full-path") ?? "");
+}
+
+export function parseEpubXmlRoot(xml: string): Element {
+  if (/<!(?:DOCTYPE|ENTITY)\b/i.test(xml)) throw new Error("Unexpected EPUB XML declaration");
+  const rejectInvalidXml = () => {
+    throw new Error("Invalid EPUB XML");
+  };
+  const doc = new DOMParser({ errorHandler: rejectInvalidXml }).parseFromString(
+    xml,
+    "application/xml",
+  );
+  if (!doc.documentElement) throw new Error("Missing EPUB XML root");
+  return doc.documentElement as unknown as Element;
 }
 
 async function inspectPackageDocument(options: {
