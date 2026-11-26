@@ -4,6 +4,7 @@
  * Uses PDF.js TextLayer for text selection support.
  */
 import * as pdfjsLib from "pdfjs-dist";
+import { ownPDFURL } from "./pdf-url.js";
 
 /**
  * Explicit host contract for pdf.js runtime configuration.
@@ -730,7 +731,7 @@ async function startNativeWorker(workerSrc, signal) {
   }
 }
 
-// PDF.js 4.10.38 does not run the local half of WorkerTransport.destroy()
+// PDF.js does not run the local half of WorkerTransport.destroy()
 // if Terminate never replies (or rejects). No public force-close API exists.
 function detachStalledTransport(task, worker, reason) {
   const transport = task._transport;
@@ -752,7 +753,6 @@ function detachStalledTransport(task, worker, reason) {
   if (!transport) return;
   transport.messageHandler?.destroy();
   transport.messageHandler = null;
-  transport._networkStream?.cancelAllRequests(reason);
   transport.commonObjs.clear();
   transport.fontLoader.clear();
   transport.filterFactory.destroy();
@@ -775,11 +775,16 @@ export async function createPDFLoadingTask(source, signal) {
   }
 
   let worker;
-  const destroyWorker = () => {
+  let ownedURL;
+  const releaseOwnedResources = () => {
     try {
-      worker?.destroy();
+      ownedURL?.close();
     } finally {
-      nativeWorker?.terminate();
+      try {
+        worker?.destroy();
+      } finally {
+        nativeWorker?.terminate();
+      }
     }
   };
   try {
@@ -787,6 +792,10 @@ export async function createPDFLoadingTask(source, signal) {
     let options = source;
     if (typeof source === "string" || source instanceof URL) options = { url: source };
     else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) options = { data: source };
+    if (options?.url && !options.data && !options.range) {
+      ownedURL = ownPDFURL(options.url);
+      options = { ...options, url: ownedURL.url };
+    }
     worker = new pdfjsLib.PDFWorker({ port: nativeWorker, verbosity: options?.verbosity });
     const task = pdfjsLib.getDocument({ ...options, worker });
     let teardown;
@@ -811,9 +820,9 @@ export async function createPDFLoadingTask(source, signal) {
         } finally {
           clearTimeout(timer);
           try {
-            destroyWorker();
+            releaseOwnedResources();
           } catch (error) {
-            console.warn("Failed to release PDF worker:", error);
+            console.warn("Failed to release PDF URL or worker:", error);
           }
         }
       }));
@@ -822,9 +831,9 @@ export async function createPDFLoadingTask(source, signal) {
     // getDocument can throw before attaching its own handler to worker.promise.
     worker?.promise.catch(() => {});
     try {
-      destroyWorker();
+      releaseOwnedResources();
     } catch (cleanupError) {
-      console.warn("Failed to release PDF worker:", cleanupError);
+      console.warn("Failed to release PDF URL or worker:", cleanupError);
     }
     throw error;
   }
