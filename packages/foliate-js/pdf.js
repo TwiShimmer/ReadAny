@@ -667,15 +667,14 @@ const writeCachedPage = (cache, key, value, limit) => {
 const loadPDFFromFile = async (file, signal) => {
   signal?.throwIfAborted();
   const arrayBuffer = await file.arrayBuffer();
-  signal?.throwIfAborted();
-  return pdfjsLib.getDocument({
-    ...getPDFJSDocumentOptions(),
-    data: new Uint8Array(arrayBuffer),
-  });
+  return createPDFLoadingTask(
+    { ...getPDFJSDocumentOptions(), data: new Uint8Array(arrayBuffer) },
+    signal,
+  );
 };
 
 const loadPDFFromURL = (url) =>
-  pdfjsLib.getDocument({
+  createPDFLoadingTask({
     ...getPDFJSDocumentOptions(),
     url,
     rangeChunkSize: 65536,
@@ -683,17 +682,93 @@ const loadPDFFromURL = (url) =>
     disableStream: false,
   });
 
-const destroyLoadingTask = async (task) => {
+async function startNativeWorker(workerSrc, signal) {
+  const worker = new Worker(workerSrc, { type: "module" });
+  const listeners = new AbortController();
+  const options = { signal: listeners.signal };
   try {
-    await task.destroy();
+    await new Promise((resolve, reject) => {
+      // PDF.js sends ready after installing its message handler on the worker port.
+      worker.addEventListener(
+        "message",
+        ({ data }) => {
+          if (data?.sourceName === "worker" && data.targetName === "main" && data.action === "ready")
+            resolve();
+        },
+        options,
+      );
+      worker.addEventListener(
+        "error",
+        (event) => {
+          event.preventDefault();
+          reject(new Error(event.message || "PDF worker failed to start"));
+        },
+        options,
+      );
+      const abort = () => reject(signal.reason);
+      signal?.addEventListener("abort", abort, options);
+      if (signal?.aborted) abort();
+    });
+    signal?.throwIfAborted();
+    return worker;
   } catch (error) {
-    console.warn("Failed to release PDF loading task:", error);
+    worker.terminate();
+    throw error;
+  } finally {
+    listeners.abort();
   }
-};
+}
 
-async function buildBookFromLoadingTask(task, fileName, signal) {
-  let destruction;
-  const destroy = () => (destruction ??= destroyLoadingTask(task));
+export async function createPDFLoadingTask(source, signal) {
+  signal?.throwIfAborted();
+  let nativeWorker;
+  if (pdfWorkerMode === "worker" && !globalThis.pdfjsWorker?.WorkerMessageHandler) {
+    const { workerSrc } = pdfjsLib.GlobalWorkerOptions;
+    try {
+      nativeWorker = await startNativeWorker(workerSrc, signal);
+    } catch {
+      signal?.throwIfAborted();
+      const { WorkerMessageHandler } = await import(/* @vite-ignore */ workerSrc);
+      globalThis.pdfjsWorker ??= { WorkerMessageHandler };
+    }
+  }
+
+  let worker;
+  const destroyWorker = () => {
+    try {
+      worker?.destroy();
+    } finally {
+      nativeWorker?.terminate();
+    }
+  };
+  try {
+    signal?.throwIfAborted();
+    let options = source;
+    if (typeof source === "string" || source instanceof URL) options = { url: source };
+    else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) options = { data: source };
+    worker = new pdfjsLib.PDFWorker({ port: nativeWorker, verbosity: options?.verbosity });
+    const task = pdfjsLib.getDocument({ ...options, worker });
+    let teardown;
+    const destroy = () =>
+      (teardown ??= Promise.resolve().then(async () => {
+        try {
+          await task.destroy();
+        } catch (error) {
+          console.warn("Failed to release PDF loading task:", error);
+        } finally {
+          destroyWorker();
+        }
+      }));
+    return { task, destroy };
+  } catch (error) {
+    // getDocument can throw before attaching its own handler to worker.promise.
+    worker?.promise.catch(() => {});
+    destroyWorker();
+    throw error;
+  }
+}
+
+async function buildBookFromLoadingTask({ task, destroy }, fileName, signal) {
   // PDF.js may abandon its loading promise after destroy(), so abort must
   // also settle our own wait, even when the worker handshake is still pending.
   let abort;
@@ -747,11 +822,11 @@ export const makePDF = async (file, { signal } = {}) =>
  * pdf.js will use HTTP Range requests to lazily load pages on demand,
  * avoiding loading the entire file into memory upfront.
  */
-export const makePDFFromURL = (url, fileName) =>
-  buildBookFromLoadingTask(loadPDFFromURL(url), fileName);
+export const makePDFFromURL = async (url, fileName) =>
+  buildBookFromLoadingTask(await loadPDFFromURL(url), fileName);
 
 export const extractPDFChapters = async (file, options = {}) => {
-  const task = await loadPDFFromFile(file);
+  const { task, destroy } = await loadPDFFromFile(file);
   const chapters = [];
 
   try {
@@ -777,7 +852,7 @@ export const extractPDFChapters = async (file, options = {}) => {
       });
     }
   } finally {
-    await destroyLoadingTask(task);
+    await destroy();
   }
 
   return chapters;

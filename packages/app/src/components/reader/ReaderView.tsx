@@ -1110,10 +1110,10 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         setError(null);
         lastLoadErrorRef.current = null;
         const parsed = await loadAndParseBook(filePath, signal);
-        if (parsed?.format === "PDF") own(parsed.bookDoc);
+        if (parsed?.format === "PDF") await own(parsed.bookDoc);
         if (signal.aborted) return;
         if (!parsed) {
-          release();
+          void release();
           setIsLoading(false);
           toast.info(
             i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
@@ -1126,18 +1126,20 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         doc.renderSignal = signal;
         doc.reportRenderError = (error) => {
           if (error instanceof DOMException && error.name === "AbortError") return;
-          reportFailure(error);
+          void reportFailure(error);
         };
         setLoadedBook({ doc, bookId, filePath, attempt: loadAttempt, signal });
         setBookFormat(parsed.format);
       } catch (err) {
-        reportFailure(err);
+        await reportFailure(err);
       }
     };
 
     initBook();
 
-    return release;
+    return () => {
+      void release();
+    };
   }, [book?.filePath, bookId, tabId, closeAppTab, removeReaderTab, loadAttempt]);
 
   useEffect(() => {

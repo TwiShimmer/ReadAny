@@ -9,12 +9,11 @@
  *  - our worker entry installs the runtime polyfills inside the worker realm
  *    before pdf.worker.mjs is evaluated.
  *
- * `?worker&url` returns the emitted worker asset URL. pdf.js then creates one
- * Worker per document from `workerSrc` (rather than sharing a single
- * `workerPort`, which pdf.js destroys together with the first document).
+ * `?worker&url` returns the emitted worker asset URL. The adapter owns a
+ * separate worker for each document from construction through teardown.
  */
-import { configurePDFWorker } from "foliate-js/pdf.js";
-import { type PDFDocumentProxy, getDocument } from "pdfjs-dist";
+import { configurePDFWorker, createPDFLoadingTask } from "foliate-js/pdf.js";
+import type { PDFDocumentLoadingTask, PDFDocumentProxy, getDocument } from "pdfjs-dist";
 import pdfWorkerUrl from "./pdf-worker-entry.ts?worker&url";
 
 let configured = false;
@@ -39,12 +38,11 @@ export async function withPdfDocument<T>(
   useDocument: (pdf: PDFDocumentProxy) => Promise<T>,
 ): Promise<T> {
   ensurePdfWorker();
-  const task = getDocument(source);
+  const { task, destroy }: { task: PDFDocumentLoadingTask; destroy: () => Promise<void> } =
+    await createPDFLoadingTask(source);
   try {
     return await useDocument(await task.promise);
   } finally {
-    await task
-      .destroy()
-      .catch((error) => console.warn("Failed to release PDF loading task:", error));
+    await destroy();
   }
 }

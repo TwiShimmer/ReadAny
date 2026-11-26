@@ -7,6 +7,8 @@ export function createDocumentAttempt(onFailure: (error: unknown) => void) {
   const controller = new AbortController();
   const { signal } = controller;
   let ownedDocument: OwnedDocument | undefined;
+  let teardown: Promise<void> | undefined;
+  let released = false;
 
   const destroy = async (doc: OwnedDocument | undefined) => {
     try {
@@ -16,28 +18,29 @@ export function createDocumentAttempt(onFailure: (error: unknown) => void) {
     }
   };
 
-  const release = () => {
-    if (signal.aborted) return;
-    controller.abort();
+  const stop = () => {
+    if (teardown) return teardown;
     const doc = ownedDocument;
     ownedDocument = undefined;
-    void destroy(doc);
+    teardown = Promise.resolve().then(() => destroy(doc));
+    controller.abort();
+    return teardown;
   };
 
   return {
     signal,
     own(doc: OwnedDocument) {
-      if (signal.aborted) {
-        void destroy(doc);
-        return;
-      }
+      if (signal.aborted) return destroy(doc);
       ownedDocument = doc;
     },
-    release,
-    fail(error: unknown) {
-      if (signal.aborted) return;
-      release();
-      onFailure(error);
+    release() {
+      released = true;
+      return stop();
+    },
+    async fail(error: unknown) {
+      if (teardown) return teardown;
+      await stop();
+      if (!released) onFailure(error);
     },
   };
 }
