@@ -6,8 +6,20 @@
 // React Native/Metro cannot resolve the Node `node:buffer` protocol import.
 // biome-ignore lint/style/useNodejsImportProtocol: Expo needs the buffer polyfill package name.
 import { Buffer } from "buffer";
+import { DOMParser } from "@xmldom/xmldom";
 import i18n from "../i18n";
-import { FileTransferError, getPlatformService } from "../services/platform";
+import {
+  FileTransferError,
+  UnverifiableUploadTargetError,
+  getPlatformService,
+} from "../services/platform";
+import {
+  hasUnsafeDavWriteBody,
+  isDavWriteMethod,
+  isDavWriteSuccess,
+  isHtmlContentType,
+  readDavDownloadBody,
+} from "./dav-response";
 import type { DavResource } from "./sync-types";
 
 function stripControlChars(value: string): string {
@@ -431,29 +443,21 @@ export class WebDavClient {
     }
     if (!response.ok) return response;
 
-    const writes =
-      method === "PUT" || method === "MKCOL" || method === "MOVE" || method === "DELETE";
-    const contentType = response.headers.get("Content-Type") ?? "";
+    const writes = isDavWriteMethod(method);
     if (
-      (writes || method === "PROPFIND" || method === "HEAD") &&
-      /^(text\/html|application\/xhtml\+xml)\b/i.test(contentType)
+      isHtmlContentType(response.headers.get("Content-Type")) ||
+      (method === "PROPFIND" && response.status !== 207) ||
+      (method !== "PROPFIND" && response.status === 207) ||
+      (method === "GET" && response.status !== 200) ||
+      (writes && !isDavWriteSuccess(method, response.status))
     ) {
+      await response.body?.cancel().catch(() => {});
       throw unexpectedResponse(method, url, response.status);
     }
-    if (
-      writes &&
-      response.status === 200 &&
-      /^\s*(?:<!doctype\s+html\b|<html\b|<form\b)/i.test(await response.text())
-    ) {
-      throw unexpectedResponse(method, url, response.status);
-    }
-    if ((method === "PROPFIND" && response.status !== 207) || (writes && response.status === 207)) {
-      throw unexpectedResponse(method, url, response.status);
-    }
-    if (
-      writes ||
-      (method === "PROPFIND" && (response.headers.has("DAV") || /\bxml\b/i.test(contentType)))
-    ) {
+    if (writes) {
+      if (await hasUnsafeDavWriteBody(response)) {
+        throw unexpectedResponse(method, url, response.status);
+      }
       this.hadAuthSuccess = true;
     }
     return response;
@@ -489,12 +493,16 @@ export class WebDavClient {
         return response;
       } catch (error: unknown) {
         const elapsed = Date.now() - startTime;
-        const webDavError = createRequestWebDavError(
-          error,
-          method,
-          this.buildUrl(path),
-          this.getTimeout(method, options.timeoutMs),
-        );
+        const url = this.buildUrl(path);
+        const webDavError =
+          error instanceof FileTransferError
+            ? this.toWebDavTransferError(error, method, url)
+            : createRequestWebDavError(
+                error,
+                method,
+                url,
+                this.getTimeout(method, options.timeoutMs),
+              );
         console.error(
           `[WebDAV] ${method} ${logPath} failed (${webDavError.kind}) after ${elapsed}ms:`,
           webDavError.status,
@@ -511,16 +519,8 @@ export class WebDavClient {
    * subpath-only servers (e.g. Jianguoyun /dav/) reject.
    */
   async ping(path = "/"): Promise<void> {
-    const resp = await this.request("PROPFIND", path, {
-      headers: { Depth: "0" },
-      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
-      contentType: "application/xml",
-      timeoutMs: 10_000,
-    });
-    if (resp.ok || resp.status === 207) {
-      return;
-    }
-    throw createHttpWebDavError(resp.status, resp.statusText, "PROPFIND", this.buildUrl(path));
+    if (await this.readPropfind(path, "0", 10_000)) return;
+    throw createHttpWebDavError(404, undefined, "PROPFIND", this.buildUrl(path));
   }
 
   /** Test connection, returns true if successful */
@@ -530,7 +530,7 @@ export class WebDavClient {
   }
 
   /** Create a directory (MKCOL) */
-  async mkcol(path: string): Promise<void> {
+  async mkcol(path: string): Promise<boolean> {
     const collectionPath = toCollectionPath(path);
     let resp: Response;
     try {
@@ -543,45 +543,44 @@ export class WebDavClient {
       ) {
         console.warn(`[WebDAV] MKCOL ${path} failed but directory exists; continuing`);
         this.knownCollections.add(collectionPath);
-        return;
+        return true;
       }
       throw e;
     }
-    const status = resp.status;
-    if (resp.ok || status === 201) {
-      this.knownCollections.add(collectionPath);
-      return;
+    if (resp.status === 409) {
+      const parent = getParentCollectionPath(collectionPath)?.parent;
+      if (parent && (await this.mkcolChain(parent, true)).created) {
+        return this.confirmCollection(collectionPath, await this.request("MKCOL", collectionPath));
+      }
     }
-    if (status === 409) {
-      await this.mkcolChain(collectionPath, true);
-      return;
-    }
-    await this.confirmCollection(collectionPath, resp);
+    return this.confirmCollection(collectionPath, resp);
   }
 
-  private async confirmCollection(path: string, response: Response): Promise<void> {
-    if (response.ok) {
+  private async confirmCollection(path: string, response: Response): Promise<boolean> {
+    const canProbe = response.status === 401 || response.status === 403 || response.status === 405;
+    if (response.ok || (canProbe && (await this.collectionExists(path)))) {
       this.knownCollections.add(path);
-      return;
+      return true;
     }
-    if (response.status === 401 || response.status === 403 || response.status === 405) {
-      if (await this.collectionExists(path)) this.knownCollections.add(path);
-      else if (response.status !== 405) throw this.createStatusError("MKCOL", path, response);
-      return;
-    }
+    if (response.status === 405) return false;
     throw this.createStatusError("MKCOL", path, response);
   }
 
-  private async mkcolChain(path: string, recheck: boolean): Promise<void> {
+  private async mkcolChain(
+    path: string,
+    recheck: boolean,
+  ): Promise<{ confirmed: boolean; created: boolean }> {
     const segments = path.split("/").filter(Boolean);
     let current = "";
+    let created = false;
+    let confirmed = true;
     for (const segment of segments) {
       current += `/${segment}`;
       const collectionPath = toCollectionPath(current);
       if (recheck) this.knownCollections.delete(collectionPath);
       if (this.knownCollections.has(collectionPath)) continue;
       const exists = recheck
-        ? await this.propfindExistsStrict(collectionPath)
+        ? await this.propfindExistsStrict(collectionPath, true)
         : await this.propfindExists(collectionPath);
       if (exists) {
         this.knownCollections.add(collectionPath);
@@ -589,11 +588,13 @@ export class WebDavClient {
       }
       if (recheck) {
         const response = await this.request("MKCOL", collectionPath);
-        await this.confirmCollection(collectionPath, response);
+        confirmed = (await this.confirmCollection(collectionPath, response)) && confirmed;
+        created ||= response.ok;
       } else {
-        await this.mkcol(collectionPath);
+        confirmed = (await this.mkcol(collectionPath)) && confirmed;
       }
     }
+    return { confirmed, created };
   }
 
   /**
@@ -601,16 +602,18 @@ export class WebDavClient {
    */
   private async recreateCollection(path: string): Promise<void> {
     this.knownCollections.delete(toCollectionPath(path));
-    if (await this.propfindExistsStrict(path)) {
+    if (await this.propfindExistsStrict(path, true)) {
       this.knownCollections.add(toCollectionPath(path));
       return;
     }
-    await this.mkcol(path);
+    if (!(await this.mkcol(path))) {
+      throw createHttpWebDavError(405, undefined, "MKCOL", this.buildUrl(path));
+    }
   }
 
   /** Ensure a full directory path exists (creates each segment) */
-  async ensureDirectory(path: string): Promise<void> {
-    await this.mkcolChain(path, false);
+  async ensureDirectory(path: string): Promise<boolean> {
+    return (await this.mkcolChain(path, false)).confirmed;
   }
 
   /** Upload data to a path (PUT) */
@@ -694,6 +697,7 @@ export class WebDavClient {
           onProgress,
         });
       } catch (error) {
+        if (error instanceof UnverifiableUploadTargetError) throw error;
         throw this.toWebDavTransferError(error, "PUT", url);
       }
       this.hadAuthSuccess = true;
@@ -781,8 +785,7 @@ export class WebDavClient {
     if (!resp.ok) {
       throw this.createStatusError("GET", path, resp);
     }
-    const buffer = await resp.arrayBuffer();
-    return new Uint8Array(buffer);
+    return this.readDownloadBytes(path, resp);
   }
 
   /** Download data with progress reporting */
@@ -807,8 +810,7 @@ export class WebDavClient {
         throw this.createStatusError("GET", path, resp);
       }
       console.log(`[WebDAV] GET ${logPath} completed in ${elapsed}ms (status: ${resp.status})`);
-      const buffer = await resp.arrayBuffer();
-      return new Uint8Array(buffer);
+      return await this.readDownloadBytes(path, resp);
     } catch (error: unknown) {
       const msg = (error as { message?: string })?.message ?? "";
       // Tauri/Chromium rejects response headers containing non-ISO-8859-1
@@ -830,6 +832,12 @@ export class WebDavClient {
     }
   }
 
+  private async readDownloadBytes(path: string, response: Response): Promise<Uint8Array> {
+    return readDavDownloadBody(response, path, () =>
+      unexpectedResponse("GET", this.buildUrl(path), response.status),
+    );
+  }
+
   async getFileToPath(
     path: string,
     localFilePath: string,
@@ -848,6 +856,7 @@ export class WebDavClient {
       await platform.downloadFile(url, localFilePath, {
         headers: this.getAuthHeaders(),
         allowInsecure: this.allowInsecure,
+        rejectRedirects: true,
         onProgress,
       });
     } catch (error) {
@@ -933,7 +942,7 @@ export class WebDavClient {
   /** PROPFIND Depth 0 to check if a resource exists */
   private async propfindExists(path: string): Promise<boolean> {
     try {
-      const exists = await this.propfindExistsStrict(path);
+      const exists = await this.propfindExistsStrict(path, true);
       if (exists) {
         this.knownCollections.add(toCollectionPath(path));
       }
@@ -944,30 +953,49 @@ export class WebDavClient {
     }
   }
 
-  private async propfindExistsStrict(path: string): Promise<boolean> {
-    const resp = await this.request("PROPFIND", path, {
-      headers: { Depth: "0" },
-      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/></D:prop></D:propfind>',
-      contentType: "application/xml",
-      timeoutMs: DIRECTORY_PROBE_TIMEOUT_MS,
-    });
-    if (resp.ok || resp.status === 207) {
-      return true;
+  private async propfindExistsStrict(path: string, collection = false): Promise<boolean> {
+    const listing = await this.readPropfind(path, "0", DIRECTORY_PROBE_TIMEOUT_MS);
+    if (!listing) return false;
+    if (collection && !listing.target.isCollection) {
+      throw unexpectedResponse("PROPFIND", this.buildUrl(path), 207);
     }
-    if (resp.status === 404 || resp.status === 409 || resp.status === 410) return false;
-    throw this.createStatusError("PROPFIND", path, resp);
+    return true;
+  }
+
+  private async readPropfind(
+    path: string,
+    depth: "0" | "1",
+    timeoutMs?: number,
+  ): Promise<DavListing | null> {
+    const resp = await this.request("PROPFIND", path, {
+      headers: { Depth: depth },
+      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/><D:getetag/></D:prop></D:propfind>',
+      contentType: "application/xml",
+      timeoutMs,
+    });
+    if (resp.status === 404 || resp.status === 410) return null;
+    if (!resp.ok) throw this.createStatusError("PROPFIND", path, resp);
+    const url = this.buildUrl(path);
+    const listing = parsePropfindResponse(await resp.text(), resp.url || url, depth);
+    if (typeof listing === "number") {
+      throw createHttpWebDavError(listing, undefined, "PROPFIND", url);
+    }
+    if (listing === undefined) throw unexpectedResponse("PROPFIND", url, resp.status);
+    if (listing) this.hadAuthSuccess = true;
+    return listing;
   }
 
   private async parentListingContainsCollection(path: string): Promise<boolean> {
     const parentInfo = getParentCollectionPath(path);
-    if (!parentInfo) return true;
+    if (!parentInfo) return false;
 
     try {
       const resources = await this.propfind(parentInfo.parent);
       return resources.some(
         (resource) => resource.isCollection && resource.name === parentInfo.name,
       );
-    } catch {
+    } catch (error) {
+      if (!(error instanceof WebDavError) || !this.canTryPutAfterPreflight(error)) throw error;
       return false;
     }
   }
@@ -981,90 +1009,109 @@ export class WebDavClient {
 
   /** List directory contents (PROPFIND Depth 1) */
   async propfind(path: string): Promise<DavResource[]> {
-    const resp = await this.request("PROPFIND", path, {
-      headers: { Depth: "1" },
-      body: '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/><D:getetag/></D:prop></D:propfind>',
-      contentType: "application/xml",
-    });
-    if (!resp.ok && resp.status !== 207) {
-      if (resp.status === 404 || resp.status === 409) return [];
-      throw this.createStatusError("PROPFIND", path, resp);
-    }
-    const xml = await resp.text();
-    return parsePropfindResponse(xml, path, this.buildUrl(path));
+    const listing = await this.readPropfind(path, "1");
+    if (!listing) return [];
+    if (!listing.target.isCollection)
+      throw unexpectedResponse("PROPFIND", this.buildUrl(path), 207);
+    return listing.children;
   }
 
-  /** Safely list directory, create if not exists */
+  /** List a directory, treating confirmed absence as an empty listing. */
   async safeReadDir(path: string): Promise<DavResource[]> {
-    const collectionPath = toCollectionPath(path);
-    try {
-      return await this.propfind(collectionPath);
-    } catch (e: unknown) {
-      // Branch on the attached status so localized messages (or paths that
-      // happen to contain "404") cannot fake a missing collection.
-      if (e instanceof WebDavError && e.kind !== "redirect" && isMissingParentStatus(e.status)) {
-        await this.ensureDirectory(collectionPath);
-        return [];
-      }
-      throw e;
-    }
+    return this.propfind(toCollectionPath(path));
   }
 }
 
-/**
- * Parse a PROPFIND multistatus XML response.
- * Uses regex-based parsing — no DOM parser needed since the XML structure is predictable.
- */
-function parsePropfindResponse(xml: string, basePath: string, requestUrl: string): DavResource[] {
-  const blocks: string[] = [];
+type DavListing = { target: DavResource; children: DavResource[] };
 
-  // Split by WebDAV response boundaries regardless of namespace prefix.
-  const responseRegex = /<(?:[\w-]+:)?response\b[^>]*>([\s\S]*?)<\/(?:[\w-]+:)?response>/gi;
-  let match = responseRegex.exec(xml);
-  while (match !== null) {
-    blocks.push(match[1]);
-    match = responseRegex.exec(xml);
-  }
-
-  const strictBasePath = normalizeWebDavPath(new URL(requestUrl).pathname);
-  const fallbackBasePath = normalizeWebDavPath(basePath);
-  let resources = parsePropfindBlocks(blocks, strictBasePath, requestUrl);
-
-  if (resources.length === 0 && fallbackBasePath !== strictBasePath) {
-    resources = parsePropfindBlocks(blocks, fallbackBasePath, requestUrl);
-  }
-
-  return resources;
+function davChildren(element: Element, localName: string): Element[] {
+  return Array.from(element.childNodes).filter(
+    (child): child is Element =>
+      child.nodeType === 1 &&
+      (child as Element).namespaceURI === "DAV:" &&
+      (child as Element).localName === localName,
+  );
 }
 
-function parsePropfindBlocks(
-  blocks: string[],
-  basePath: string,
+function davStatus(element: Element): number | undefined {
+  const line = davChildren(element, "status")[0]?.textContent?.trim();
+  const code = line?.match(/^HTTP\/\d(?:\.\d+)?\s+(\d{3})(?:\s|$)/)?.[1];
+  return code ? Number(code) : undefined;
+}
+
+function parsePropfindResponse(
+  xml: string,
   requestUrl: string,
-): DavResource[] {
-  const resources: DavResource[] = [];
+  depth: "0" | "1",
+): DavListing | number | null | undefined {
+  let malformed = false;
+  const reportInvalidXml = () => {
+    malformed = true;
+  };
+  const parser = new DOMParser({
+    errorHandler: {
+      warning: reportInvalidXml,
+      error: reportInvalidXml,
+      fatalError: reportInvalidXml,
+    },
+  });
+  const root = parser.parseFromString(xml, "application/xml")?.documentElement;
+  if (malformed || root?.namespaceURI !== "DAV:" || root.localName !== "multistatus") return;
 
-  for (const block of blocks) {
-    const href = extractTagContent(block, "href") || "";
-    const hrefPath = normalizeWebDavPath(getPathnameFromHref(href, requestUrl));
-    if (!isDirectChildPath(basePath, hrefPath)) continue;
+  const request = new URL(requestUrl);
+  const base = normalizeWebDavPath(request.pathname);
+  const children: DavResource[] = [];
+  let target: DavResource | undefined;
+  for (const response of davChildren(root, "response")) {
+    const href = davChildren(response, "href")[0]?.textContent?.trim();
+    if (!href) continue;
+    let url: URL;
+    try {
+      url = new URL(href, request);
+    } catch {
+      return;
+    }
+    if (url.origin !== request.origin) continue;
+    const path = normalizeWebDavPath(url.pathname);
+    const self = path === base;
+    if (!self && (depth === "0" || !isDirectChildPath(base, path))) continue;
+    if (self && target) return;
 
-    const isCollection = /<(?:(?:\w+):)?collection\b[^>]*\/?>/i.test(block);
-    const contentLengthStr = extractTagContent(block, "getcontentlength");
-    const lastModified = extractTagContent(block, "getlastmodified");
-    const etag = extractTagContent(block, "getetag")?.replace(/"/g, "");
-
-    resources.push({
-      href: hrefPath,
-      name: filenameFromPath(hrefPath),
-      isCollection,
-      contentLength: contentLengthStr ? Number.parseInt(contentLengthStr, 10) : undefined,
-      lastModified: lastModified || undefined,
-      etag: etag || undefined,
+    const responseStatus = davStatus(response);
+    if (responseStatus === undefined && davChildren(response, "status").length > 0) return;
+    if (responseStatus && (responseStatus < 200 || responseStatus >= 300)) {
+      if (self) return responseStatus === 404 || responseStatus === 410 ? null : responseStatus;
+      if (responseStatus === 404 || responseStatus === 410) continue;
+      return responseStatus;
+    }
+    const statuses = davChildren(response, "propstat");
+    const successful = statuses.flatMap((stat) => {
+      const status = davStatus(stat);
+      return status && status >= 200 && status < 300 ? davChildren(stat, "prop") : [];
     });
+    const property = (name: string) => successful.flatMap((prop) => davChildren(prop, name))[0];
+    const resourceType = property("resourcetype");
+    if (!resourceType) {
+      const failedType = statuses.find((stat) =>
+        davChildren(stat, "prop").some((prop) => davChildren(prop, "resourcetype").length > 0),
+      );
+      const status = failedType && davStatus(failedType);
+      // A missing property does not establish that the resource itself is missing.
+      return status === 401 || status === 403 ? status : undefined;
+    }
+    const size = property("getcontentlength")?.textContent;
+    const resource = {
+      href: path,
+      name: path.split("/").pop() ?? "",
+      isCollection: davChildren(resourceType, "collection").length > 0,
+      contentLength: size ? Number.parseInt(size, 10) : undefined,
+      lastModified: property("getlastmodified")?.textContent || undefined,
+      etag: property("getetag")?.textContent?.replace(/"/g, "") || undefined,
+    };
+    if (self) target = resource;
+    else children.push(resource);
   }
-
-  return resources;
+  return target ? { target, children } : undefined;
 }
 
 function safeDecodeWebDavPath(path: string): string {
@@ -1072,14 +1119,6 @@ function safeDecodeWebDavPath(path: string): string {
     return decodeURIComponent(path);
   } catch {
     return path;
-  }
-}
-
-function getPathnameFromHref(href: string, requestUrl: string): string {
-  try {
-    return new URL(href, requestUrl).pathname;
-  } catch {
-    return href;
   }
 }
 
@@ -1095,19 +1134,4 @@ function isDirectChildPath(basePath: string, hrefPath: string): boolean {
   if (!hrefPath.startsWith(prefix)) return false;
   const relative = hrefPath.slice(prefix.length).replace(/\/+$/, "");
   return relative.length > 0 && !relative.includes("/");
-}
-
-/** Extract text content of an XML tag (case-insensitive, supports arbitrary namespace prefix) */
-function extractTagContent(xml: string, localName: string): string | null {
-  const regex = new RegExp(
-    `<(?:[\\w-]+:)?${localName}\\b[^>]*>([^<]*)<\\/(?:[\\w-]+:)?${localName}>`,
-    "i",
-  );
-  const match = regex.exec(xml);
-  return match ? match[1].trim() : null;
-}
-
-/** Extract filename from a normalized WebDAV path */
-function filenameFromPath(path: string): string {
-  return path.replace(/\/+$/, "").split("/").pop() || "";
 }

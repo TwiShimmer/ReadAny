@@ -73,12 +73,12 @@ export class WebDavBackend implements ISyncBackend {
     if (this.directoriesEnsured) return;
 
     // Create directories for the new simple sync (JSON-based)
-    await this.client.ensureDirectory(this.resolvePath("/readany/sync"));
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_DATA));
+    const syncConfirmed = await this.client.ensureDirectory(this.resolvePath("/readany/sync"));
+    const dataConfirmed = await this.client.ensureDirectory(this.resolvePath(REMOTE_DATA));
     // New per-book layout root. Legacy /data/file and /data/cover are only
     // read for migration; creating them on every sync is unnecessary.
-    await this.client.ensureDirectory(this.resolvePath(REMOTE_BOOKS_ROOT));
-    this.directoriesEnsured = true;
+    const booksConfirmed = await this.client.ensureDirectory(this.resolvePath(REMOTE_BOOKS_ROOT));
+    this.directoriesEnsured = syncConfirmed && dataConfirmed && booksConfirmed;
   }
 
   // Directory self-healing lives in WebDavClient.put()/putFile() only. Keeping

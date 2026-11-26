@@ -36,6 +36,8 @@ export interface FileTransferOptions {
   onProgress?: (loaded: number, total: number) => void;
 }
 
+export class UnverifiableUploadTargetError extends Error {}
+
 /**
  * Structured failure for native file transfers. `status` carries the HTTP
  * status when the transfer reached the server, so callers can branch on

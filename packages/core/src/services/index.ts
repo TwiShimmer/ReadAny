@@ -10,6 +10,7 @@ export type {
 } from "./platform";
 export {
   FileTransferError,
+  UnverifiableUploadTargetError,
   setPlatformService,
   getPlatformService,
   waitForPlatformService,
