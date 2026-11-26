@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use tauri::ipc::Channel;
 use tauri_plugin_http::reqwest;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 
 const TRANSFER_TIMEOUT_SECS: u64 = 300;
@@ -20,6 +20,7 @@ const DOWNLOAD_MAX_ATTEMPTS: u32 = 3;
 const UPLOAD_MAX_ATTEMPTS: u32 = 2;
 const BASE_DELAY_MS: u64 = 500;
 const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BODY_PREFIX_BYTES: usize = 1024;
 
 /// Serialized to the webview as `{ status, message }` so the JS layer can
 /// branch on the HTTP status without matching message text.
@@ -29,6 +30,8 @@ pub struct TransferError {
     message: String,
     #[serde(rename = "redirectLocation", skip_serializing_if = "Option::is_none")]
     redirect_location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 impl TransferError {
@@ -37,6 +40,7 @@ impl TransferError {
             status: None,
             message: message.into(),
             redirect_location: None,
+            url: None,
         }
     }
 
@@ -45,6 +49,7 @@ impl TransferError {
             status: Some(status),
             message: message.into(),
             redirect_location: None,
+            url: None,
         }
     }
 }
@@ -119,6 +124,116 @@ fn redirect_error(method: &reqwest::Method, response: &reqwest::Response) -> Tra
     error
 }
 
+fn check_response_target(
+    method: &reqwest::Method,
+    target: &reqwest::Url,
+    response: &reqwest::Response,
+) -> Result<(), TransferError> {
+    if response.status().is_redirection() || response.url() != target {
+        return Err(redirect_error(method, response));
+    }
+    Ok(())
+}
+
+fn unexpected_response(response: &reqwest::Response) -> TransferError {
+    let mut error =
+        TransferError::with_status(response.status().as_u16(), "Unexpected WebDAV response");
+    let url = response.url();
+    error.url = Some(format!(
+        "{}{}",
+        url.origin().ascii_serialization(),
+        url.path()
+    ));
+    error
+}
+
+fn is_html(response: &reqwest::Response) -> bool {
+    let mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    mime_type.eq_ignore_ascii_case("text/html")
+        || mime_type.eq_ignore_ascii_case("application/xhtml+xml")
+}
+
+fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
+    let decoded = if prefix.starts_with(&[0xff, 0xfe]) || prefix.starts_with(&[0xfe, 0xff]) {
+        let little_endian = prefix[0] == 0xff;
+        let utf16: Vec<u16> = prefix[2..]
+            .chunks_exact(2)
+            .map(|chunk| {
+                if little_endian {
+                    u16::from_le_bytes([chunk[0], chunk[1]])
+                } else {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&utf16)
+    } else {
+        String::from_utf8_lossy(prefix).into_owned()
+    };
+    let mut start = decoded.trim_start_matches('\u{feff}').trim_start();
+    if prefix.len() >= BODY_PREFIX_BYTES && start.is_empty() {
+        return true;
+    }
+    if !start
+        .strip_prefix('<')
+        .and_then(|s| s.trim_start().chars().next())
+        .is_some_and(|c| c.is_alphabetic() || matches!(c, '!' | '?' | '/'))
+    {
+        return false;
+    }
+    if allow_fiction_book {
+        loop {
+            let end = if start.starts_with("<?xml ") {
+                start.find("?>").map(|i| i + 2)
+            } else if start.starts_with("<!--") {
+                start.find("-->").map(|i| i + 3)
+            } else {
+                None
+            };
+            let Some(end) = end else {
+                break;
+            };
+            start = start[end..].trim_start();
+        }
+        if let Some(tag) = start
+            .strip_prefix('<')
+            .and_then(|s| s.split(|c: char| c.is_whitespace() || c == '>').next())
+        {
+            return tag.rsplit(':').next() != Some("FictionBook");
+        }
+    }
+    true
+}
+
+async fn validate_upload_response(mut response: reqwest::Response) -> Result<(), TransferError> {
+    if !matches!(response.status().as_u16(), 200 | 201 | 204) || is_html(&response) {
+        return Err(unexpected_response(&response));
+    }
+    let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
+    while prefix.len() < BODY_PREFIX_BYTES {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|_| unexpected_response(&response))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        prefix.extend_from_slice(&chunk[..chunk.len().min(BODY_PREFIX_BYTES - prefix.len())]);
+    }
+    if is_unexpected_markup(&prefix, false) {
+        return Err(unexpected_response(&response));
+    }
+    Ok(())
+}
+
 /// Same retry policy as the JS layer: retry transient failures (network
 /// errors, 429, 5xx) up to 3 times with exponential backoff; 4xx fails fast.
 async fn send_with_retry(
@@ -127,6 +242,8 @@ async fn send_with_retry(
     url: &str,
     headers: reqwest::header::HeaderMap,
 ) -> Result<reqwest::Response, TransferError> {
+    let target =
+        reqwest::Url::parse(url).map_err(|_| TransferError::new("Invalid WebDAV transfer URL"))?;
     let mut last_error = TransferError::new(format!(
         "WebDAV {method} failed for {url}: no attempt was made"
     ));
@@ -136,7 +253,7 @@ async fn send_with_retry(
             tokio::time::sleep(retry_delay(attempt)).await;
         }
         let response = match client
-            .request(method.clone(), url)
+            .request(method.clone(), target.clone())
             .headers(headers.clone())
             .send()
             .await
@@ -147,12 +264,10 @@ async fn send_with_retry(
                 continue;
             }
         };
+        check_response_target(&method, &target, &response)?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
-        }
-        if status.is_redirection() {
-            return Err(redirect_error(&method, &response));
         }
         let error = TransferError::with_status(
             status.as_u16(),
@@ -177,6 +292,8 @@ async fn upload_file_with_retry(
     headers: reqwest::header::HeaderMap,
     file_path: &str,
 ) -> Result<(), TransferError> {
+    let target =
+        reqwest::Url::parse(url).map_err(|_| TransferError::new("Invalid WebDAV transfer URL"))?;
     let mut last_error =
         TransferError::new(format!("WebDAV PUT failed for {url}: no attempt was made"));
 
@@ -205,7 +322,7 @@ async fn upload_file_with_retry(
         }
 
         let response = client
-            .put(url)
+            .put(target.clone())
             .headers(headers.clone())
             .header(reqwest::header::CONTENT_LENGTH, total)
             .body(reqwest::Body::wrap_stream(ReaderStream::with_capacity(
@@ -224,26 +341,10 @@ async fn upload_file_with_retry(
             }
         };
 
+        check_response_target(&reqwest::Method::PUT, &target, &response)?;
         let status = response.status();
         if status.is_success() {
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default();
-            let mime_type = content_type.split(';').next().unwrap_or_default().trim();
-            if mime_type.eq_ignore_ascii_case("text/html")
-                || mime_type.eq_ignore_ascii_case("application/xhtml+xml")
-            {
-                return Err(TransferError::with_status(
-                    status.as_u16(),
-                    "WebDAV upload received an HTML page",
-                ));
-            }
-            return Ok(());
-        }
-        if status.is_redirection() {
-            return Err(redirect_error(&reqwest::Method::PUT, &response));
+            return validate_upload_response(response).await;
         }
         let error = TransferError::with_status(
             status.as_u16(),
@@ -286,6 +387,11 @@ pub async fn webdav_download_file(
     let mut response =
         send_with_retry(&client, reqwest::Method::GET, &url, to_header_map(&headers)).await?;
 
+    if response.status().as_u16() != 200 || is_html(&response) {
+        return Err(unexpected_response(&response));
+    }
+    let allow_fiction_book = response.url().path().to_ascii_lowercase().ends_with(".fb2");
+
     let total = response.content_length().unwrap_or(0);
     if let Some(parent) = std::path::Path::new(&file_path).parent() {
         tokio::fs::create_dir_all(parent)
@@ -297,25 +403,48 @@ pub async fn webdav_download_file(
         .map_err(|e| TransferError::new(format!("failed to create {file_path}: {e}")))?;
 
     let mut loaded: u64 = 0;
+    let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| TransferError::new(format!("download read failed: {e}")))?
     {
-        {
-            use tokio::io::AsyncWriteExt;
-            file.write_all(&chunk)
+        let mut chunk = chunk.as_ref();
+        if prefix.len() < BODY_PREFIX_BYTES {
+            let size = chunk.len().min(BODY_PREFIX_BYTES - prefix.len());
+            prefix.extend_from_slice(&chunk[..size]);
+            if prefix.len() < BODY_PREFIX_BYTES {
+                continue;
+            }
+            if is_unexpected_markup(&prefix, allow_fiction_book) {
+                return Err(unexpected_response(&response));
+            }
+            file.write_all(&prefix)
                 .await
                 .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
+            loaded += prefix.len() as u64;
+            chunk = &chunk[size..];
         }
+        file.write_all(chunk)
+            .await
+            .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
         loaded += chunk.len() as u64;
         let _ = on_progress.send(TransferProgress { loaded, total });
     }
-    {
-        use tokio::io::AsyncWriteExt;
-        file.flush()
+    if prefix.len() < BODY_PREFIX_BYTES {
+        if prefix.is_empty() || is_unexpected_markup(&prefix, allow_fiction_book) {
+            return Err(unexpected_response(&response));
+        }
+        file.write_all(&prefix)
             .await
-            .map_err(|e| TransferError::new(format!("download flush failed: {e}")))?;
+            .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
+        let _ = on_progress.send(TransferProgress {
+            loaded: prefix.len() as u64,
+            total,
+        });
     }
+    file.flush()
+        .await
+        .map_err(|e| TransferError::new(format!("download flush failed: {e}")))?;
     Ok(())
 }
