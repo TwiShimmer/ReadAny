@@ -15,6 +15,7 @@ import {
 } from "../services/platform";
 import {
   hasUnsafeDavWriteBody,
+  isDavMissingCollectionProbe,
   isDavMissingResponse,
   isDavMissingStatus,
   isDavWriteMethod,
@@ -604,8 +605,8 @@ export class WebDavClient {
       if (recheck) this.knownCollections.delete(collectionPath);
       if (this.knownCollections.has(collectionPath)) continue;
       const exists = recheck
-        ? await this.propfindExistsStrict(collectionPath, true)
-        : await this.propfindExists(collectionPath);
+        ? await this.propfindExistsStrict(collectionPath, true, "allow-plain-missing")
+        : await this.propfindExists(collectionPath, "allow-plain-missing");
       if (exists) {
         this.knownCollections.add(collectionPath);
         continue;
@@ -626,7 +627,7 @@ export class WebDavClient {
    */
   private async recreateCollection(path: string): Promise<void> {
     this.knownCollections.delete(toCollectionPath(path));
-    if (await this.propfindExistsStrict(path, true)) {
+    if (await this.propfindExistsStrict(path, true, "allow-plain-missing")) {
       this.knownCollections.add(toCollectionPath(path));
       return;
     }
@@ -962,9 +963,9 @@ export class WebDavClient {
   }
 
   /** PROPFIND Depth 0 to check if a resource exists */
-  private async propfindExists(path: string): Promise<boolean> {
+  private async propfindExists(path: string, missing?: DavMissingPolicy): Promise<boolean> {
     try {
-      const exists = await this.propfindExistsStrict(path, true);
+      const exists = await this.propfindExistsStrict(path, true, missing);
       if (exists) {
         this.knownCollections.add(toCollectionPath(path));
       }
@@ -975,8 +976,12 @@ export class WebDavClient {
     }
   }
 
-  private async propfindExistsStrict(path: string, collection = false): Promise<boolean> {
-    const listing = await this.readPropfind(path, "0", DIRECTORY_PROBE_TIMEOUT_MS);
+  private async propfindExistsStrict(
+    path: string,
+    collection = false,
+    missing?: DavMissingPolicy,
+  ): Promise<boolean> {
+    const listing = await this.readPropfind(path, "0", DIRECTORY_PROBE_TIMEOUT_MS, missing);
     if (!listing) return false;
     if (collection && !listing.target.isCollection) {
       throw unexpectedResponse("PROPFIND", this.buildUrl(path), 207);
@@ -988,6 +993,7 @@ export class WebDavClient {
     path: string,
     depth: "0" | "1",
     timeoutMs?: number,
+    missing: DavMissingPolicy = "require-empty-missing",
   ): Promise<DavListing | null> {
     const resp = await this.request("PROPFIND", path, {
       headers: { Depth: depth },
@@ -997,7 +1003,9 @@ export class WebDavClient {
     });
     const url = this.buildUrl(path);
     if (isDavMissingStatus(resp.status)) {
-      if (await isDavMissingResponse(resp)) return null;
+      const isMissing =
+        missing === "allow-plain-missing" ? isDavMissingCollectionProbe : isDavMissingResponse;
+      if (await isMissing(resp)) return null;
       throw unexpectedResponse("PROPFIND", url, resp.status);
     }
     if (!resp.ok) throw this.createStatusError("PROPFIND", path, resp);
@@ -1008,7 +1016,7 @@ export class WebDavClient {
     }
     if (listing === undefined) throw unexpectedResponse("PROPFIND", url, resp.status);
     if (listing) this.hadAuthSuccess = true;
-    return listing;
+    return listing && { ...listing, isEmpty: resp.status === 207 && listing.isEmpty };
   }
 
   private async parentListingContainsCollection(path: string): Promise<boolean> {
@@ -1034,8 +1042,8 @@ export class WebDavClient {
   }
 
   /** List directory contents (PROPFIND Depth 1) */
-  async propfind(path: string): Promise<DavResource[]> {
-    const listing = await this.readPropfind(path, "1");
+  async propfind(path: string, missing?: DavMissingPolicy): Promise<DavResource[]> {
+    const listing = await this.readPropfind(path, "1", undefined, missing);
     if (!listing) return [];
     if (!listing.target.isCollection)
       throw unexpectedResponse("PROPFIND", this.buildUrl(path), 207);
@@ -1043,12 +1051,19 @@ export class WebDavClient {
   }
 
   /** List a directory, treating confirmed absence as an empty listing. */
-  async safeReadDir(path: string): Promise<DavResource[]> {
-    return this.propfind(toCollectionPath(path));
+  async safeReadDir(path: string, missing?: DavMissingPolicy): Promise<DavResource[]> {
+    return this.propfind(toCollectionPath(path), missing);
+  }
+
+  /** Require a fresh Depth: 1 listing that proves the collection exists and is empty. */
+  async isDirectoryEmpty(path: string): Promise<boolean> {
+    const listing = await this.readPropfind(toCollectionPath(path), "1");
+    return !!listing && listing.target.isCollection && listing.isEmpty;
   }
 }
 
-type DavListing = { target: DavResource; children: DavResource[] };
+type DavMissingPolicy = "require-empty-missing" | "allow-plain-missing";
+type DavListing = { target: DavResource; children: DavResource[]; isEmpty: boolean };
 
 function davChildren(element: Element, localName: string): Element[] {
   return Array.from(element.childNodes).filter(
@@ -1088,7 +1103,8 @@ function parsePropfindResponse(
   const base = davPathSegments(request.pathname);
   const children: DavResource[] = [];
   let target: DavResource | undefined;
-  for (const response of davChildren(root, "response")) {
+  const responses = davChildren(root, "response");
+  for (const response of responses) {
     const href = davChildren(response, "href")[0]?.textContent?.trim();
     if (!href) continue;
     let url: URL;
@@ -1141,7 +1157,11 @@ function parsePropfindResponse(
     if (self) target = resource;
     else children.push(resource);
   }
-  return target ? { target, children } : undefined;
+  // Only a positive response for the collection itself and no other responses
+  // proves emptiness. This also covers children not addressable by logical paths.
+  return target
+    ? { target, children, isEmpty: depth === "1" && responses.length === 1 }
+    : undefined;
 }
 
 function safeDecodeWebDavPath(path: string): string {

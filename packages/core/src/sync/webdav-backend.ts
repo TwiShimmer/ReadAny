@@ -9,7 +9,7 @@ import {
   type RemoteFile,
   type WebDavConfig,
 } from "./sync-backend";
-import { REMOTE_BOOKS_ROOT, REMOTE_DATA } from "./sync-types";
+import { REMOTE_BOOKS_ROOT, REMOTE_COVERS, REMOTE_DATA, REMOTE_FILES } from "./sync-types";
 import { WebDavClient, sanitizeWebDavRemoteRoot } from "./webdav-client";
 
 /**
@@ -124,7 +124,9 @@ export class WebDavBackend implements ISyncBackend {
   }
 
   async listDir(path: string): Promise<RemoteFile[]> {
-    const resources = await this.client.safeReadDir(this.resolvePath(path));
+    const missing =
+      path === REMOTE_FILES || path === REMOTE_COVERS ? "allow-plain-missing" : undefined;
+    const resources = await this.client.safeReadDir(this.resolvePath(path), missing);
     return resources.map((r) => ({
       name: r.name,
       path: this.joinLogicalPath(path, r.name),
@@ -132,6 +134,10 @@ export class WebDavBackend implements ISyncBackend {
       lastModified: r.lastModified ? new Date(r.lastModified).getTime() : 0,
       isDirectory: r.isCollection,
     }));
+  }
+
+  async isDirectoryEmpty(path: string): Promise<boolean> {
+    return this.client.isDirectoryEmpty(this.resolvePath(path));
   }
 
   async delete(path: string): Promise<void> {

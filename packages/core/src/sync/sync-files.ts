@@ -1179,7 +1179,7 @@ async function migrateBookRemoteState(
           `[Sync] Failed to list old book folder ${oldDir} (${errorStatus(e) ?? "unknown"})`,
         );
       }
-      let allMoved = !!oldFiles?.length;
+      let allMoved = oldFiles !== undefined;
       for (const f of oldFiles ?? []) {
         const ext = getExt(f.name);
         if (!ext || f.isDirectory) {
@@ -1205,10 +1205,21 @@ async function migrateBookRemoteState(
         }
       }
       if (allMoved) {
-        try {
-          await backend.delete(oldDir);
-        } catch {}
-        listings.bookDirByBookId.set(book.id, info.expectedFolderName);
+        if (backend.type === "webdav") {
+          try {
+            if (await backend.isDirectoryEmpty?.(oldDir)) {
+              await backend.delete(oldDir);
+              listings.bookDirByBookId.set(book.id, info.expectedFolderName);
+            }
+          } catch {
+            // No confirmation means the former collection must be retained.
+          }
+        } else if (oldFiles?.length) {
+          try {
+            await backend.delete(oldDir);
+          } catch {}
+          listings.bookDirByBookId.set(book.id, info.expectedFolderName);
+        }
       }
     } else {
       if (listings.source === "manifest") {

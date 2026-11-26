@@ -68,7 +68,7 @@ async function withBodyDeadline<T>(read: () => Promise<T>, timeoutMs: number): P
   }
 }
 
-type DavMissingBody = "confirmed-empty" | "html/xml" | "unknown";
+type DavMissingBody = "confirmed-empty" | "plain-missing" | "unknown";
 
 // Expo releases the native fetch/timeout before returning the Response snapshot.
 // Keep the original classification rather than inventing a body or changing headers.
@@ -85,23 +85,41 @@ async function classifyDavMissingBody(response: Response): Promise<DavMissingBod
   const contentType = response.headers.get("Content-Type");
   if (isHtmlContentType(contentType) || /\/(?:xml|[^/]+\+xml)$/i.test(mediaType(contentType))) {
     void response.body?.cancel().catch(() => {});
-    return "html/xml";
+    return "unknown";
   }
   const length = response.headers.get("Content-Length")?.trim();
   const declaredEmpty =
     response.status === 204 || (length === "0" && !response.headers.has("Transfer-Encoding"));
   const prefix = await readAndCancelDavBodyPrefix(response);
   if (!prefix) return declaredEmpty ? "confirmed-empty" : "unknown";
-  if (/^(?:<|!doctype\b)/i.test(decodeDavBodyPrefix(prefix).trimStart())) return "html/xml";
-  return prefix.length === 0 && (length == null || declaredEmpty) ? "confirmed-empty" : "unknown";
+  if (prefix.length === 0 && (length == null || declaredEmpty)) return "confirmed-empty";
+  // A short prefix below the read limit is the entire body. Only accept ordinary
+  // status text, not a sign-in prompt or an error document mislabeled as plain text.
+  if (
+    prefix.length > 128 ||
+    declaredEmpty ||
+    (contentType && !/^text\/plain$/i.test(mediaType(contentType)))
+  )
+    return "unknown";
+  const text = decodeDavBodyPrefix(prefix).trim();
+  const statusText =
+    response.status === 404 ? /^(?:404(?: Not Found)?|Not Found)$/i : /^(?:410(?: Gone)?|Gone)$/i;
+  return statusText.test(text) ? "plain-missing" : "unknown";
 }
 
 export async function isDavMissingResponse(response: Response): Promise<boolean> {
-  return (
-    isDavMissingStatus(response.status) &&
-    (missingBodySnapshots.get(response) ?? (await classifyDavMissingBody(response))) ===
-      "confirmed-empty"
-  );
+  return (await missingResponseBody(response)) === "confirmed-empty";
+}
+
+/** Compatibility for non-destructive probes, not for reading sync state. */
+export async function isDavMissingCollectionProbe(response: Response): Promise<boolean> {
+  const body = await missingResponseBody(response);
+  return body === "confirmed-empty" || body === "plain-missing";
+}
+
+async function missingResponseBody(response: Response): Promise<DavMissingBody> {
+  if (!isDavMissingStatus(response.status)) return "unknown";
+  return missingBodySnapshots.get(response) ?? (await classifyDavMissingBody(response));
 }
 
 async function readAndCancelDavBodyPrefix(response: Response): Promise<Uint8Array | undefined> {
