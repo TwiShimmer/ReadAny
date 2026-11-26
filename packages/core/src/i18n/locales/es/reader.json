@@ -3,6 +3,22 @@
     "untitled": "Sin título",
     "loadingBook": "Cargando libro...",
     "failedToLoad": "Error al cargar el libro",
+    "loadFailedMessage": "No se pudo abrir este libro. El archivo puede estar dañado o no ser compatible.",
+    "largePdf": {
+      "title": "PDF grande",
+      "message": "Este PDF ocupa {{size}}. Abrirlo puede consumir mucha memoria y tardar. ¿Abrirlo de todos modos?",
+      "openAnyway": "Abrir de todos modos",
+      "cancelled": "No se abrió el PDF grande."
+    },
+    "errorBoundary": {
+      "title": "Esta página encontró un problema",
+      "description": "No se pudo mostrar el libro. Tu progreso de lectura y tus notas están a salvo.",
+      "appTitle": "ReadAny encontró un problema",
+      "appDescription": "No se pudo mostrar la interfaz. Tu biblioteca y tus notas están a salvo.",
+      "copyDiagnostics": "Copiar diagnóstico",
+      "copied": "Diagnóstico copiado",
+      "copyFailed": "No se pudo copiar el diagnóstico"
+    },
     "validEpub": "Asegúrate de que el archivo sea un EPUB o PDF válido.",
     "noBookFile": "No hay archivo disponible para el libro {{bookId}}",
     "reimportPromptTitle": "Archivo del libro faltante",

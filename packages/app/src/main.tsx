@@ -7,6 +7,7 @@ import { initI18nLanguage } from "@readany/core/i18n";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { AppErrorBoundary } from "./components/common/ErrorBoundary";
 import "./styles/globals.css";
 import { setEmbeddingWorkerFactory, setStreamingFetch } from "@readany/core/ai";
 import { onLibraryChanged } from "@readany/core/events/library-events";
@@ -23,6 +24,7 @@ import { setPlatformService } from "@readany/core/services";
 import { setTheme as setTauriTheme } from "@tauri-apps/api/app";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { shouldSuppressNativeContextMenu } from "./lib/environment";
+import { configurePdfAssets } from "./lib/pdf/pdf-assets";
 import { TauriPlatformService } from "./lib/platform/tauri-platform-service";
 import { registerDesktopFallbackContentProvider } from "./lib/rag/fallback-content-provider";
 import { syncLegacyDesktopLibraryRootConfig } from "./lib/storage/desktop-library-root";
@@ -32,6 +34,7 @@ import { flushAllWrites } from "./stores/persist";
 import { useVectorModelStore } from "./stores/vector-model-store";
 
 installFeedbackLogCapture();
+configurePdfAssets();
 
 // Suppress the WebView's native context menu in production builds; dev keeps
 // it so the native menu (Inspect Element etc.) stays available for debugging.
@@ -179,7 +182,9 @@ i18nReady.then(() => {
 
   createRoot(rootElement).render(
     <StrictMode>
-      <App />
+      <AppErrorBoundary>
+        <App />
+      </AppErrorBoundary>
     </StrictMode>,
   );
 });

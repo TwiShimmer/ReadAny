@@ -3,6 +3,22 @@
     "untitled": "無標題",
     "loadingBook": "正在載入書籍...",
     "failedToLoad": "載入書籍失敗",
+    "loadFailedMessage": "無法開啟這本書，檔案可能已損壞或格式不受支援。",
+    "largePdf": {
+      "title": "大型 PDF",
+      "message": "這個 PDF 有 {{size}}。開啟它可能佔用大量記憶體並需要較長時間。仍要開啟嗎？",
+      "openAnyway": "仍要開啟",
+      "cancelled": "已取消開啟大型檔案。"
+    },
+    "errorBoundary": {
+      "title": "這個頁面遇到問題",
+      "description": "無法顯示這本書。你的閱讀進度與筆記不會遺失。",
+      "appTitle": "ReadAny 遇到問題",
+      "appDescription": "介面無法顯示。你的書庫與筆記不會遺失。",
+      "copyDiagnostics": "複製診斷資訊",
+      "copied": "診斷資訊已複製",
+      "copyFailed": "無法複製診斷資訊"
+    },
     "validEpub": "請確保檔案是有效的 EPUB 或 PDF 格式。",
     "noBookFile": "書籍 {{bookId}} 沒有可用的檔案",
     "reimportPromptTitle": "書籍檔案缺失",
