@@ -6,6 +6,7 @@
 //! thread, which froze the whole app during library sync.
 
 use std::collections::HashMap;
+use std::io::BufReader;
 
 use tauri::ipc::Channel;
 use tauri_plugin_http::reqwest;
@@ -147,8 +148,8 @@ fn unexpected_response(response: &reqwest::Response) -> TransferError {
     error
 }
 
-fn is_html(response: &reqwest::Response) -> bool {
-    let mime_type = response
+fn content_type(response: &reqwest::Response) -> &str {
+    response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -156,13 +157,16 @@ fn is_html(response: &reqwest::Response) -> bool {
         .split(';')
         .next()
         .unwrap_or_default()
-        .trim();
+        .trim()
+}
+
+fn is_html(mime_type: &str) -> bool {
     mime_type.eq_ignore_ascii_case("text/html")
         || mime_type.eq_ignore_ascii_case("application/xhtml+xml")
 }
 
-fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
-    let decoded = if prefix.starts_with(&[0xff, 0xfe]) || prefix.starts_with(&[0xfe, 0xff]) {
+fn decode_prefix(prefix: &[u8]) -> String {
+    if prefix.starts_with(&[0xff, 0xfe]) || prefix.starts_with(&[0xfe, 0xff]) {
         let little_endian = prefix[0] == 0xff;
         let utf16: Vec<u16> = prefix[2..]
             .chunks_exact(2)
@@ -177,7 +181,25 @@ fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
         String::from_utf16_lossy(&utf16)
     } else {
         String::from_utf8_lossy(prefix).into_owned()
-    };
+    }
+}
+
+fn skip_markup_preamble(mut start: &str) -> &str {
+    loop {
+        let end = if start.starts_with("<?xml ") {
+            start.find("?>").map(|i| i + 2)
+        } else if start.starts_with("<!--") {
+            start.find("-->").map(|i| i + 3)
+        } else {
+            None
+        };
+        let Some(end) = end else { return start };
+        start = start[end..].trim_start();
+    }
+}
+
+fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
+    let decoded = decode_prefix(prefix);
     let mut start = decoded.trim_start_matches('\u{feff}').trim_start();
     if prefix.len() >= BODY_PREFIX_BYTES && start.is_empty() {
         return true;
@@ -190,19 +212,7 @@ fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
         return false;
     }
     if allow_fiction_book {
-        loop {
-            let end = if start.starts_with("<?xml ") {
-                start.find("?>").map(|i| i + 2)
-            } else if start.starts_with("<!--") {
-                start.find("-->").map(|i| i + 3)
-            } else {
-                None
-            };
-            let Some(end) = end else {
-                break;
-            };
-            start = start[end..].trim_start();
-        }
+        start = skip_markup_preamble(start);
         if let Some(tag) = start
             .strip_prefix('<')
             .and_then(|s| s.split(|c: char| c.is_whitespace() || c == '>').next())
@@ -213,8 +223,76 @@ fn is_unexpected_markup(prefix: &[u8], allow_fiction_book: bool) -> bool {
     true
 }
 
+fn is_zip_download(extension: &str) -> bool {
+    matches!(extension, "epub" | "cbz" | "fbz")
+}
+
+fn accepts_download_prefix(extension: &str, prefix: &[u8]) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    if is_zip_download(extension) {
+        return prefix.starts_with(b"PK\x03\x04");
+    }
+    if extension != "txt" {
+        return !is_unexpected_markup(prefix, extension == "fb2");
+    }
+
+    let decoded = decode_prefix(prefix);
+    if decoded.bytes().any(|b| matches!(b, 0..=8 | 11 | 14..=31)) {
+        return false;
+    }
+    let start = skip_markup_preamble(decoded.trim_start_matches('\u{feff}').trim_start());
+    let Some(tag) = start.strip_prefix('<') else {
+        return true;
+    };
+    let tag = tag
+        .trim_start()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    if let Some(doctype) = tag.strip_prefix("!doctype") {
+        if doctype.starts_with(char::is_whitespace)
+            && doctype
+                .split(|c: char| c.is_whitespace() || c == '>')
+                .find(|s| !s.is_empty())
+                == Some("html")
+        {
+            return false;
+        }
+    }
+    let name = tag.split_once(|c: char| c.is_whitespace() || matches!(c, '/' | '>'));
+    !matches!(
+        name,
+        Some((
+            "html" | "head" | "body" | "title" | "meta" | "script" | "form" | "input" | "iframe",
+            _
+        ))
+    )
+}
+
+fn is_nonempty_zip(path: &str) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut zip) = zip::ZipArchive::new(BufReader::new(file)) else {
+        return false;
+    };
+    let mut has_file = false;
+    let central_directory = zip.central_directory_start();
+    for i in 0..zip.len() {
+        let Ok(entry) = zip.by_index_raw(i) else {
+            return false;
+        };
+        if entry.data_start().saturating_add(entry.compressed_size()) > central_directory {
+            return false;
+        }
+        has_file |= entry.is_file() && entry.size() > 0;
+    }
+    has_file
+}
+
 async fn validate_upload_response(mut response: reqwest::Response) -> Result<(), TransferError> {
-    if !matches!(response.status().as_u16(), 200 | 201 | 204) || is_html(&response) {
+    if !matches!(response.status().as_u16(), 200 | 201 | 204) || is_html(content_type(&response)) {
         return Err(unexpected_response(&response));
     }
     let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
@@ -244,9 +322,7 @@ async fn send_with_retry(
 ) -> Result<reqwest::Response, TransferError> {
     let target =
         reqwest::Url::parse(url).map_err(|_| TransferError::new("Invalid WebDAV transfer URL"))?;
-    let mut last_error = TransferError::new(format!(
-        "WebDAV {method} failed for {url}: no attempt was made"
-    ));
+    let mut last_error = TransferError::new(format!("WebDAV {method}: no attempt was made"));
 
     for attempt in 0..DOWNLOAD_MAX_ATTEMPTS {
         if attempt > 0 {
@@ -260,7 +336,8 @@ async fn send_with_retry(
         {
             Ok(response) => response,
             Err(e) => {
-                last_error = TransferError::new(format!("WebDAV {method} failed for {url}: {e}"));
+                last_error =
+                    TransferError::new(format!("WebDAV {method} failed: {}", e.without_url()));
                 continue;
             }
         };
@@ -271,7 +348,7 @@ async fn send_with_retry(
         }
         let error = TransferError::with_status(
             status.as_u16(),
-            format!("WebDAV {method} failed for {url}: {status}"),
+            format!("WebDAV {method} failed: {status}"),
         );
         if is_retryable_status(status) {
             last_error = error;
@@ -294,8 +371,7 @@ async fn upload_file_with_retry(
 ) -> Result<(), TransferError> {
     let target =
         reqwest::Url::parse(url).map_err(|_| TransferError::new("Invalid WebDAV transfer URL"))?;
-    let mut last_error =
-        TransferError::new(format!("WebDAV PUT failed for {url}: no attempt was made"));
+    let mut last_error = TransferError::new("WebDAV PUT: no attempt was made");
 
     for attempt in 0..UPLOAD_MAX_ATTEMPTS {
         if attempt > 0 {
@@ -336,7 +412,7 @@ async fn upload_file_with_retry(
             Ok(response) => response,
             Err(e) => {
                 // The stream is consumed; the next attempt reopens the file.
-                last_error = TransferError::new(format!("WebDAV PUT failed for {url}: {e}"));
+                last_error = TransferError::new(format!("WebDAV PUT failed: {}", e.without_url()));
                 continue;
             }
         };
@@ -346,10 +422,8 @@ async fn upload_file_with_retry(
         if status.is_success() {
             return validate_upload_response(response).await;
         }
-        let error = TransferError::with_status(
-            status.as_u16(),
-            format!("WebDAV PUT failed for {url}: {status}"),
-        );
+        let error =
+            TransferError::with_status(status.as_u16(), format!("WebDAV PUT failed: {status}"));
         if is_retryable_status(status) {
             last_error = error;
             continue;
@@ -373,7 +447,7 @@ pub async fn webdav_upload_file(
     upload_file_with_retry(&client, &url, to_header_map(&headers), &file_path).await
 }
 
-/// Stream a server file to local disk via GET, reporting progress over the
+/// Stream a server file to a staged path via GET, reporting progress over the
 /// IPC channel (the JS side throttles UI updates).
 #[tauri::command(async)]
 pub async fn webdav_download_file(
@@ -387,12 +461,40 @@ pub async fn webdav_download_file(
     let mut response =
         send_with_retry(&client, reqwest::Method::GET, &url, to_header_map(&headers)).await?;
 
-    if response.status().as_u16() != 200 || is_html(&response) {
+    let extension = response
+        .url()
+        .path()
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = content_type(&response).to_ascii_lowercase();
+    if response.status().as_u16() != 200
+        || is_html(&mime)
+        || (extension != "json" && (mime.ends_with("/json") || mime.ends_with("+json")))
+    {
         return Err(unexpected_response(&response));
     }
-    let allow_fiction_book = response.url().path().to_ascii_lowercase().ends_with(".fb2");
 
     let total = response.content_length().unwrap_or(0);
+    let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
+    let mut remainder = None;
+    while prefix.len() < BODY_PREFIX_BYTES {
+        let Some(chunk) = response.chunk().await.map_err(|e| {
+            TransferError::new(format!("download read failed: {}", e.without_url()))
+        })?
+        else {
+            break;
+        };
+        let size = chunk.len().min(BODY_PREFIX_BYTES - prefix.len());
+        prefix.extend_from_slice(&chunk[..size]);
+        if size < chunk.len() {
+            remainder = Some(chunk.slice(size..));
+        }
+    }
+    if !accepts_download_prefix(&extension, &prefix) {
+        return Err(unexpected_response(&response));
+    }
+
     if let Some(parent) = std::path::Path::new(&file_path).parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -402,49 +504,38 @@ pub async fn webdav_download_file(
         .await
         .map_err(|e| TransferError::new(format!("failed to create {file_path}: {e}")))?;
 
-    let mut loaded: u64 = 0;
-    let mut prefix = Vec::with_capacity(BODY_PREFIX_BYTES);
+    file.write_all(&prefix)
+        .await
+        .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
+    let mut loaded = prefix.len() as u64;
+    if let Some(chunk) = remainder {
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
+        loaded += chunk.len() as u64;
+    }
+    let _ = on_progress.send(TransferProgress { loaded, total });
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| TransferError::new(format!("download read failed: {e}")))?
+        .map_err(|e| TransferError::new(format!("download read failed: {}", e.without_url())))?
     {
-        let mut chunk = chunk.as_ref();
-        if prefix.len() < BODY_PREFIX_BYTES {
-            let size = chunk.len().min(BODY_PREFIX_BYTES - prefix.len());
-            prefix.extend_from_slice(&chunk[..size]);
-            if prefix.len() < BODY_PREFIX_BYTES {
-                continue;
-            }
-            if is_unexpected_markup(&prefix, allow_fiction_book) {
-                return Err(unexpected_response(&response));
-            }
-            file.write_all(&prefix)
-                .await
-                .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
-            loaded += prefix.len() as u64;
-            chunk = &chunk[size..];
-        }
-        file.write_all(chunk)
+        file.write_all(&chunk)
             .await
             .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
         loaded += chunk.len() as u64;
         let _ = on_progress.send(TransferProgress { loaded, total });
     }
-    if prefix.len() < BODY_PREFIX_BYTES {
-        if prefix.is_empty() || is_unexpected_markup(&prefix, allow_fiction_book) {
-            return Err(unexpected_response(&response));
-        }
-        file.write_all(&prefix)
-            .await
-            .map_err(|e| TransferError::new(format!("download write failed: {e}")))?;
-        let _ = on_progress.send(TransferProgress {
-            loaded: prefix.len() as u64,
-            total,
-        });
-    }
     file.flush()
         .await
         .map_err(|e| TransferError::new(format!("download flush failed: {e}")))?;
+    drop(file);
+    if is_zip_download(&extension)
+        && !tokio::task::spawn_blocking(move || is_nonempty_zip(&file_path))
+            .await
+            .unwrap_or(false)
+    {
+        return Err(unexpected_response(&response));
+    }
     Ok(())
 }

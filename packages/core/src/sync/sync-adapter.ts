@@ -24,14 +24,17 @@ export interface ISyncAdapter {
   /** Get the app data directory (where books/covers live) */
   getAppDataDir(): Promise<string>;
 
-  /** Compute SHA-256 hash of a file, returns hex string */
+  /** Hash a file for the existing cover manifest. */
   hashFile(filePath: string): Promise<string>;
+
+  /** Raw-byte SHA-256; omit when hashFile already hashes raw bytes. */
+  hashFileContents?(filePath: string): Promise<string>;
 
   /** Read a file as Uint8Array */
   readFileBytes(filePath: string): Promise<Uint8Array>;
 
-  /** Read up to the given number of bytes from the beginning of a file. */
-  readFilePrefix(filePath: string, limit: number): Promise<Uint8Array>;
+  /** Read up to the given number of bytes, starting at offset (default: zero). */
+  readFilePrefix(filePath: string, limit: number, offset?: number): Promise<Uint8Array>;
 
   /** Get file size in bytes, or null when unavailable. */
   getFileSize(filePath: string): Promise<number | null>;

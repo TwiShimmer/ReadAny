@@ -96,6 +96,23 @@ export class MobileSyncAdapter implements ISyncAdapter {
     );
   }
 
+  async hashFileContents(filePath: string): Promise<string> {
+    const { Sha256 } = await import("@aws-crypto/sha256-js");
+    const hash = new Sha256();
+    const handle = new File(filePath).open();
+    try {
+      for (;;) {
+        const bytes = handle.readBytes(4 * 1024 * 1024);
+        if (!bytes.length) break;
+        hash.update(bytes);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+      return Array.from(hash.digestSync(), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    } finally {
+      handle.close();
+    }
+  }
+
   async readFileBytes(filePath: string): Promise<Uint8Array> {
     const file = new File(filePath);
     return file.bytes();
@@ -125,9 +142,10 @@ export class MobileSyncAdapter implements ISyncAdapter {
     srcFile.copy(destFile);
   }
 
-  async readFilePrefix(filePath: string, limit: number): Promise<Uint8Array> {
+  async readFilePrefix(filePath: string, limit: number, offset = 0): Promise<Uint8Array> {
     const handle = new File(filePath).open();
     try {
+      if (offset) handle.offset = offset;
       return handle.readBytes(limit);
     } finally {
       handle.close();

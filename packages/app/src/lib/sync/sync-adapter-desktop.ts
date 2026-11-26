@@ -9,6 +9,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { join, tempDir } from "@tauri-apps/api/path";
 import {
+  SeekMode,
   copyFile,
   exists,
   mkdir,
@@ -105,9 +106,10 @@ export class DesktopSyncAdapter implements ISyncAdapter {
     await copyFile(resolvedSrc, resolvedDest);
   }
 
-  async readFilePrefix(filePath: string, limit: number): Promise<Uint8Array> {
+  async readFilePrefix(filePath: string, limit: number, offset = 0): Promise<Uint8Array> {
     const file = await open(await this.resolveToAbsolute(filePath), { read: true });
     try {
+      if (offset) await file.seek(offset, SeekMode.Start);
       const prefix = new Uint8Array(limit);
       let length = 0;
       while (length < limit) {

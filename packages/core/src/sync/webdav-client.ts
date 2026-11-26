@@ -15,6 +15,8 @@ import {
 } from "../services/platform";
 import {
   hasUnsafeDavWriteBody,
+  isDavMissingResponse,
+  isDavMissingStatus,
   isDavWriteMethod,
   isDavWriteSuccess,
   isHtmlContentType,
@@ -101,6 +103,25 @@ export class WebDavError extends Error {
   }
 }
 
+export function syncErrorDiagnostic(error: unknown): unknown {
+  if (!(error instanceof WebDavError)) return error;
+  return {
+    method: error.method,
+    status: error.status,
+    kind: error.kind,
+    ...(error.kind === "redirect" && typeof error.cause === "string"
+      ? { destination: redactDavUrl(error.cause) }
+      : {}),
+  };
+}
+
+function redactDavUrl(url: string): string | undefined {
+  try {
+    const { origin, pathname, protocol } = new URL(url);
+    if (protocol === "http:" || protocol === "https:") return `${origin}${pathname}`;
+  } catch {}
+}
+
 function summarizeStatus(status: number, statusText?: string): string {
   return [status, statusText?.trim()].filter(Boolean).join(" ");
 }
@@ -114,10 +135,7 @@ function redirectError(
   let destination: string | undefined;
   try {
     if (location) {
-      const target = new URL(location, url);
-      if (target.protocol === "https:" || target.protocol === "http:") {
-        destination = `${target.origin}${target.pathname}`;
-      }
+      destination = redactDavUrl(new URL(location, url).href);
     }
   } catch {
     // Preserve the HTTP status when the server's Location is malformed.
@@ -505,8 +523,7 @@ export class WebDavClient {
               );
         console.error(
           `[WebDAV] ${method} ${logPath} failed (${webDavError.kind}) after ${elapsed}ms:`,
-          webDavError.status,
-          webDavError.kind === "redirect" ? webDavError.cause : undefined,
+          syncErrorDiagnostic(webDavError),
         );
         throw webDavError;
       }
@@ -973,9 +990,12 @@ export class WebDavClient {
       contentType: "application/xml",
       timeoutMs,
     });
-    if (resp.status === 404 || resp.status === 410) return null;
-    if (!resp.ok) throw this.createStatusError("PROPFIND", path, resp);
     const url = this.buildUrl(path);
+    if (isDavMissingStatus(resp.status)) {
+      if (await isDavMissingResponse(resp)) return null;
+      throw unexpectedResponse("PROPFIND", url, resp.status);
+    }
+    if (!resp.ok) throw this.createStatusError("PROPFIND", path, resp);
     const listing = parsePropfindResponse(await resp.text(), resp.url || url, depth);
     if (typeof listing === "number") {
       throw createHttpWebDavError(listing, undefined, "PROPFIND", url);
@@ -1059,7 +1079,7 @@ function parsePropfindResponse(
   if (malformed || root?.namespaceURI !== "DAV:" || root.localName !== "multistatus") return;
 
   const request = new URL(requestUrl);
-  const base = normalizeWebDavPath(request.pathname);
+  const base = davPathSegments(request.pathname);
   const children: DavResource[] = [];
   let target: DavResource | undefined;
   for (const response of davChildren(root, "response")) {
@@ -1072,9 +1092,10 @@ function parsePropfindResponse(
       return;
     }
     if (url.origin !== request.origin) continue;
-    const path = normalizeWebDavPath(url.pathname);
-    const self = path === base;
-    if (!self && (depth === "0" || !isDirectChildPath(base, path))) continue;
+    const segments = davPathSegments(url.pathname);
+    const underBase = base.every((segment, i) => segment === segments[i]);
+    const self = underBase && segments.length === base.length;
+    if (!self && (depth === "0" || !underBase || segments.length !== base.length + 1)) continue;
     if (self && target) return;
 
     const responseStatus = davStatus(response);
@@ -1100,9 +1121,12 @@ function parsePropfindResponse(
       return status === 401 || status === 403 ? status : undefined;
     }
     const size = property("getcontentlength")?.textContent;
+    // The public logical path API cannot address a child whose name contains '/'.
+    const name = segments[segments.length - 1] ?? "";
+    if (!self && (!name || name.includes("/"))) continue;
     const resource = {
-      href: path,
-      name: path.split("/").pop() ?? "",
+      href: `/${segments.join("/")}`,
+      name,
       isCollection: davChildren(resourceType, "collection").length > 0,
       contentLength: size ? Number.parseInt(size, 10) : undefined,
       lastModified: property("getlastmodified")?.textContent || undefined,
@@ -1122,16 +1146,8 @@ function safeDecodeWebDavPath(path: string): string {
   }
 }
 
-function normalizeWebDavPath(path: string): string {
-  const decoded = safeDecodeWebDavPath(path).replace(/\/{2,}/g, "/");
-  const trimmed = decoded.replace(/\/+$/, "");
-  return trimmed.startsWith("/") ? trimmed || "/" : `/${trimmed}`;
-}
-
-function isDirectChildPath(basePath: string, hrefPath: string): boolean {
-  if (hrefPath === basePath) return false;
-  const prefix = basePath === "/" ? "/" : `${basePath}/`;
-  if (!hrefPath.startsWith(prefix)) return false;
-  const relative = hrefPath.slice(prefix.length).replace(/\/+$/, "");
-  return relative.length > 0 && !relative.includes("/");
+function davPathSegments(path: string): string[] {
+  const segments = path.split("/").slice(1);
+  if (segments[segments.length - 1] === "") segments.pop();
+  return segments.map(safeDecodeWebDavPath);
 }

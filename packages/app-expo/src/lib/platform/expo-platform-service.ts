@@ -22,11 +22,17 @@ import type {
   WebSocketOptions,
 } from "@readany/core/services";
 import {
+  acceptsDavDownloadPrefix,
+  acceptsDavDownloadType,
   hasUnsafeDavWriteBody,
+  isDavMissingStatus,
   isDavWriteMethod,
   isDavWriteSuccess,
+  isDavZipDownload,
   isHtmlContentType,
+  isNonemptyDavZip,
   isUnsafeDavFilePrefix,
+  readAndCancelDavBodyPrefix,
   readDavBodyPrefix,
   readDavDownloadBody,
 } from "@readany/core/sync/dav-response";
@@ -305,8 +311,12 @@ export class ExpoPlatformService implements IPlatformService {
         const noBody =
           status < 200 || status === 204 || status === 205 || status === 304 || method === "HEAD";
         let body: BodyInit | null = null;
+        let missingPrefix: Uint8Array<ArrayBuffer> | undefined;
         let consumed = false;
-        if (response.ok && !noBody && !isHtmlContentType(headers.get("Content-Type"))) {
+        if (method === "PROPFIND" && isDavMissingStatus(status) && !noBody) {
+          missingPrefix = await readAndCancelDavBodyPrefix(response);
+          body = missingPrefix.buffer;
+        } else if (response.ok && !noBody && !isHtmlContentType(headers.get("Content-Type"))) {
           if (isDavWriteMethod(method)) {
             if (await hasUnsafeDavWriteBody(response)) {
               throw new FileTransferError("Unexpected WebDAV write response", {
@@ -331,6 +341,18 @@ export class ExpoPlatformService implements IPlatformService {
         }
         if (!consumed && body === null) await response.body?.cancel().catch(() => {});
         const snapshot = new Response(body, { status, statusText, headers });
+        // RN's Response polyfill exposes arrayBuffer() but no body stream.
+        if (missingPrefix && !snapshot.body) {
+          const prefix = missingPrefix;
+          Object.defineProperty(snapshot, "body", {
+            value: new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(prefix);
+                controller.close();
+              },
+            }),
+          });
+        }
         Object.defineProperties(snapshot, {
           url: { value: response.url },
           redirected: { value: response.redirected },
@@ -407,28 +429,26 @@ export class ExpoPlatformService implements IPlatformService {
         300_000,
         async (response, signal) => {
           const status = response.status;
-          if (
-            status !== 200 ||
-            !response.body ||
-            isHtmlContentType(response.headers.get("Content-Type"))
-          ) {
-            await response.body?.cancel().catch(() => {});
-            throw new FileTransferError("Unexpected WebDAV download response", {
+          const remotePath = new URL(effectiveUrl).pathname;
+          const invalid = () =>
+            new FileTransferError("Unexpected WebDAV download response", {
               url: effectiveUrl,
               status,
             });
+          if (
+            status !== 200 ||
+            !response.body ||
+            !acceptsDavDownloadType(remotePath, response.headers.get("Content-Type"))
+          ) {
+            await response.body?.cancel().catch(() => {});
+            throw invalid();
           }
           const file = new File(filePath);
           const reader = response.body.getReader();
           try {
             const { prefix, remainder } = await readDavBodyPrefix(reader);
             if (signal.aborted) throw new Error("WebDAV download timed out");
-            if (!prefix.length || isUnsafeDavFilePrefix(prefix, new URL(effectiveUrl).pathname)) {
-              throw new FileTransferError("Unexpected WebDAV download response", {
-                url: effectiveUrl,
-                status,
-              });
-            }
+            if (!acceptsDavDownloadPrefix(remotePath, prefix)) throw invalid();
             file.create({ overwrite: true });
             const handle = file.open();
             const total = Number(response.headers.get("Content-Length")) || 0;
@@ -451,6 +471,21 @@ export class ExpoPlatformService implements IPlatformService {
               }
             } finally {
               handle.close();
+            }
+            if (isDavZipDownload(remotePath)) {
+              const handle = file.open();
+              try {
+                if (
+                  !(await isNonemptyDavZip(file.size, async (offset, length) => {
+                    if (signal.aborted) throw new Error("WebDAV download timed out");
+                    handle.offset = offset;
+                    return handle.readBytes(length);
+                  }))
+                )
+                  throw invalid();
+              } finally {
+                handle.close();
+              }
             }
           } finally {
             await reader.cancel().catch(() => {});
