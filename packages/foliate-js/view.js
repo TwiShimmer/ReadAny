@@ -402,7 +402,8 @@ export class View extends HTMLElement {
     } else if (showTextStart) await this.goToTextStart();
     else {
       this.history.pushState(0);
-      await this.next();
+      if (this.isFixedLayout) await this.renderer.goTo({ index: 0 }, "page");
+      else await this.next();
     }
     signal?.throwIfAborted();
   }

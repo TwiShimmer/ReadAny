@@ -1428,6 +1428,8 @@
         bookTextMetricsTimer = null;
       }
 
+      let book;
+      let el;
       try {
         let hasSignalledLoaded = false;
         const markLoaded = () => {
@@ -1542,11 +1544,11 @@
           throw new Error('No book data provided');
         }
 
-        const book = (file && file.sections) ? file : await makeBook(file);
+        book = (file && file.sections) ? file : await makeBook(file);
         currentBook = book;
         attachBookTransformHandler(book);
 
-        const el = document.createElement('foliate-view');
+        el = document.createElement('foliate-view');
         readerElement = el;
         el.style.width = '100%';
         el.style.height = '100%';
@@ -1554,7 +1556,7 @@
 
         el.addEventListener('load', (e) => {
           const { doc, index, primary } = e.detail;
-          markLoaded();
+          if (!el.isFixedLayout) markLoaded();
           normalizeBrOnlyParagraphs(doc);
           if (primary !== false) {
             currentSectionUsesVerticalWriting = !el.isFixedLayout && isVerticalDoc(doc);
@@ -1779,9 +1781,16 @@
         scheduleBookTextMetrics(book);
 
       } catch (err) {
+        el?.close();
+        el?.remove();
+        if (view === el) view = null;
+        if (readerElement === el) readerElement = null;
+        if (currentBook === book) currentBook = null;
+        await book?.destroy?.();
         console.error('[WebView] Error in openBook:', err);
         const message = `${String(err)}${msg?.uri ? ` (${msg.uri})` : ''}`;
         loading.innerHTML = '<div class="error-text">' + escapeHtml(message) + '</div>';
+        loading.classList.remove('hidden');
         postToRN('error', { message });
       }
     }

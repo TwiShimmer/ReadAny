@@ -31,8 +31,9 @@ const getViewport = (doc, viewport) => {
 export class FixedLayout extends HTMLElement {
   static observedAttributes = ["zoom", "zoom-factor", "spread"];
   #root = this.attachShadow({ mode: "closed" });
-  #observer = new ResizeObserver(() => this.#render());
+  #observer = new ResizeObserver(() => this.#refreshSpread());
   #spreads;
+  #spreadMode;
   #index = -1;
   defaultViewport;
   spread;
@@ -44,7 +45,7 @@ export class FixedLayout extends HTMLElement {
   #zoom;
   #zoomFactor = 1;
   #pendingSpread;
-  #displayedSpread;
+  #frameController;
   #destroyed = false;
   constructor() {
     super();
@@ -67,25 +68,24 @@ export class FixedLayout extends HTMLElement {
       case "zoom":
         this.#zoom =
           value !== "fit-width" && value !== "fit-page" ? Number.parseFloat(value) : value;
-        this.#render();
+        this.#refreshSpread();
         break;
       case "zoom-factor": {
         const parsed = Number.parseFloat(value);
         this.#zoomFactor = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-        this.#render();
+        this.#refreshSpread();
         break;
       }
       case "spread":
         this.spread = value;
-        void this.#applySpreadChange(value);
+        this.#applySpreadChange();
         break;
     }
   }
   #buildSpreads(book) {
-    const { rendition } = book;
     const rtl = book.dir === "rtl";
     const ltr = !rtl;
-    if (rendition?.spread === "none") return book.sections.map((section) => ({ center: section }));
+    if (this.#spreadMode === "none") return book.sections.map((section) => ({ center: section }));
 
     return book.sections.reduce(
       (arr, section, i) => {
@@ -119,19 +119,19 @@ export class FixedLayout extends HTMLElement {
       [{}],
     );
   }
-  async #applySpreadChange(value) {
-    if (!this.book?.sections?.length) return;
-    if (this.book.rendition) this.book.rendition.spread = value;
-
-    const currentSection = this.book.sections[this.index] ?? this.book.sections[0];
+  #applySpreadChange() {
+    if (this.#destroyed || this.#pendingSpread || !this.book?.sections?.length) return;
+    if (this.spread === this.#spreadMode) return;
+    const currentSection = this.book.sections[this.index];
+    this.#spreadMode = this.spread;
+    if (this.book.rendition) this.book.rendition.spread = this.spread;
     this.#spreads = this.#buildSpreads(this.book);
-    const target = currentSection ? this.getSpreadOf(currentSection) : null;
+    if (!currentSection) return;
+    const target = this.getSpreadOf(currentSection);
     this.#index = -1;
-    await this.goToSpread(
-      target?.index ?? 0,
-      target?.side ?? (this.rtl ? "right" : "left"),
-      "layout",
-    );
+    this.goToSpread(target.index, target.side, "layout").catch((error) => {
+      this.#reportRenderError(error);
+    });
   }
   async #createFrame({ index, src: srcOption }, signal) {
     signal.throwIfAborted();
@@ -214,19 +214,16 @@ export class FixedLayout extends HTMLElement {
         ? fitScale
         : fitScale * this.#zoomFactor;
 
+    const renders = [];
     const transform = (frame) => {
       const { element, iframe, width, height, blank, onZoom, signal } = frame;
       if (!iframe) return;
       if (onZoom) {
-        Promise.resolve()
-          .then(() => {
+        renders.push(
+          Promise.resolve().then(() => {
             if (!signal.aborted) return onZoom({ doc: iframe.contentDocument, scale });
-          })
-          .catch((error) => {
-            if (signal.aborted) return;
-            if (this.book.reportRenderError) this.book.reportRenderError(error);
-            else console.error("Failed to render fixed-layout page:", error);
-          });
+          }),
+        );
       }
       const iframeScale = onZoom ? scale : 1;
       Object.assign(iframe.style, {
@@ -254,40 +251,67 @@ export class FixedLayout extends HTMLElement {
       transform(left);
       transform(right);
     }
+    if (renders.length) return Promise.all(renders);
+  }
+  #reportRenderError(error) {
+    if (this.book.reportRenderError) this.book.reportRenderError(error);
+    else console.error("Failed to render fixed-layout page:", error);
+  }
+  #refreshSpread() {
+    const controller = this.#frameController;
+    if (!controller) return;
+    const pending = this.#pendingSpread;
+    if (pending?.controller === controller) {
+      pending.refresh = true;
+      return;
+    }
+    this.#render()?.catch((error) => {
+      if (!controller.signal.aborted) this.#reportRenderError(error);
+    });
   }
   #clearFrames() {
     this.#root.replaceChildren();
     this.#left = null;
     this.#right = null;
     this.#center = null;
-    this.#displayedSpread?.abort();
-    this.#displayedSpread = undefined;
+    this.#frameController?.abort();
+    this.#frameController = undefined;
   }
-  async #showSpread({ left, right, center, side }, controller) {
+  #spreadSide(side) {
+    if (this.#center) return "center";
+    if (this.#left?.blank) return "right";
+    if (this.#right?.blank) return "left";
+    return side;
+  }
+  async #showSpread({ left, right, center }, pending) {
+    const { controller } = pending;
     const { signal } = controller;
     signal.throwIfAborted();
     this.#clearFrames();
-    this.#displayedSpread = controller;
+    this.#frameController = controller;
     if (center) {
       const frame = await this.#createFrame(center, signal);
       signal.throwIfAborted();
       this.#center = frame;
-      this.#side = "center";
     } else {
       const leftFrame = await this.#createFrame(left, signal);
       const rightFrame = await this.#createFrame(right, signal);
       signal.throwIfAborted();
       this.#left = leftFrame;
       this.#right = rightFrame;
-      this.#side = this.#left.blank ? "right" : this.#right.blank ? "left" : side;
     }
-    this.#render();
+    const side = this.#spreadSide(pending.side);
+    pending.refresh = false;
+    await this.#render(side);
+    signal.throwIfAborted();
+    this.#side = this.#spreadSide(pending.side);
+    pending.refresh ||= this.#side !== side;
   }
   #goLeft() {
     if (this.#center || this.#left?.blank) return;
     if (this.#portrait && this.#left?.element?.style?.display === "none") {
       this.#side = "left";
-      this.#render();
+      this.#refreshSpread();
       this.#reportLocation("page");
       return true;
     }
@@ -296,7 +320,7 @@ export class FixedLayout extends HTMLElement {
     if (this.#center || this.#right?.blank) return;
     if (this.#portrait && this.#right?.element?.style?.display === "none") {
       this.#side = "right";
-      this.#render();
+      this.#refreshSpread();
       this.#reportLocation("page");
       return true;
     }
@@ -305,6 +329,7 @@ export class FixedLayout extends HTMLElement {
     this.book = book;
     const { rendition } = book;
     this.spread = rendition?.spread;
+    this.#spreadMode = this.spread;
     this.defaultViewport = rendition?.viewport;
 
     const rtl = book.dir === "rtl";
@@ -336,17 +361,36 @@ export class FixedLayout extends HTMLElement {
       if (center === section) return { index, side: "center" };
     }
   }
-  async goToSpread(index, side, reason) {
-    if (this.#destroyed || index < 0 || index > this.#spreads.length - 1) return;
-    if (index === this.#index) {
-      this.#render(side);
-      return;
+  goToSpread(index, side, reason) {
+    if (this.#destroyed || !this.#spreads[index]) return Promise.resolve();
+    const pending = this.#pendingSpread;
+    if (pending?.index === index) {
+      pending.side = side;
+      return pending.promise;
     }
-    if (this.#pendingSpread && this.#pendingSpread === this.#displayedSpread) this.#clearFrames();
-    this.#pendingSpread?.abort();
-    const controller = new AbortController();
+    this.#cancelPendingSpread();
+    if (index === this.#index && this.#frameController) {
+      const previousSide = this.#side;
+      this.#side = this.#spreadSide(side);
+      this.#refreshSpread();
+      if (previousSide !== this.#side) this.#reportLocation(reason);
+      return Promise.resolve();
+    }
+    const load = { index, side, controller: new AbortController(), promise: undefined };
+    this.#pendingSpread = load;
+    load.promise = Promise.resolve().then(() => this.#loadSpread(load, reason));
+    return load.promise;
+  }
+  #cancelPendingSpread() {
+    const pending = this.#pendingSpread;
+    if (!pending) return;
+    this.#pendingSpread = undefined;
+    if (pending.controller === this.#frameController) this.#clearFrames();
+    else pending.controller.abort();
+  }
+  async #loadSpread(pending, reason) {
+    const { index, controller } = pending;
     const { signal } = controller;
-    this.#pendingSpread = controller;
     const loadFrame = async (section) => {
       signal.throwIfAborted();
       const src = await section?.load?.();
@@ -357,32 +401,34 @@ export class FixedLayout extends HTMLElement {
       if (src?.release) signal.addEventListener("abort", src.release, { once: true });
       return { src, index: this.book.sections.indexOf(section) };
     };
-    this.#index = index;
     const spread = this.#spreads[index];
     try {
+      signal.throwIfAborted();
       if (spread.center) {
         const center = await loadFrame(spread.center);
-        await this.#showSpread({ center }, controller);
+        await this.#showSpread({ center }, pending);
       } else {
         const left = await loadFrame(spread.left);
         const right = await loadFrame(spread.right);
-        await this.#showSpread({ left, right, side }, controller);
+        await this.#showSpread({ left, right }, pending);
       }
-      if (!signal.aborted) this.#reportLocation(reason);
+      if (signal.aborted) return;
+      this.#index = index;
+      this.#pendingSpread = undefined;
+      if (pending.refresh) this.#refreshSpread();
+      this.#reportLocation(reason);
+      this.#applySpreadChange();
     } catch (error) {
       if (signal.aborted) return;
-      if (this.#displayedSpread === controller) this.#clearFrames();
-      controller.abort();
+      if (this.#pendingSpread === pending) this.#cancelPendingSpread();
       throw error;
-    } finally {
-      if (this.#pendingSpread === controller) this.#pendingSpread = undefined;
     }
   }
   async select(target) {
     await this.goTo(target);
     // TODO
   }
-  async goTo(target) {
+  async goTo(target, reason) {
     const { book } = this;
     const resolved = await target;
     if (!resolved || typeof resolved.index !== "number") return;
@@ -391,14 +437,14 @@ export class FixedLayout extends HTMLElement {
     const spread = this.getSpreadOf(section);
     if (!spread) return;
     const { index, side } = spread;
-    await this.goToSpread(index, side);
+    await this.goToSpread(index, side, reason);
   }
   async next() {
-    const s = this.rtl ? this.#goLeft() : this.#goRight();
+    const s = !this.#pendingSpread && (this.rtl ? this.#goLeft() : this.#goRight());
     if (!s) return this.goToSpread(this.#index + 1, this.rtl ? "right" : "left", "page");
   }
   async prev() {
-    const s = this.rtl ? this.#goRight() : this.#goLeft();
+    const s = !this.#pendingSpread && (this.rtl ? this.#goRight() : this.#goLeft());
     if (!s) return this.goToSpread(this.#index - 1, this.rtl ? "left" : "right", "page");
   }
   getContents() {
@@ -410,8 +456,8 @@ export class FixedLayout extends HTMLElement {
   destroy() {
     this.#destroyed = true;
     this.#observer.unobserve(this);
+    this.#cancelPendingSpread();
     this.#clearFrames();
-    this.#pendingSpread?.abort();
   }
 }
 
