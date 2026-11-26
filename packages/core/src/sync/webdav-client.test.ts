@@ -679,6 +679,38 @@ describe("WebDavClient PUT/mkcol self-healing", () => {
     },
   );
 
+  it.each([
+    { status: 404, body: "Not Found", type: "text/plain; charset=utf-8", create: true },
+    { status: 404, body: "404", type: "text/plain", create: true },
+    { status: 410, body: "Gone", type: "text/plain", create: true },
+    { status: 404, body: "<html>Login</html>", type: "text/html", create: false },
+    { status: 404, body: '{"error":"Not Found"}', type: "text/plain", create: false },
+    { status: 404, body: "Please log in", type: "text/plain", create: false },
+  ])(
+    "only attempts MKCOL for a missing collection ($status $body)",
+    async ({ status, body, type, create }) => {
+      const fetch = vi.fn((_url: string, options?: FetchOptions) =>
+        options?.method === "MKCOL"
+          ? new Response(null, { status: 201 })
+          : new Response(body, { status, headers: { "Content-Type": type } }),
+      );
+      installFetchStub(fetch);
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+      const ensure = client.ensureDirectory("/missing");
+      if (create) await expect(ensure).resolves.toBe(true);
+      else await expect(ensure).rejects.toMatchObject({ kind: "unexpected-response", status });
+      expect(fetch.mock.calls.map(([, options]) => options?.method)).toEqual(
+        create ? ["PROPFIND", "MKCOL"] : ["PROPFIND"],
+      );
+    },
+  );
+
+  it("keeps plain 404 strict for ordinary directory reads", async () => {
+    installFetchStub(() => new Response("Not Found", { status: 404 }));
+    const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+    await expect(client.safeReadDir("/sessions")).rejects.toMatchObject({ status: 404 });
+  });
+
   it("does not treat an unrelated localized error containing 404 as a missing collection", async () => {
     const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
     vi.spyOn(client, "propfind").mockRejectedValueOnce(

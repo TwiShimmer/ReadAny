@@ -1,7 +1,7 @@
-import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
 import { describe, expect, it } from "vitest";
 
 import { type FetchOptions, type IPlatformService, setPlatformService } from "../services/platform";
+import { epubFixture } from "../sync/__tests__/epub-fixture";
 import {
   WebDavImportService,
   getWebDavImportRootPrefix,
@@ -104,16 +104,7 @@ function installFetchCapture(): { requests: Array<{ method: string; url: string 
       if (method === "PROPFIND") {
         return new Response(PROPFIND_BOOKS_XML, { status: 207 });
       }
-      const writer = new ZipWriter(new Uint8ArrayWriter());
-      await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
-      await writer.add(
-        "META-INF/container.xml",
-        new TextReader(
-          '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
-        ),
-      );
-      await writer.add("book.opf", new TextReader("<package/>"));
-      return new Response(await writer.close(), { status: 200 });
+      return new Response(await epubFixture(), { status: 200 });
     },
   } as unknown as IPlatformService);
   return { requests };

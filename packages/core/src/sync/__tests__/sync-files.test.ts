@@ -1,10 +1,12 @@
-import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
+import { Uint8ArrayReader, ZipReader } from "@zip.js/zip.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  type FetchOptions,
   FileTransferError,
   type IPlatformService,
   setPlatformService,
 } from "../../services/platform";
+import { TxtToEpubConverter } from "../../utils/txt-to-epub";
 import type { ISyncBackend, RemoteFile } from "../sync-backend";
 import {
   REMOTE_BOOKS_ROOT,
@@ -12,7 +14,9 @@ import {
   REMOTE_FILES,
   REMOTE_FILE_MANIFEST,
 } from "../sync-types";
+import { WebDavBackend } from "../webdav-backend";
 import { WebDavClient, WebDavError } from "../webdav-client";
+import { epubFixture, epubPackageXml } from "./epub-fixture";
 
 const mockAdapter = {
   getAppDataDir: vi.fn().mockResolvedValue("/appdata"),
@@ -46,26 +50,31 @@ vi.mock("../../db/database", () => ({
 
 const { syncFiles, downloadBookFile } = await import("../sync-files");
 
-async function epubFixture(rootfile?: string, packagePath?: string, mime = "application/epub+zip") {
-  const zip = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false });
-  await zip.add("mimetype", new TextReader(mime), { level: 0 });
-  if (rootfile)
-    await zip.add(
-      "META-INF/container.xml",
-      new TextReader(
-        `<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="${rootfile}"/></rootfiles></container>`,
-      ),
-    );
-  if (packagePath)
-    await zip.add(packagePath, new TextReader('<package xmlns="http://www.idpf.org/2007/opf"/>'));
-  return zip.close();
+const epubBytes = await epubFixture();
+const emptyOpf = '<package xmlns="http://www.idpf.org/2007/opf"/>';
+const config = {
+  type: "webdav",
+  url: "https://dav.example.com/dav",
+  username: "alice",
+  autoSync: false,
+  syncIntervalMins: 30,
+  wifiOnly: false,
+  notifyOnComplete: false,
+} as const;
+
+function davListing(...entries: Array<[path: string, collection: boolean]>): Response {
+  return new Response(
+    `<D:multistatus xmlns:D="DAV:">${entries
+      .map(
+        ([path, collection]) => `
+      <D:response><D:href>${path}</D:href><D:propstat><D:prop>
+      <D:resourcetype>${collection ? "<D:collection/>" : ""}</D:resourcetype>
+      </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`,
+      )
+      .join("")}</D:multistatus>`,
+    { status: 207 },
+  );
 }
-const epubBytes = await epubFixture("OPS/book.opf", "OPS/book.opf");
-const mimetypeOnly = await epubFixture();
-const noContainer = await epubFixture(undefined, "OPS/book.opf");
-const noPackage = await epubFixture("OPS/missing.opf", "OPS/book.opf");
-const traversal = await epubFixture("../book.opf", "../book.opf");
-const wrongMime = await epubFixture("OPS/book.opf", "OPS/book.opf", "application/zip");
 
 function createMockBackend(overrides: Partial<ISyncBackend> = {}): ISyncBackend {
   return {
@@ -487,6 +496,27 @@ describe("sync-files", () => {
       expect(result.filesDownloaded).toBe(1);
     });
 
+    it("downloads the EPUB produced by desktop TXT conversion with a first, Stored mimetype", async () => {
+      const converter = new TxtToEpubConverter();
+      const { file } = await converter.convert({
+        file: new File(["Chapter 1\n\nA paragraph.\n\nAnother paragraph."], "Novel & Stories.txt"),
+      });
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const zip = new ZipReader(new Uint8ArrayReader(bytes));
+      try {
+        const [first] = await zip.getEntries();
+        expect(first).toMatchObject({ filename: "mimetype", offset: 0, compressionMethod: 0 });
+      } finally {
+        await zip.close();
+      }
+
+      setPlatformService({
+        fetch: vi.fn(() => new Response(bytes)),
+      } as unknown as IPlatformService);
+      const client = new WebDavClient("https://dav.example.com/dav", "alice", "secret");
+      await expect(client.get("/books/Novel.epub")).resolves.toEqual(bytes);
+    });
+
     it.each([
       { name: "buffered HTML", body: "<!-- sign in --><html>Login</html>" },
       { name: "staged native HTML", body: "<!-- sign in --><html>Login</html>", native: true },
@@ -496,11 +526,71 @@ describe("sync-files", () => {
       { name: "buffered non-ZIP EPUB", body: "Not a ZIP" },
       { name: "staged truncated EPUB", body: epubBytes.subarray(0, 32), native: true },
       { name: "buffered empty ZIP", body: Uint8Array.of(80, 75, 5, 6, ...Array(18).fill(0)) },
-      { name: "buffered mimetype-only ZIP without a hash", body: mimetypeOnly },
-      { name: "staged ZIP missing container.xml without a hash", body: noContainer, native: true },
-      { name: "buffered ZIP with a missing rootfile", body: noPackage },
-      { name: "staged ZIP with a traversing rootfile", body: traversal, native: true },
-      { name: "staged EPUB with the wrong mimetype", body: wrongMime, native: true },
+      {
+        name: "buffered mimetype-only ZIP without a hash",
+        body: epubFixture({ rootfile: "", opfPath: "" }),
+      },
+      {
+        name: "staged ZIP missing container.xml without a hash",
+        body: epubFixture({ rootfile: "" }),
+        native: true,
+      },
+      {
+        name: "buffered ZIP with a missing rootfile",
+        body: epubFixture({ rootfile: "OPS/missing.opf" }),
+      },
+      {
+        name: "staged ZIP with a traversing rootfile",
+        body: epubFixture({ rootfile: "../book.opf", opfPath: "../book.opf" }),
+        native: true,
+      },
+      {
+        name: "staged EPUB with the wrong mimetype",
+        body: epubFixture({ mime: "application/zip" }),
+        native: true,
+      },
+      { name: "EPUB without rootfile media-type", body: epubFixture({ rootfileMediaType: "" }) },
+      { name: "EPUB with an empty OPF", body: epubFixture({ opf: emptyOpf }), native: true },
+      {
+        name: "EPUB without metadata",
+        body: epubFixture({
+          opf: epubPackageXml.replace(/<metadata[^>]*>[\s\S]*?<\/metadata>/, ""),
+        }),
+      },
+      {
+        name: "EPUB with an empty manifest",
+        body: epubFixture({
+          opf: epubPackageXml.replace(/<manifest>[\s\S]*?<\/manifest>/, "<manifest/>"),
+        }),
+      },
+      {
+        name: "EPUB with an empty spine",
+        body: epubFixture({ opf: epubPackageXml.replace('<itemref idref="chapter"/>', "") }),
+      },
+      {
+        name: "EPUB with a dangling spine idref",
+        body: epubFixture({ opf: epubPackageXml.replace('idref="chapter"', 'idref="missing"') }),
+      },
+      {
+        name: "EPUB with a missing manifest resource",
+        body: epubFixture({ opf: epubPackageXml.replace('href="toc.ncx"', 'href="missing.ncx"') }),
+      },
+      { name: "EPUB with an empty chapter", body: epubFixture({ chapter: "" }) },
+      {
+        name: "EPUB with a traversing manifest href",
+        body: epubFixture({
+          opf: epubPackageXml.replace("./chapter%20one.xhtml", "%2e%2e/OPS/chapter%20one.xhtml"),
+        }),
+      },
+      {
+        name: "historical Deflate mimetype with an empty OPF",
+        body: epubFixture({ mimeLevel: 6, opf: emptyOpf }),
+      },
+      {
+        name: "historical Deflate mimetype with a complete OPF",
+        body: epubFixture({ mimeLevel: 6 }),
+        valid: true,
+      },
       { name: "buffered TXT", body: "<chapter> is the title.\n", ext: "txt", valid: true },
       {
         name: "staged native TXT",
@@ -534,7 +624,7 @@ describe("sync-files", () => {
       }) => {
         const localPath = `/appdata/books/book-1.${ext}`;
         const oldBytes = new Uint8Array([1, 2, 3]);
-        const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
+        const bytes = typeof body === "string" ? new TextEncoder().encode(body) : await body;
         const files = new Map([[localPath, oldBytes]]);
         mockAdapter.fileExists.mockImplementation(async (path: string) => files.has(path));
         mockAdapter.writeFileBytes.mockImplementation(
@@ -975,8 +1065,92 @@ describe("sync-files", () => {
       expect(backend.putJSON).not.toHaveBeenCalledWith(REMOTE_FILE_MANIFEST, expect.anything());
     });
 
+    it.each([false, true])(
+      "handles a legacy directory 404 during file scanning (HTML: %s)",
+      async (html) => {
+        const fetch = vi.fn((url: string, options?: FetchOptions) => {
+          const path = new URL(url).pathname;
+          if (options?.method === "GET")
+            return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
+          if (path === `/dav${REMOTE_FILES}/` || path === `/dav${REMOTE_COVERS}/`) {
+            return new Response(html ? "<html>Login</html>" : "Not Found", {
+              status: 404,
+              headers: { "Content-Type": html ? "text/html" : "text/plain" },
+            });
+          }
+          return davListing([path, true]);
+        });
+        setPlatformService({ fetch } as unknown as IPlatformService);
+        const sync = syncFiles(new WebDavBackend(config, "secret"));
+        if (html)
+          await expect(sync).rejects.toMatchObject({ kind: "unexpected-response", status: 404 });
+        else
+          await expect(sync).resolves.toMatchObject({
+            filesUploadFailed: 0,
+            filesDownloadFailed: 0,
+          });
+        expect(
+          fetch.mock.calls.filter(([, options]) => options?.method === "PROPFIND"),
+        ).toHaveLength(3);
+      },
+    );
+
+    it.each(["empty", "encoded child", "unverifiable", "new child"])(
+      "only deletes the former WebDAV collection after a successful MOVE and a confirmed empty listing (%s)",
+      async (remaining) => {
+        mockSelect.mockResolvedValue([
+          {
+            id: "book-1",
+            file_path: "books/book-1.epub",
+            title: "New Title",
+          },
+        ]);
+        let moved = false;
+        const root = `/dav${REMOTE_BOOKS_ROOT}/`;
+        const oldDir = `${root}Old%20Title-book-1/`;
+        const source = `${oldDir}Old%20Title.epub`;
+        const fetch = vi.fn((url: string, options?: FetchOptions) => {
+          const path = new URL(url).pathname;
+          switch (options?.method) {
+            case "GET":
+              return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
+            case "PROPFIND": {
+              if (path === root && options.headers?.Depth === "1")
+                return davListing([root, true], [oldDir, true]);
+              if (path !== oldDir) return davListing([path, true]);
+              if (moved && remaining === "unverifiable")
+                return new Response("<html>Login</html>", { status: 404 });
+              const entries: Array<[string, boolean]> = [[oldDir, true]];
+              if (!moved) entries.push([source, false]);
+              if (remaining === "encoded child") entries.push([`${oldDir}extra%2Fdata`, false]);
+              if (moved && remaining === "new child") entries.push([`${oldDir}new.txt`, false]);
+              return davListing(...entries);
+            }
+            case "MOVE":
+              expect(path).toBe(source);
+              moved = true;
+              return new Response(null, { status: 201 });
+            case "DELETE":
+              return new Response(null, { status: 204 });
+            case "PUT":
+              return new Response(null, { status: 201 });
+            default:
+              throw new Error(`Unexpected method ${options?.method}`);
+          }
+        });
+        setPlatformService({ fetch } as unknown as IPlatformService);
+        const backend = new WebDavBackend(config, "secret");
+        await syncFiles(backend, undefined, { disableUploads: true });
+        expect(moved).toBe(true);
+        const deletes = fetch.mock.calls.filter(([, options]) => options?.method === "DELETE");
+        expect(deletes.map(([url]) => new URL(url).pathname)).toEqual(
+          remaining === "empty" ? [oldDir.slice(0, -1)] : [],
+        );
+      },
+    );
+
     it.each([true, false])(
-      "deletes the old folder only when all files moved (all moved: %s)",
+      "checks for an empty old folder only when all files moved (all moved: %s)",
       async (allMoved) => {
         mockSelect.mockResolvedValue([
           {
@@ -1026,6 +1200,7 @@ describe("sync-files", () => {
             if (!allMoved && source.endsWith("epub"))
               throw new WebDavError("forbidden", "MOVE blocked", { status: 403 });
           }),
+          isDirectoryEmpty: vi.fn().mockResolvedValue(true),
           exists: vi
             .fn()
             .mockRejectedValue(new WebDavError("network", "Cannot verify destination")),
@@ -1042,8 +1217,13 @@ describe("sync-files", () => {
           `${oldDirPath}/Old Title.jpg`,
           `${REMOTE_BOOKS_ROOT}/New Title-book-1/New Title.jpg`,
         );
-        if (allMoved) expect(backend.delete).toHaveBeenCalledWith(oldDirPath);
-        else expect(backend.delete).not.toHaveBeenCalled();
+        if (allMoved) {
+          expect(backend.isDirectoryEmpty).toHaveBeenCalledWith(oldDirPath);
+          expect(backend.delete).toHaveBeenCalledWith(oldDirPath);
+        } else {
+          expect(backend.isDirectoryEmpty).not.toHaveBeenCalled();
+          expect(backend.delete).not.toHaveBeenCalled();
+        }
       },
     );
 

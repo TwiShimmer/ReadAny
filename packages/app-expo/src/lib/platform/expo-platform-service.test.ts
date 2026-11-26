@@ -1,6 +1,6 @@
-import { isDavMissingResponse } from "@readany/core/sync/dav-response";
-import { TextReader, Uint8ArrayWriter, ZipWriter } from "@zip.js/zip.js";
+import { isDavMissingCollectionProbe, isDavMissingResponse } from "@readany/core/sync/dav-response";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { epubFixture } from "../../../../core/src/sync/__tests__/epub-fixture";
 
 const { fetch, files, upload, url } = vi.hoisted(() => ({
   fetch: vi.fn<typeof globalThis.fetch>(),
@@ -131,10 +131,15 @@ describe("Expo WebDAV transport", () => {
     expect(await isDavMissingResponse(result)).toBe(true);
   });
 
+  it("preserves plain 404 on the Expo snapshot for collection probes only", async () => {
+    fetch.mockResolvedValueOnce(response(url, "Not Found", 404));
+    const result = await platform.fetch(url, { method: "PROPFIND", redirect: "error" });
+    expect(await isDavMissingCollectionProbe(result)).toBe(true);
+    expect(await isDavMissingResponse(result)).toBe(false);
+  });
+
   it("rejects an EPUB with only a mimetype entry", async () => {
-    const writer = new ZipWriter(new Uint8ArrayWriter());
-    await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
-    fetch.mockResolvedValueOnce(response(url, await writer.close()));
+    fetch.mockResolvedValueOnce(response(url, await epubFixture({ rootfile: "", opfPath: "" })));
 
     await expect(
       platform.downloadFile(url, "/books/staged.tmp", { rejectRedirects: true }),
@@ -169,16 +174,7 @@ describe("Expo WebDAV transport", () => {
   });
 
   it("writes a valid EPUB and rejects a truncated archive", async () => {
-    const writer = new ZipWriter(new Uint8ArrayWriter());
-    await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
-    await writer.add(
-      "META-INF/container.xml",
-      new TextReader(
-        '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
-      ),
-    );
-    await writer.add("book.opf", new TextReader("<package/>"));
-    const zip = await writer.close();
+    const zip = await epubFixture();
     fetch.mockResolvedValueOnce(response(url, zip));
     fetch.mockResolvedValueOnce(response(url, zip.subarray(0, 32)));
 
@@ -189,17 +185,8 @@ describe("Expo WebDAV transport", () => {
     ).rejects.toMatchObject({ status: 200 });
   });
 
-  it("validates deflated EPUB metadata without a native DecompressionStream", async () => {
-    const writer = new ZipWriter(new Uint8ArrayWriter(), { useWebWorkers: false });
-    await writer.add("mimetype", new TextReader("application/epub+zip"), { level: 0 });
-    await writer.add(
-      "META-INF/container.xml",
-      new TextReader(
-        '<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>',
-      ),
-    );
-    await writer.add("book.opf", new TextReader("<package/>"));
-    const bytes = await writer.close();
+  it("validates deflated EPUB metadata and mimetype without a native DecompressionStream", async () => {
+    const bytes = await epubFixture({ mimeLevel: 6 });
     fetch.mockResolvedValueOnce(response(url, bytes));
     vi.stubGlobal("DecompressionStream", undefined);
     const hermesPlatform = new ExpoPlatformService();

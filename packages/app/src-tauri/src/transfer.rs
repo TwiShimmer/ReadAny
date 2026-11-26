@@ -209,30 +209,62 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_mimetype_only_epub_zip() {
-        let zip = epub_fixture(false);
+        let zip = epub_fixture(false, false);
         let (result, _) = download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
         assert_eq!(result.unwrap_err().status, Some(200));
     }
 
-    fn epub_fixture(with_container: bool) -> Vec<u8> {
+    fn epub_fixture(with_container: bool, deflated_mime: bool) -> Vec<u8> {
+        // Raw Deflate of application/epub+zip. The native zip crate is built without a codec.
+        const DEFLATED: &[u8] = b"\x4b\x2c\x28\xc8\xc9\x4c\x4e\x2c\xc9\xcc\xcf\xd3\x4f\x2d\x28\x4d\xd2\xae\xca\x2c\x00\x00";
         let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
         zip.start_file("mimetype", options).unwrap();
-        zip.write_all(b"application/epub+zip").unwrap();
+        zip.write_all(if deflated_mime {
+            DEFLATED
+        } else {
+            b"application/epub+zip"
+        })
+        .unwrap();
         if with_container {
             zip.start_file("META-INF/container.xml", options).unwrap();
-            zip.write_all(br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OPS/book.opf"/></rootfiles></container>"#).unwrap();
+            zip.write_all(br#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="OPS/book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
             zip.start_file("OPS/book.opf", options).unwrap();
-            zip.write_all(br#"<package xmlns="http://www.idpf.org/2007/opf"/>"#)
-                .unwrap();
+            zip.write_all(br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">test</dc:identifier><dc:title>Book</dc:title><dc:language>en</dc:language><meta property="dcterms:modified">2026-01-01T00:00:00Z</meta></metadata>
+              <manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml" properties="nav"/></manifest>
+              <spine><itemref idref="chapter"/></spine></package>"#).unwrap();
+            zip.start_file("OPS/chapter.xhtml", options).unwrap();
+            zip.write_all(br#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Book</title></head><body><nav epub:type="toc"><ol><li><a href="chapter.xhtml">Chapter</a></li></ol></nav><p>Text</p></body></html>"#).unwrap();
         }
-        zip.finish().unwrap().into_inner()
+        let mut bytes = zip.finish().unwrap().into_inner();
+        if deflated_mime {
+            let central = zip::ZipArchive::new(std::io::Cursor::new(&bytes))
+                .unwrap()
+                .central_directory_start() as usize;
+            bytes[8..10].copy_from_slice(&8u16.to_le_bytes());
+            bytes[14..18].copy_from_slice(&0x2cab616fu32.to_le_bytes());
+            bytes[22..26].copy_from_slice(&20u32.to_le_bytes());
+            bytes[central + 10..central + 12].copy_from_slice(&8u16.to_le_bytes());
+            bytes[central + 16..central + 20].copy_from_slice(&0x2cab616fu32.to_le_bytes());
+            bytes[central + 24..central + 28].copy_from_slice(&20u32.to_le_bytes());
+        }
+        bytes
     }
 
     #[tokio::test]
     async fn stages_an_epub_with_a_container_and_package() {
-        let zip = epub_fixture(true);
+        let zip = epub_fixture(true, false);
+        let (result, bytes) =
+            download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
+        result.unwrap();
+        assert_eq!(bytes, zip);
+    }
+
+    #[tokio::test]
+    async fn stages_historical_epub_with_deflated_mimetype_for_shared_validation() {
+        let zip = epub_fixture(true, true);
         let (result, bytes) =
             download_fixture("epub", "200 OK", "application/epub+zip", &zip).await;
         result.unwrap();
