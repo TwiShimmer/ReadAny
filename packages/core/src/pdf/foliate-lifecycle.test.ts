@@ -161,6 +161,44 @@ describe("Foliate PDF document lifecycle", () => {
     expect(task.destroy).toHaveBeenCalledTimes(1);
   });
 
+  it("releases only pending XHRs owned by a closed asset URL PDF task", async () => {
+    class AssetRequest extends EventTarget {
+      abort = vi.fn();
+      url = "";
+
+      open(_method: string, url: string | URL) {
+        this.url = String(url);
+      }
+    }
+    vi.stubGlobal("XMLHttpRequest", AssetRequest);
+    const { createPDFLoadingTask } = await import("../../../foliate-js/pdf.js");
+    const url = "asset://localhost/reader.pdf";
+    const send = (url: string | URL) => {
+      const xhr = new AssetRequest();
+      xhr.open("GET", url);
+      expect(xhr.url).toBe("asset://localhost/reader.pdf");
+      return xhr;
+    };
+
+    createTask(Promise.resolve(createPdf()));
+    createTask(Promise.resolve(createPdf()));
+    const first = await createPDFLoadingTask({ url });
+    const second = await createPDFLoadingTask({ url });
+    const pending = send(getDocument.mock.calls[0][0].url);
+    const completed = send(getDocument.mock.calls[0][0].url);
+    completed.dispatchEvent(new Event("loadend"));
+    const other = send(getDocument.mock.calls[1][0].url);
+    const unrelated = send(url);
+
+    await Promise.all([first.destroy(), first.destroy()]);
+    expect(pending.abort).toHaveBeenCalledOnce();
+    expect(completed.abort).not.toHaveBeenCalled();
+    expect(other.abort).not.toHaveBeenCalled();
+    expect(unrelated.abort).not.toHaveBeenCalled();
+    await second.destroy();
+    expect(other.abort).toHaveBeenCalledOnce();
+  });
+
   it("terminates the native worker when opening is aborted before the handshake", async () => {
     const { configurePDFWorker, makePDF } = await import("../../../foliate-js/pdf.js");
     vi.stubGlobal("Worker", TrackedWorker);
@@ -222,7 +260,6 @@ describe("Foliate PDF document lifecycle", () => {
       const task = createTask(Promise.resolve(createPdf()));
       const transport = {
         messageHandler: { destroy: vi.fn() },
-        _networkStream: { cancelAllRequests: vi.fn() },
         commonObjs: { clear: vi.fn() },
         fontLoader: { clear: vi.fn() },
         filterFactory: { destroy: vi.fn() },
@@ -254,7 +291,6 @@ describe("Foliate PDF document lifecycle", () => {
       await closing;
       expect(activeWorkers.size).toBe(0);
       expect(loadingTask._transport).toBeNull();
-      expect(transport._networkStream.cancelAllRequests).toHaveBeenCalledOnce();
       expect(transport.fontLoader.clear).toHaveBeenCalledOnce();
       expect(task.destroy).toHaveBeenCalledOnce();
       expect(warning).toHaveBeenCalledOnce();

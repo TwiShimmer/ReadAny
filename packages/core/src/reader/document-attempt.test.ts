@@ -188,7 +188,7 @@ describe("reader view and document ownership", () => {
     expect(showError).not.toHaveBeenCalled();
   });
 
-  async function openFixedLayout() {
+  async function openFixedLayout({ pageCount = 3, reportInvalidLocation = vi.fn() } = {}) {
     const { FixedLayout } = await import("../../../foliate-js/fixed-layout.js");
     const { view, book, attempt, destroy, showError } = await openAttempt();
     const firstPage = controlledPromise<undefined>();
@@ -222,11 +222,12 @@ describe("reader view and document ownership", () => {
       rendition: { ...book.rendition, viewport: { width: 600, height: 800 } },
       resolveHref: (href: string) => ({ index: Number(href) }),
       reportRenderError: attempt.fail,
+      reportInvalidLocation,
       sections: [
         { id: 0, load: loadFirst },
         { id: 1, load: loadSecond },
         { id: 2, load: loadThird },
-      ],
+      ].slice(0, pageCount),
     });
     return {
       view,
@@ -270,6 +271,31 @@ describe("reader view and document ownership", () => {
     expect(loadFirst).toHaveBeenCalledExactlyOnceWith();
     expect(layout.index).toBe(-1);
   });
+
+  it.each(["epubcfi(/6/6)", "epubcfi(/6/3)", "epubcfi(/4/2)", "not-a-cfi"])(
+    "discards invalid fixed-layout position %s before rendering page one",
+    async (lastLocation) => {
+      const reportInvalidLocation = vi.fn();
+      const { view, layout, firstPage, loadFirst, loadThird, destroy, showError } =
+        await openFixedLayout({ pageCount: 1, reportInvalidLocation });
+      layout.setAttribute("spread", "none");
+      const diagnostic = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const initializing = view.init({ lastLocation });
+        await vi.waitFor(() => expect(loadFirst).toHaveBeenCalledOnce());
+        expect(reportInvalidLocation).toHaveBeenCalledExactlyOnceWith(lastLocation);
+        firstPage.resolve(undefined);
+        await initializing;
+        expect(layout.index).toBe(0);
+        expect(view.lastLocation.cfi).toBe("epubcfi(/6/2)");
+        expect(loadThird).not.toHaveBeenCalled();
+        expect(showError).not.toHaveBeenCalled();
+        expect(destroy).not.toHaveBeenCalled();
+      } finally {
+        diagnostic.mockRestore();
+      }
+    },
+  );
 
   it("blocks next and TOC navigation while restoring a later spread", async () => {
     const { view, layout, thirdPage, loadThird, loadFirst, loadSecond } = await openFixedLayout();

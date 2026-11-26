@@ -25,8 +25,12 @@ assert.ok(
   pdfChunk && configChunk && workerChunk && viewChunk,
   "Run pnpm --filter app build before this smoke test",
 );
+// Check the API version actually shipped in each build, not the lockfile.
+assert.match(await readFile(new URL(`assets/${pdfChunk}`, dist), "utf8"), /apiVersion:"5\.5\.207"/);
+const mobileSource = await readFile(mobileReader, "utf8");
+assert.match(mobileSource, /Promise\.withResolvers \?\?= function[\s\S]*apiVersion:"4\.10\.38"/);
 
-function makePdf(pages) {
+function makePdf(pages, padding = "") {
   const pageIds = pages.map((_, index) => `${4 + index * 2} 0 R`).join(" ");
   const objects = [
     "<< /Type /Catalog /Pages 2 0 R >>",
@@ -47,11 +51,13 @@ function makePdf(pages) {
     offsets.push(`${String(pdf.length).padStart(10, "0")} 00000 n \n`);
     pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
   }
+  pdf += padding;
   const xref = pdf.length;
   return `${pdf}xref\n0 ${offsets.length}\n${offsets.join("")}trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
 }
 
 const expectedText = "ReadAny production fallback";
+const rangePdf = Buffer.from(makePdf([expectedText], `%${" ".repeat(256 * 1024)}\n`));
 const page = `<!doctype html><meta charset="utf-8"><div id="root" hidden></div><script type="module">
   const mobileFrame = document.createElement("iframe");
   mobileFrame.src = "/mobile";
@@ -161,6 +167,27 @@ const page = `<!doctype html><meta charset="utf-8"><div id="root" hidden></div><
     await stalledBook.destroy();
     stalledTransports.push({ elapsed: performance.now() - startedClosing, active: activeWorkers.size });
 
+    const controller = new AbortController();
+    const rangeSource = { url: "/range.pdf", disableStream: true, disableAutoFetch: true };
+    const lost = withPdfDocument(rangeSource, () => {
+      throw new Error("The stalled URL PDF unexpectedly opened");
+    }, controller.signal).catch((error) => error.name);
+    await fetch("/range-ready/1", { signal: AbortSignal.timeout(5000) });
+    globalThis.Worker = TrackedWorker;
+    const healthy = withPdfDocument(rangeSource, async (pdf) => {
+      const { items } = await (await pdf.getPage(1)).getTextContent();
+      return items.map((item) => item.str ?? "").join("");
+    }).then((value) => value, (error) => ({ error: String(error) }));
+    await fetch("/range-ready/2", { signal: AbortSignal.timeout(5000) });
+    const concurrentActive = activeWorkers.size;
+    controller.abort();
+    const abortError = await lost;
+    const activeAfterAbort = activeWorkers.size;
+    const rangesClosed = await fetch("/range-closed").then((response) => response.json());
+    const healthyResult = await healthy;
+    const urlOutcome = { abortError, concurrentActive, activeAfterAbort, rangesClosed,
+      healthyResult, activeAfterClose: activeWorkers.size };
+
     globalThis.Worker = class extends EventTarget {
       constructor() { super(); activeWorkers.set(this, "no-ready"); }
       terminate() { activeWorkers.delete(this); }
@@ -194,7 +221,7 @@ const page = `<!doctype html><meta charset="utf-8"><div id="root" hidden></div><
     });
     result = {
       text, attempts, workerEvents: nativeLifecycle, openWorkerCounts, closedWorkerCounts,
-      pagesShown, firstPageError, stalledTransports, handshakeError, handshakeActive, unhandled,
+      pagesShown, firstPageError, stalledTransports, urlOutcome, handshakeError, handshakeActive, unhandled,
       patched: typeof Map.prototype.getOrInsertComputed === "function",
     };
   } catch (error) {
@@ -213,6 +240,7 @@ const mobileHarness = `<script type="module">
     type: "openBook", fileName, base64: btoa(${JSON.stringify(makePdf(["one", "two", "three"]))}),
     paginatedLayout: "single", ...extra,
   });
+  const openSinglePage = (fileName, extra) => open(fileName, { base64: btoa(${JSON.stringify(makePdf(["one"]))}), ...extra });
   const counts = { loaded: () => messages.filter(({ type }) => type === "loaded").length,
     views: () => document.querySelectorAll("foliate-view").length };
   const destroyed = [];
@@ -223,6 +251,7 @@ const mobileHarness = `<script type="module">
   const finishLateDestroy = Promise.withResolvers();
   const restoring = Promise.withResolvers();
   const finishRestore = Promise.withResolvers();
+  let failFirstPage = true;
   window.makeBook = async (file, options) => {
     const book = await make(file, options);
     const destroy = book.destroy;
@@ -237,6 +266,12 @@ const mobileHarness = `<script type="module">
     if (file.name === "late.pdf") {
       started.resolve();
       await late.promise;
+    }
+    if (file.name === "retry.pdf" && failFirstPage) {
+      const load = book.sections[0].load;
+      book.sections[0].load = async () => ({ ...await load(), onZoom: async () => {
+        throw new Error("Injected first canvas error after rejecting stale CFI");
+      } });
     }
     if (file.name === "restore.pdf") {
       const load = book.sections[2].load;
@@ -254,6 +289,23 @@ const mobileHarness = `<script type="module">
   };
   let result;
   try {
+    const staleCfi = "epubcfi(/6/6)";
+    await openSinglePage("single.pdf", { lastLocation: staleCfi });
+    const staleLocation = { loaded: counts.loaded(), index: view?.renderer.index,
+      cfi: messages.findLast(({ type }) => type === "relocate")?.cfi,
+      errors: messages.filter(({ type }) => type === "error").map(({ message }) => message) };
+    await openSinglePage("retry.pdf", { lastLocation: staleCfi });
+    const initialFailurePanel = document.querySelector("#loading:not(.hidden) .error-text")?.textContent;
+    const invalidCfi = messages.findLast(({ type }) => type === "invalidLastLocation")?.cfi;
+    const failedViews = counts.views();
+    failFirstPage = false;
+    messages.length = 0;
+    await openSinglePage("retry.pdf", { lastLocation: invalidCfi === staleCfi ? undefined : staleCfi });
+    const retry = { invalidCfi, initialFailurePanel, failedViews, loaded: counts.loaded(),
+      index: view?.renderer.index, errors: messages.filter(({ type }) => type === "error").length };
+    await currentOpen?.release();
+    messages.length = 0;
+    destroyed.length = 0;
     await open("first.pdf");
     await open("second.pdf");
     const consecutive = { loaded: counts.loaded(), views: counts.views(), destroyed: [...destroyed] };
@@ -272,7 +324,7 @@ const mobileHarness = `<script type="module">
     const afterRestore = { loaded: counts.loaded(), index: view.renderer.index };
     await handleCommand({ type: "goToHref", href: "1" });
     const panel = document.querySelector("#loading:not(.hidden) .error-text")?.textContent;
-    result = { consecutive, whileDestroying, whileRestoring, afterRestore, panel,
+    result = { staleLocation, retry, consecutive, whileDestroying, whileRestoring, afterRestore, panel,
       destroyed, views: counts.views(), unhandled };
   } catch (error) { result = { error: String(error), messages, destroyed, unhandled }; }
   await fetch("/mobile-result", { method: "POST", body: JSON.stringify(result) });
@@ -282,6 +334,9 @@ const { promise: result, resolve: report } = Promise.withResolvers();
 const { promise: mobileResult, resolve: reportMobile } = Promise.withResolvers();
 const reported = [];
 const workerFetchDestinations = [];
+const heldRanges = [];
+const rangeReady = [Promise.withResolvers(), Promise.withResolvers()];
+const firstRangeClosed = Promise.withResolvers();
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "POST" && ["/result", "/mobile-result"].includes(request.url)) {
@@ -292,10 +347,48 @@ const server = createServer(async (request, response) => {
       response.end();
     } else if (request.url === "/") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(page);
+    } else if (request.url === "/range.pdf") {
+      const [, start, end] = /^bytes=(\d+)-(\d+)$/.exec(request.headers.range ?? "") ?? [];
+      const headers = { "content-type": "application/pdf", "accept-ranges": "bytes" };
+      if (!start) {
+        response.writeHead(200, { ...headers, "content-length": rangePdf.length });
+        response.flushHeaders();
+      } else {
+        const slice = rangePdf.subarray(Number(start), Number(end) + 1);
+        response.writeHead(206, {
+          ...headers,
+          "content-length": slice.length,
+          "content-range": `bytes ${start}-${end}/${rangePdf.length}`,
+        });
+        if (start === "0" && heldRanges.length < 2) {
+          const index = heldRanges.length;
+          const held = { closed: false, finish: () => response.end(slice.subarray(16)) };
+          heldRanges.push(held);
+          response.once("close", () => {
+            held.closed = !response.writableFinished;
+            if (index === 0) firstRangeClosed.resolve();
+          });
+          response.write(slice.subarray(0, 16));
+          rangeReady[index].resolve();
+        } else response.end(slice);
+      }
+    } else if (request.url === "/range-ready/1" || request.url === "/range-ready/2") {
+      await rangeReady[Number(request.url.at(-1)) - 1].promise;
+      response.end();
+    } else if (request.url === "/range-closed") {
+      let timer;
+      await Promise.race([
+        firstRangeClosed.promise,
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, 1000);
+        }),
+      ]);
+      clearTimeout(timer);
+      response.end(JSON.stringify(heldRanges.map(({ closed }) => closed)));
+      heldRanges[1].finish();
     } else if (request.url === "/mobile") {
-      const reader = await readFile(mobileReader, "utf8");
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(
-        reader
+        mobileSource
           .replace(
             "<body>",
             `<body><script>window.ReactNativeWebView = {
@@ -361,6 +454,7 @@ try {
   console.log(`Production dist chunks: ${pdfChunk}, ${configChunk}, ${workerChunk}, ${viewChunk}`);
   console.log(`Worker lifecycle: ${JSON.stringify(outcome.workerEvents)}`);
   console.log(`Worker fetch destinations: ${JSON.stringify(workerFetchDestinations)}`);
+  console.log(`PDF URL range teardown: ${JSON.stringify(outcome.urlOutcome)}`);
   console.log(`Generated mobile reader: ${JSON.stringify(mobile)}`);
   assert.equal(outcome.error, undefined);
   const workerUrl = `/assets/${workerChunk}`;
@@ -386,6 +480,14 @@ try {
   assert.equal(outcome.stalledTransports.length, 1);
   assert.equal(outcome.stalledTransports[0].active, 0);
   assert.ok(outcome.stalledTransports[0].elapsed < 5000);
+  assert.deepEqual(outcome.urlOutcome, {
+    abortError: "AbortError",
+    concurrentActive: 2,
+    activeAfterAbort: 1,
+    rangesClosed: [true, false],
+    healthyResult: expectedText,
+    activeAfterClose: 0,
+  });
   assert.match(outcome.handshakeError, /PDF worker did not start in time/);
   assert.equal(outcome.handshakeActive, 0);
   assert.deepEqual(outcome.unhandled, []);
@@ -397,6 +499,15 @@ try {
     `Stalled transport: ${JSON.stringify(outcome.stalledTransports)}; no-ready: ${outcome.handshakeError}`,
   );
   assert.equal(mobile.error, undefined);
+  assert.deepEqual(mobile.staleLocation, { loaded: 1, index: 0, cfi: "epubcfi(/6/2)", errors: [] });
+  assert.deepEqual(mobile.retry, {
+    invalidCfi: "epubcfi(/6/6)",
+    initialFailurePanel: "Error: Injected first canvas error after rejecting stale CFI",
+    failedViews: 0,
+    loaded: 1,
+    index: 0,
+    errors: 0,
+  });
   assert.deepEqual(mobile.consecutive, { loaded: 2, views: 1, destroyed: ["first.pdf"] });
   assert.deepEqual(mobile.whileDestroying, { loaded: 2, views: 0 });
   assert.deepEqual(mobile.whileRestoring, { loaded: 2, index: -1 });
