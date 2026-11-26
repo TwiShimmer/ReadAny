@@ -26,7 +26,6 @@ export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => 
 
   if (workerSrc) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
-    // biome-ignore lint/performance/noDelete: remove the fake-worker hook entirely
     delete globalThis.pdfjsWorker;
   } else if (workerMessageHandler) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = "";
@@ -673,21 +672,32 @@ const loadPDFFromFile = async (file, signal) => {
   );
 };
 
-const loadPDFFromURL = (url) =>
+const loadPDFFromURL = (url, signal) =>
   createPDFLoadingTask({
     ...getPDFJSDocumentOptions(),
     url,
     rangeChunkSize: 65536,
     disableAutoFetch: true,
     disableStream: false,
-  });
+  }, signal);
+
+const WORKER_HANDSHAKE_MS = 3000;
+const LOADING_TASK_DESTROY_MS = 2500;
+
+class PDFWorkerHandshakeTimeout extends Error {
+  constructor() {
+    super("PDF worker did not start in time. Retry opening the PDF or restart the app.");
+  }
+}
 
 async function startNativeWorker(workerSrc, signal) {
   const worker = new Worker(workerSrc, { type: "module" });
   const listeners = new AbortController();
   const options = { signal: listeners.signal };
+  let timer;
   try {
     await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new PDFWorkerHandshakeTimeout()), WORKER_HANDSHAKE_MS);
       // PDF.js sends ready after installing its message handler on the worker port.
       worker.addEventListener(
         "message",
@@ -715,8 +725,38 @@ async function startNativeWorker(workerSrc, signal) {
     worker.terminate();
     throw error;
   } finally {
+    clearTimeout(timer);
     listeners.abort();
   }
+}
+
+// PDF.js 4.10.38 does not run the local half of WorkerTransport.destroy()
+// if Terminate never replies (or rejects). No public force-close API exists.
+function detachStalledTransport(task, worker, reason) {
+  const transport = task._transport;
+  task._transport = null;
+  task._worker = null;
+  task._capability?.reject(reason);
+  for (const handler of [worker?.messageHandler, transport?.messageHandler]) {
+    if (!handler) continue;
+    for (const callback of Object.values(handler.callbackCapabilities ?? {})) {
+      callback.reject(reason);
+    }
+    for (const stream of Object.values(handler.streamControllers ?? {})) {
+      if (!stream.isClosed) stream.controller.error(reason);
+      stream.startCall?.reject(reason);
+      stream.pullCall?.reject(reason);
+      stream.cancelCall?.reject(reason);
+    }
+  }
+  if (!transport) return;
+  transport.messageHandler?.destroy();
+  transport.messageHandler = null;
+  transport._networkStream?.cancelAllRequests(reason);
+  transport.commonObjs.clear();
+  transport.fontLoader.clear();
+  transport.filterFactory.destroy();
+  pdfjsLib.TextLayer?.cleanup();
 }
 
 export async function createPDFLoadingTask(source, signal) {
@@ -726,8 +766,9 @@ export async function createPDFLoadingTask(source, signal) {
     const { workerSrc } = pdfjsLib.GlobalWorkerOptions;
     try {
       nativeWorker = await startNativeWorker(workerSrc, signal);
-    } catch {
+    } catch (error) {
       signal?.throwIfAborted();
+      if (error instanceof PDFWorkerHandshakeTimeout) throw error;
       const { WorkerMessageHandler } = await import(/* @vite-ignore */ workerSrc);
       globalThis.pdfjsWorker ??= { WorkerMessageHandler };
     }
@@ -751,19 +792,40 @@ export async function createPDFLoadingTask(source, signal) {
     let teardown;
     const destroy = () =>
       (teardown ??= Promise.resolve().then(async () => {
+        let timer;
         try {
-          await task.destroy();
+          await Promise.race([
+            task.destroy(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("PDF transport did not terminate in time")),
+                LOADING_TASK_DESTROY_MS);
+            }),
+          ]);
         } catch (error) {
           console.warn("Failed to release PDF loading task:", error);
+          try {
+            detachStalledTransport(task, worker, error);
+          } catch (cleanupError) {
+            console.warn("Failed to detach PDF transport:", cleanupError);
+          }
         } finally {
-          destroyWorker();
+          clearTimeout(timer);
+          try {
+            destroyWorker();
+          } catch (error) {
+            console.warn("Failed to release PDF worker:", error);
+          }
         }
       }));
     return { task, destroy };
   } catch (error) {
     // getDocument can throw before attaching its own handler to worker.promise.
     worker?.promise.catch(() => {});
-    destroyWorker();
+    try {
+      destroyWorker();
+    } catch (cleanupError) {
+      console.warn("Failed to release PDF worker:", cleanupError);
+    }
     throw error;
   }
 }
@@ -822,8 +884,8 @@ export const makePDF = async (file, { signal } = {}) =>
  * pdf.js will use HTTP Range requests to lazily load pages on demand,
  * avoiding loading the entire file into memory upfront.
  */
-export const makePDFFromURL = async (url, fileName) =>
-  buildBookFromLoadingTask(await loadPDFFromURL(url), fileName);
+export const makePDFFromURL = async (url, fileName, { signal } = {}) =>
+  buildBookFromLoadingTask(await loadPDFFromURL(url, signal), fileName, signal);
 
 export const extractPDFChapters = async (file, options = {}) => {
   const { task, destroy } = await loadPDFFromFile(file);

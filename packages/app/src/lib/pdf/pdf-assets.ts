@@ -14,9 +14,9 @@ export function configurePdfAssets(): void {
       origin && origin !== "null"
         ? `${origin}${import.meta.env.BASE_URL}`
         : document.baseURI || window.location.href;
-    globalThis.__READANY_PDF_ASSET_BASE__ = new URL("vendor/pdfjs/", baseHref).href;
+    window.__READANY_PDF_ASSET_BASE__ = new URL("vendor/pdfjs/", baseHref).href;
   } catch (error) {
     console.warn("[pdf-assets] Failed to resolve bundled pdf.js assets:", error);
-    globalThis.__READANY_PDF_ASSET_BASE__ = undefined;
+    window.__READANY_PDF_ASSET_BASE__ = undefined;
   }
 }

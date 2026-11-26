@@ -36,13 +36,24 @@ export function ensurePdfWorker(): void {
 export async function withPdfDocument<T>(
   source: Parameters<typeof getDocument>[0],
   useDocument: (pdf: PDFDocumentProxy) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
+  signal?.throwIfAborted();
   ensurePdfWorker();
   const { task, destroy }: { task: PDFDocumentLoadingTask; destroy: () => Promise<void> } =
-    await createPDFLoadingTask(source);
+    await createPDFLoadingTask(source, signal);
+  const { promise: aborted, reject } = Promise.withResolvers<never>();
+  const abort = () => reject(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
   try {
-    return await useDocument(await task.promise);
+    const reading = task.promise.then((doc) => {
+      signal?.throwIfAborted();
+      return useDocument(doc);
+    });
+    if (signal?.aborted) abort();
+    return await (signal ? Promise.race([reading, aborted]) : reading);
   } finally {
+    signal?.removeEventListener("abort", abort);
     await destroy();
   }
 }
