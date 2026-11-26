@@ -147,11 +147,26 @@ export function clearBlobCache(): void {
   fileBlobCache.clear();
 }
 
-async function getCachedBlob(filePath: string): Promise<Blob> {
+// Disk reads and native dialogs have no cancellation API and do not own a BookDoc.
+// Stop waiting on abort, but don't race DocumentLoader.open: it may deliver a document.
+async function waitForReaderInput<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  const { promise, reject } = Promise.withResolvers<never>();
+  const abort = () => reject(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    return await Promise.race([Promise.resolve().then(read), promise]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+async function getCachedBlob(filePath: string, signal: AbortSignal): Promise<Blob> {
   const cached = fileBlobCache.get(filePath);
   if (cached) return cached;
 
-  const blob = await loadFileAsBlob(filePath);
+  const blob = await waitForReaderInput(() => loadFileAsBlob(filePath), signal);
+  signal.throwIfAborted();
 
   if (fileBlobCache.size >= MAX_CACHE_SIZE) {
     const firstKey = fileBlobCache.keys().next().value;
@@ -196,11 +211,11 @@ async function loadAndParseBook(
   filePath: string,
   signal: AbortSignal,
 ): Promise<{ bookDoc: BookDoc; format: BookFormat } | null> {
-  const blob = await getCachedBlob(filePath);
+  const blob = await getCachedBlob(filePath, signal);
   signal.throwIfAborted();
 
   const fileName = filePath.split("/").pop() || "book.epub";
-  if (!(await confirmLargePdfOpen(fileName, blob.size))) {
+  if (!(await waitForReaderInput(() => confirmLargePdfOpen(fileName, blob.size), signal))) {
     return null;
   }
   signal.throwIfAborted();
@@ -1079,14 +1094,13 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     };
   }, [flushLatestProgress]);
 
-  // Each attempt owns its PDF. The borrowed view closes synchronously on abort,
-  // before the attempt releases the PDF.js document and loading task.
+  // The borrowed view closes synchronously on abort, before the attempt releases its BookDoc.
   useEffect(() => {
     const filePath = book?.filePath;
     if (!filePath || !bookId) return;
     const {
       signal,
-      own,
+      load,
       release,
       fail: reportFailure,
     } = createDocumentAttempt((error) => {
@@ -1109,11 +1123,13 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         setIsLoading(true);
         setError(null);
         lastLoadErrorRef.current = null;
-        const parsed = await loadAndParseBook(filePath, signal);
-        if (parsed?.format === "PDF") await own(parsed.bookDoc);
+        const parsed = await load(
+          (signal) => loadAndParseBook(filePath, signal),
+          (result) => result?.bookDoc,
+        );
         if (signal.aborted) return;
         if (!parsed) {
-          void release();
+          await release();
           setIsLoading(false);
           toast.info(
             i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
@@ -1125,8 +1141,8 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         const doc = parsed.bookDoc;
         doc.renderSignal = signal;
         doc.reportRenderError = (error) => {
-          if (error instanceof DOMException && error.name === "AbortError") return;
-          void reportFailure(error);
+          if (signal.aborted) return;
+          return reportFailure(error);
         };
         setLoadedBook({ doc, bookId, filePath, attempt: loadAttempt, signal });
         setBookFormat(parsed.format);

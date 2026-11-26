@@ -53,7 +53,7 @@ export interface BookDoc {
   getCover(): Promise<Blob | null>;
   destroy?(): void | Promise<void>;
   renderSignal?: AbortSignal;
-  reportRenderError?(error: unknown): void;
+  reportRenderError?(error: unknown): void | Promise<void>;
 }
 
 /** File extension map */
