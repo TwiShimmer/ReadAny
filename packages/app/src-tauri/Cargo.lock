@@ -101,6 +101,7 @@ dependencies = [
  "tower-http",
  "uuid",
  "zerocopy",
+ "zip",
 ]
 
 [[package]]
