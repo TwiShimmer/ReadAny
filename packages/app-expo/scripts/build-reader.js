@@ -74,6 +74,7 @@ async function buildReader() {
     import { configurePDFWorker, extractPDFChapters, makePDFFromURL } from "${FOLIATE_DIR.replace(/\\/g, "/")}/pdf.js";
     import { WorkerMessageHandler } from "${normalizedWorkerPath}";
     import { installModernMapPolyfills } from "${normalizedModernMapPath}";
+    import { createDocumentAttempt } from "${CORE_READER.replace(/\\/g, "/")}/document-attempt";
 
     // The build guard pins pdf.js 4.x, but installing this keeps the mobile
     // reader safe if the dependency is deliberately raised to 5.x later.
@@ -84,6 +85,7 @@ async function buildReader() {
     configurePDFWorker({ workerMessageHandler: WorkerMessageHandler });
 
     window.makeBook = makeBook;
+    window._createDocumentAttempt = createDocumentAttempt;
     window.Overlayer = Overlayer;
     window.CFI = CFI;
 

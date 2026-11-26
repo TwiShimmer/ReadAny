@@ -129,9 +129,7 @@ export class FixedLayout extends HTMLElement {
     if (!currentSection) return;
     const target = this.getSpreadOf(currentSection);
     this.#index = -1;
-    this.goToSpread(target.index, target.side, "layout").catch((error) => {
-      this.#reportRenderError(error);
-    });
+    this.goToSpread(target.index, target.side, "layout").catch((error) => this.#reportRenderError(error));
   }
   async #createFrame({ index, src: srcOption }, signal) {
     signal.throwIfAborted();
@@ -253,9 +251,16 @@ export class FixedLayout extends HTMLElement {
     }
     if (renders.length) return Promise.all(renders);
   }
-  #reportRenderError(error) {
-    if (this.book.reportRenderError) this.book.reportRenderError(error);
-    else console.error("Failed to render fixed-layout page:", error);
+  async #reportRenderError(error) {
+    if (!this.book.reportRenderError) {
+      console.error("Failed to render fixed-layout page:", error);
+      return;
+    }
+    try {
+      await this.book.reportRenderError(error);
+    } catch (failure) {
+      console.error("Failed to report fixed-layout render error:", failure);
+    }
   }
   #refreshSpread() {
     const controller = this.#frameController;
@@ -266,7 +271,7 @@ export class FixedLayout extends HTMLElement {
       return;
     }
     this.#render()?.catch((error) => {
-      if (!controller.signal.aborted) this.#reportRenderError(error);
+      if (!controller.signal.aborted) return this.#reportRenderError(error);
     });
   }
   #clearFrames() {
@@ -362,7 +367,7 @@ export class FixedLayout extends HTMLElement {
     }
   }
   goToSpread(index, side, reason) {
-    if (this.#destroyed || !this.#spreads[index]) return Promise.resolve();
+    if (this.#destroyed || !this.#spreads[index]) return Promise.resolve(false);
     const pending = this.#pendingSpread;
     if (pending?.index === index) {
       pending.side = side;
@@ -374,11 +379,19 @@ export class FixedLayout extends HTMLElement {
       this.#side = this.#spreadSide(side);
       this.#refreshSpread();
       if (previousSide !== this.#side) this.#reportLocation(reason);
-      return Promise.resolve();
+      return Promise.resolve(true);
     }
     const load = { index, side, controller: new AbortController(), promise: undefined };
     this.#pendingSpread = load;
-    load.promise = Promise.resolve().then(() => this.#loadSpread(load, reason));
+    const { signal } = load.controller;
+    const cancelled = new Promise((resolve) => {
+      load.onAbort = () => resolve(false);
+      signal.addEventListener("abort", load.onAbort, { once: true });
+    });
+    load.promise = Promise.race([
+      Promise.resolve().then(() => this.#loadSpread(load, reason)),
+      cancelled,
+    ]).finally(() => signal.removeEventListener("abort", load.onAbort));
     return load.promise;
   }
   #cancelPendingSpread() {
@@ -412,14 +425,16 @@ export class FixedLayout extends HTMLElement {
         const right = await loadFrame(spread.right);
         await this.#showSpread({ left, right }, pending);
       }
-      if (signal.aborted) return;
+      if (signal.aborted) return false;
       this.#index = index;
       this.#pendingSpread = undefined;
       if (pending.refresh) this.#refreshSpread();
       this.#reportLocation(reason);
       this.#applySpreadChange();
+      return true;
     } catch (error) {
-      if (signal.aborted) return;
+      if (signal.aborted) return false;
+      signal.removeEventListener("abort", pending.onAbort);
       if (this.#pendingSpread === pending) this.#cancelPendingSpread();
       throw error;
     }
@@ -431,13 +446,13 @@ export class FixedLayout extends HTMLElement {
   async goTo(target, reason) {
     const { book } = this;
     const resolved = await target;
-    if (!resolved || typeof resolved.index !== "number") return;
+    if (!resolved || typeof resolved.index !== "number") return false;
     const section = book.sections[resolved.index];
-    if (!section) return;
+    if (!section) return false;
     const spread = this.getSpreadOf(section);
-    if (!spread) return;
+    if (!spread) return false;
     const { index, side } = spread;
-    await this.goToSpread(index, side, reason);
+    return this.goToSpread(index, side, reason);
   }
   async next() {
     const s = !this.#pendingSpread && (this.rtl ? this.#goLeft() : this.#goRight());
