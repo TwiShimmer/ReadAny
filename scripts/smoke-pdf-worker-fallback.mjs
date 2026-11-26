@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const dist = new URL("../packages/app/dist/", import.meta.url);
+const mobileReader = new URL("../packages/app-expo/assets/reader/reader.html", import.meta.url);
 const browser =
   process.env.READANY_PDF_SMOKE_BROWSER ||
   [
@@ -51,7 +52,11 @@ function makePdf(pages) {
 }
 
 const expectedText = "ReadAny production fallback";
-const page = `<!doctype html><meta charset="utf-8"><script type="module">
+const page = `<!doctype html><meta charset="utf-8"><div id="root" hidden></div><script type="module">
+  const mobileFrame = document.createElement("iframe");
+  mobileFrame.src = "/mobile";
+  Object.assign(mobileFrame.style, { width: "375px", height: "600px", position: "absolute", left: "650px" });
+  document.body.append(mobileFrame);
   const attempts = [];
   const workerEvents = [];
   let result;
@@ -61,6 +66,9 @@ const page = `<!doctype html><meta charset="utf-8"><script type="module">
     const openWorkerCounts = [];
     const closedWorkerCounts = [];
     const pagesShown = [];
+    const stalledTransports = [];
+    const unhandled = [];
+    addEventListener("unhandledrejection", (event) => unhandled.push(String(event.reason)));
     let firstPageError;
     class TrackedWorker extends Worker {
       constructor(url, options) {
@@ -141,6 +149,30 @@ const page = `<!doctype html><meta charset="utf-8"><script type="module">
       closedWorkerCounts.push(activeWorkers.size);
     }
 
+    const nativeLifecycle = workerEvents.slice();
+    globalThis.Worker = class extends TrackedWorker {
+      postMessage(message, ...args) {
+        if (message.action === "Terminate") return; // simulate a transport that never acknowledges
+        super.postMessage(message, ...args);
+      }
+    };
+    const stalledBook = await makePDF(new File([pdfSource], "stalled.pdf"));
+    const startedClosing = performance.now();
+    await stalledBook.destroy();
+    stalledTransports.push({ elapsed: performance.now() - startedClosing, active: activeWorkers.size });
+
+    globalThis.Worker = class extends EventTarget {
+      constructor() { super(); activeWorkers.set(this, "no-ready"); }
+      terminate() { activeWorkers.delete(this); }
+    };
+    let handshakeError;
+    try {
+      await withPdfDocument(new TextEncoder().encode(pdfSource), () => {
+        throw new Error("Stalled worker unexpectedly opened a PDF");
+      });
+    } catch (error) { handshakeError = error.message; }
+    const handshakeActive = activeWorkers.size;
+
     globalThis.Worker = class {
       constructor(url) {
         attempts.push(String(url));
@@ -161,7 +193,8 @@ const page = `<!doctype html><meta charset="utf-8"><script type="module">
       return items.map((item) => item.str ?? "").join("");
     });
     result = {
-      text, attempts, workerEvents, openWorkerCounts, closedWorkerCounts, pagesShown, firstPageError,
+      text, attempts, workerEvents: nativeLifecycle, openWorkerCounts, closedWorkerCounts,
+      pagesShown, firstPageError, stalledTransports, handshakeError, handshakeActive, unhandled,
       patched: typeof Map.prototype.getOrInsertComputed === "function",
     };
   } catch (error) {
@@ -170,17 +203,107 @@ const page = `<!doctype html><meta charset="utf-8"><script type="module">
   await fetch("/result", { method: "POST", body: JSON.stringify(result) });
 </script>`;
 
+const mobileHarness = `<script type="module">
+  const messages = [];
+  const unhandled = [];
+  addEventListener("unhandledrejection", (event) => unhandled.push(String(event.reason)));
+  // The bridge object must be installed before the template captures it.
+  window.captureReaderMessage = (json) => messages.push(JSON.parse(json));
+  const open = (fileName, extra) => handleCommand({
+    type: "openBook", fileName, base64: btoa(${JSON.stringify(makePdf(["one", "two", "three"]))}),
+    paginatedLayout: "single", ...extra,
+  });
+  const counts = { loaded: () => messages.filter(({ type }) => type === "loaded").length,
+    views: () => document.querySelectorAll("foliate-view").length };
+  const destroyed = [];
+  const make = window.makeBook;
+  const late = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  const lateDestroying = Promise.withResolvers();
+  const finishLateDestroy = Promise.withResolvers();
+  const restoring = Promise.withResolvers();
+  const finishRestore = Promise.withResolvers();
+  window.makeBook = async (file, options) => {
+    const book = await make(file, options);
+    const destroy = book.destroy;
+    book.destroy = async () => {
+      if (file.name === "late.pdf") {
+        lateDestroying.resolve();
+        await finishLateDestroy.promise;
+      }
+      await destroy();
+      destroyed.push(file.name);
+    };
+    if (file.name === "late.pdf") {
+      started.resolve();
+      await late.promise;
+    }
+    if (file.name === "restore.pdf") {
+      const load = book.sections[2].load;
+      book.sections[2].load = async () => {
+        restoring.resolve();
+        await finishRestore.promise;
+        return load();
+      };
+      const loadPage2 = book.sections[1].load;
+      book.sections[1].load = async () => ({ ...await loadPage2(), onZoom: async () => {
+        throw new Error("Injected later canvas error");
+      } });
+    }
+    return book;
+  };
+  let result;
+  try {
+    await open("first.pdf");
+    await open("second.pdf");
+    const consecutive = { loaded: counts.loaded(), views: counts.views(), destroyed: [...destroyed] };
+    const old = open("late.pdf");
+    await started.promise;
+    const replacement = open("restore.pdf", { lastLocation: "epubcfi(/6/6)" });
+    late.resolve();
+    await lateDestroying.promise;
+    const whileDestroying = { loaded: counts.loaded(), views: counts.views() };
+    finishLateDestroy.resolve();
+    await restoring.promise;
+    await handleCommand({ type: "goNext" });
+    const whileRestoring = { loaded: counts.loaded(), index: view.renderer.index };
+    finishRestore.resolve();
+    await Promise.all([old, replacement]);
+    const afterRestore = { loaded: counts.loaded(), index: view.renderer.index };
+    await handleCommand({ type: "goToHref", href: "1" });
+    const panel = document.querySelector("#loading:not(.hidden) .error-text")?.textContent;
+    result = { consecutive, whileDestroying, whileRestoring, afterRestore, panel,
+      destroyed, views: counts.views(), unhandled };
+  } catch (error) { result = { error: String(error), messages, destroyed, unhandled }; }
+  await fetch("/mobile-result", { method: "POST", body: JSON.stringify(result) });
+</script>`;
+
 const { promise: result, resolve: report } = Promise.withResolvers();
+const { promise: mobileResult, resolve: reportMobile } = Promise.withResolvers();
+const reported = [];
 const workerFetchDestinations = [];
 const server = createServer(async (request, response) => {
   try {
-    if (request.method === "POST" && request.url === "/result") {
+    if (request.method === "POST" && ["/result", "/mobile-result"].includes(request.url)) {
       let json = "";
       for await (const chunk of request) json += chunk;
-      report(JSON.parse(json));
+      reported.push(request.url);
+      (request.url === "/result" ? report : reportMobile)(JSON.parse(json));
       response.end();
     } else if (request.url === "/") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(page);
+    } else if (request.url === "/mobile") {
+      const reader = await readFile(mobileReader, "utf8");
+      response.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(
+        reader
+          .replace(
+            "<body>",
+            `<body><script>window.ReactNativeWebView = {
+          postMessage: (json) => window.captureReaderMessage?.(json)
+        };</script>`,
+          )
+          .replace(/<\/body>(?=\s*<\/html>\s*$)/, () => `${mobileHarness}</body>`),
+      );
     } else if (/^\/(assets|vendor\/pdfjs\/standard_fonts)\/[\w.-]+$/.test(request.url ?? "")) {
       const path = request.url.slice(1);
       const data = await readFile(new URL(path, dist));
@@ -221,14 +344,24 @@ try {
   });
   const deadline = new Promise((_, reject) => {
     timeout = setTimeout(
-      () => reject(new Error("Timed out waiting for PDF fallback result")),
+      () =>
+        reject(
+          new Error(
+            `Timed out waiting for PDF smoke results; received: ${reported.join(", ") || "none"}`,
+          ),
+        ),
       30_000,
     );
   });
-  const outcome = await Promise.race([result, browserExited, deadline]);
+  const [outcome, mobile] = await Promise.race([
+    Promise.all([result, mobileResult]),
+    browserExited,
+    deadline,
+  ]);
   console.log(`Production dist chunks: ${pdfChunk}, ${configChunk}, ${workerChunk}, ${viewChunk}`);
   console.log(`Worker lifecycle: ${JSON.stringify(outcome.workerEvents)}`);
   console.log(`Worker fetch destinations: ${JSON.stringify(workerFetchDestinations)}`);
+  console.log(`Generated mobile reader: ${JSON.stringify(mobile)}`);
   assert.equal(outcome.error, undefined);
   const workerUrl = `/assets/${workerChunk}`;
   assert.deepEqual(
@@ -250,10 +383,28 @@ try {
   );
   assert.equal(outcome.text, expectedText);
   assert.equal(outcome.patched, true);
+  assert.equal(outcome.stalledTransports.length, 1);
+  assert.equal(outcome.stalledTransports[0].active, 0);
+  assert.ok(outcome.stalledTransports[0].elapsed < 5000);
+  assert.match(outcome.handshakeError, /PDF worker did not start in time/);
+  assert.equal(outcome.handshakeActive, 0);
+  assert.deepEqual(outcome.unhandled, []);
   console.log(`First open displayed pages ${outcome.pagesShown.join(", ")}, in order.`);
   console.log(`Restoring page 1 propagated the canvas failure: ${outcome.firstPageError}`);
   console.log(`Production fallback (${workerChunk}) read page 1: ${outcome.text}`);
   console.log("Active workers returned to zero after 3 closes and 3 corrupt PDF retries.");
+  console.log(
+    `Stalled transport: ${JSON.stringify(outcome.stalledTransports)}; no-ready: ${outcome.handshakeError}`,
+  );
+  assert.equal(mobile.error, undefined);
+  assert.deepEqual(mobile.consecutive, { loaded: 2, views: 1, destroyed: ["first.pdf"] });
+  assert.deepEqual(mobile.whileDestroying, { loaded: 2, views: 0 });
+  assert.deepEqual(mobile.whileRestoring, { loaded: 2, index: -1 });
+  assert.deepEqual(mobile.afterRestore, { loaded: 3, index: 2 });
+  assert.match(mobile.panel, /Injected later canvas error/);
+  assert.deepEqual(mobile.destroyed, ["first.pdf", "second.pdf", "late.pdf", "restore.pdf"]);
+  assert.equal(mobile.views, 0);
+  assert.deepEqual(mobile.unhandled, []);
 } finally {
   clearTimeout(timeout);
   server.closeAllConnections();

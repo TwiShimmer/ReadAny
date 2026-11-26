@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDocumentAttempt } from "../reader/document-attempt";
 
 const getDocument = vi.fn();
 const workerOptions = { workerSrc: "" };
@@ -47,6 +48,7 @@ describe("Foliate PDF document lifecycle", () => {
       version: "4.0.0",
       getDocument,
       GlobalWorkerOptions: workerOptions,
+      TextLayer: { cleanup: vi.fn() },
       PDFWorker: class {
         destroy = destroyWorker;
       },
@@ -61,6 +63,7 @@ describe("Foliate PDF document lifecycle", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    vi.useRealTimers();
   });
 
   it("releases each loading task exactly once when its book is closed", async () => {
@@ -206,6 +209,74 @@ describe("Foliate PDF document lifecycle", () => {
     expect(destroyWorker).toHaveBeenCalledExactlyOnceWith();
     expect(activeWorkers.size).toBe(0);
     expect(warning).toHaveBeenCalledExactlyOnceWith("Failed to release PDF loading task:", failure);
+  });
+
+  it.each(["close", "hibernate", "render failure"])(
+    "forces worker and transport cleanup within the grace period on %s",
+    async (mode) => {
+      const { configurePDFWorker, makePDF } = await import("../../../foliate-js/pdf.js");
+      vi.stubGlobal("Worker", TrackedWorker);
+      configurePDFWorker({ workerSrc: "/pdf-worker.js" });
+      const started = Promise.withResolvers<EventTarget>();
+      TrackedWorker.created.mockImplementationOnce(started.resolve);
+      const task = createTask(Promise.resolve(createPdf()));
+      const transport = {
+        messageHandler: { destroy: vi.fn() },
+        _networkStream: { cancelAllRequests: vi.fn() },
+        commonObjs: { clear: vi.fn() },
+        fontLoader: { clear: vi.fn() },
+        filterFactory: { destroy: vi.fn() },
+      };
+      const loadingTask = Object.assign(task, { _transport: transport });
+      task.destroy.mockReturnValueOnce(new Promise(() => {}));
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const showError = vi.fn();
+      const attempt = createDocumentAttempt(showError);
+      const opening = attempt.load(
+        (signal) => makePDF(file, { signal }),
+        (book) => book,
+      );
+      const worker = await started.promise;
+      worker.dispatchEvent(
+        new MessageEvent("message", {
+          data: { sourceName: "worker", targetName: "main", action: "ready" },
+        }),
+      );
+      await opening;
+      vi.useFakeTimers();
+      const originalError = new Error("Second page failed to render");
+      // Close and hibernate both unmount the reader and call release().
+      const closing = mode === "render failure" ? attempt.fail(originalError) : attempt.release();
+      await vi.advanceTimersByTimeAsync(2499);
+      expect(activeWorkers.size).toBe(1);
+      expect(showError).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await closing;
+      expect(activeWorkers.size).toBe(0);
+      expect(loadingTask._transport).toBeNull();
+      expect(transport._networkStream.cancelAllRequests).toHaveBeenCalledOnce();
+      expect(transport.fontLoader.clear).toHaveBeenCalledOnce();
+      expect(task.destroy).toHaveBeenCalledOnce();
+      expect(warning).toHaveBeenCalledOnce();
+      if (mode === "render failure")
+        expect(showError).toHaveBeenCalledExactlyOnceWith(originalError);
+      else expect(showError).not.toHaveBeenCalled();
+    },
+  );
+
+  it("times out and terminates a worker that never handshakes without a signal", async () => {
+    const { configurePDFWorker, createPDFLoadingTask } = await import("../../../foliate-js/pdf.js");
+    vi.useFakeTimers();
+    vi.stubGlobal("Worker", TrackedWorker);
+    configurePDFWorker({ workerSrc: "/pdf-worker.js" });
+    const opening = createPDFLoadingTask(new Uint8Array([1]));
+    const failed = expect(opening).rejects.toThrow("PDF worker did not start in time");
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(activeWorkers.size).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await failed;
+    expect(activeWorkers.size).toBe(0);
+    expect(getDocument).not.toHaveBeenCalled();
   });
 
   it("does not create a loading task for an already cancelled open", async () => {
