@@ -22,6 +22,7 @@ import { canonicalBookCoverPath, canonicalBookFilePath } from "./local-book-path
 import type { ISyncBackend } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
 import type { FileSyncFailure, SyncProgress } from "./sync-types";
+import { syncErrorDiagnostic } from "./webdav-client";
 
 interface SyncTableConfig {
   name: string;
@@ -656,9 +657,7 @@ async function loadDeviceSyncIndex(backend: ISyncBackend): Promise<DeviceSyncInd
     }
     return index;
   } catch (error) {
-    console.warn(
-      `[SimpleSync] Failed to load remote device index: ${error instanceof Error ? error.message : String(error)}`,
-    );
+    console.warn("[SimpleSync] Failed to load remote device index:", syncErrorDiagnostic(error));
     return null;
   }
 }
@@ -695,7 +694,8 @@ export async function listRemoteDeviceFiles(
     );
   } catch (error) {
     console.warn(
-      `[SimpleSync] Failed to list remote device snapshots: ${error instanceof Error ? error.message : String(error)}`,
+      "[SimpleSync] Failed to list remote device snapshots:",
+      syncErrorDiagnostic(error),
     );
   }
 
@@ -728,7 +728,8 @@ async function saveDeviceSnapshot(
     );
   } catch (error) {
     console.warn(
-      `[SimpleSync] Failed to update remote device index (non-fatal): ${error instanceof Error ? error.message : String(error)}`,
+      "[SimpleSync] Failed to update remote device index (non-fatal):",
+      syncErrorDiagnostic(error),
     );
   }
 }
@@ -804,7 +805,8 @@ export async function runSimpleSync(
       } catch (e) {
         skippedRemoteSnapshots++;
         console.warn(
-          `[SimpleSync] Skipping unreadable remote snapshot from device ${deviceId}: ${e instanceof Error ? e.message : String(e)}`,
+          `[SimpleSync] Skipping unreadable remote snapshot from device ${deviceId}:`,
+          syncErrorDiagnostic(e),
         );
         continue;
       }
@@ -900,7 +902,10 @@ export async function runSimpleSync(
         await saveDeviceSnapshot(backend, localDeviceId, snapshotPayload);
         console.log("[SimpleSync] Uploaded merged snapshot after receive-only sync");
       } catch (e) {
-        console.warn("[SimpleSync] Failed to upload merged snapshot (non-fatal):", e);
+        console.warn(
+          "[SimpleSync] Failed to upload merged snapshot (non-fatal):",
+          syncErrorDiagnostic(e),
+        );
       }
     }
 
@@ -995,7 +1000,7 @@ export async function runSimpleSync(
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    console.error("[SimpleSync] Sync failed:", error);
+    console.error("[SimpleSync] Sync failed:", syncErrorDiagnostic(e));
     return {
       success: false,
       changes: 0,

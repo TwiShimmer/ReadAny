@@ -566,8 +566,14 @@ export class WebDavClient {
     }
     if (resp.status === 409) {
       const parent = getParentCollectionPath(collectionPath)?.parent;
-      if (parent && (await this.mkcolChain(parent, true)).created) {
-        return this.confirmCollection(collectionPath, await this.request("MKCOL", collectionPath));
+      if (parent) {
+        const { confirmed, created } = await this.mkcolChain(parent, true);
+        if (confirmed && created) {
+          return this.confirmCollection(
+            collectionPath,
+            await this.request("MKCOL", collectionPath),
+          );
+        }
       }
     }
     return this.confirmCollection(collectionPath, resp);

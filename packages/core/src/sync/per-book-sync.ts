@@ -48,7 +48,6 @@ import i18n from "../i18n";
 import { getPlatformService } from "../services/platform";
 import {
   applyChanges,
-  getLastSyncTimestamp,
   listRemoteDeviceFiles,
   localizeSyncedBookRecord,
   setLastSyncTimestamp,
@@ -60,6 +59,7 @@ import type { DeviceSyncPayload } from "./simple-sync";
 import type { ISyncBackend } from "./sync-backend";
 import type { SyncFilesOptions } from "./sync-files";
 import type { FileSyncFailure, SyncProgress } from "./sync-types";
+import { syncErrorDiagnostic } from "./webdav-client";
 
 export interface PerBookSyncOptions {
   receiveOnly?: boolean;
@@ -79,6 +79,7 @@ const SESSIONS_DIR = `${SYNC_ROOT}/sessions`;
 const CHAT_PULLED_DAY_KEY = "perbook:chat-pulled-day";
 const CHAT_MERGED_DAYS_KEY = "perbook:chat-merged-days";
 const CHAT_PUSHED_AT_KEY = "perbook:chat-pushed-at";
+const SESSIONS_PUSHED_AT_KEY = "perbook:sessions-pushed-at";
 
 const BOOK_LOCAL_EXCLUDED_COLUMNS = ["is_vectorized", "vectorize_progress"];
 const ANNOTATION_TABLES = ["highlights", "notes", "bookmarks"] as const;
@@ -165,7 +166,10 @@ export async function importLegacySnapshots(
           `applied=${result.applied}, skipped=${result.skipped}`,
       );
     } catch (error) {
-      console.warn(`[PerBookSync] Failed to import legacy snapshot from ${deviceId}:`, error);
+      console.warn(
+        `[PerBookSync] Failed to import legacy snapshot from ${deviceId}:`,
+        syncErrorDiagnostic(error),
+      );
     }
   }
 
@@ -609,7 +613,10 @@ export async function runPerBookSync(
       } catch (error) {
         // Flaky tunnels fail individual MKCOLs; per-file self-heal retries
         // later, so a missed directory must not abort the whole sync.
-        console.warn(`[PerBookSync] ensureDirectory ${dir} failed (continuing):`, error);
+        console.warn(
+          `[PerBookSync] ensureDirectory ${dir} failed (continuing):`,
+          syncErrorDiagnostic(error),
+        );
       }
     }
 
@@ -672,7 +679,10 @@ export async function runPerBookSync(
         await sleep(0);
       } catch (error) {
         _pullFailures++;
-        console.warn(`[PerBookSync] Failed to pull book ${bookId} (will retry next sync):`, error);
+        console.warn(
+          `[PerBookSync] Failed to pull book ${bookId} (will retry next sync):`,
+          syncErrorDiagnostic(error),
+        );
       }
     }
 
@@ -727,7 +737,7 @@ export async function runPerBookSync(
           _pushFailures++;
           console.warn(
             `[PerBookSync] Failed to push book ${bookId} (will retry next sync):`,
-            error,
+            syncErrorDiagnostic(error),
           );
         }
       }
@@ -932,12 +942,16 @@ export async function runPerBookSync(
 
     // 8. Reading sessions — monthly shards
     progress("同步阅读统计...");
-    const lastSync = legacyImported ? 0 : await getLastSyncTimestamp();
     const shardEntries = await backend.listDir(SESSIONS_DIR);
     if (!receiveOnly) {
+      // The legacy global cursor may already have skipped local sessions during download-only sync.
+      // Replay once rather than using it to initialize the independent upload cursor.
+      const pushedAt = legacyImported
+        ? 0
+        : Number((await getMetadata(SESSIONS_PUSHED_AT_KEY)) ?? 0);
       const changedSessions = await db.select<Row>(
         "SELECT * FROM reading_sessions WHERE updated_at > ?",
-        [lastSync],
+        [pushedAt],
       );
       const byMonth = new Map<string, Row[]>();
       for (const session of changedSessions) {
@@ -1054,6 +1068,7 @@ export async function runPerBookSync(
     }
 
     if (filesUploadFailed === 0 && filesDownloadFailed === 0) {
+      if (!receiveOnly) await setMetadata(SESSIONS_PUSHED_AT_KEY, String(syncStartedAt));
       await setLastSyncTimestamp(syncStartedAt);
     }
 
@@ -1078,7 +1093,7 @@ export async function runPerBookSync(
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    console.error("[PerBookSync] Sync failed:", error);
+    console.error("[PerBookSync] Sync failed:", syncErrorDiagnostic(e));
     return {
       success: false,
       changes: 0,
