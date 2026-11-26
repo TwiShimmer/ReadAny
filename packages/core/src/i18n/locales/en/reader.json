@@ -3,6 +3,22 @@
     "untitled": "Untitled",
     "loadingBook": "Loading book...",
     "failedToLoad": "Failed to load book",
+    "loadFailedMessage": "This book could not be opened. The file may be damaged or unsupported.",
+    "largePdf": {
+      "title": "Large PDF",
+      "message": "This PDF is {{size}}. Opening it may use a lot of memory and take a while. Open it anyway?",
+      "openAnyway": "Open anyway",
+      "cancelled": "Large PDF was not opened."
+    },
+    "errorBoundary": {
+      "title": "This page ran into a problem",
+      "description": "The book could not be displayed. Your reading progress and notes are safe.",
+      "appTitle": "ReadAny ran into a problem",
+      "appDescription": "The interface could not be displayed. Your library and notes are safe.",
+      "copyDiagnostics": "Copy diagnostics",
+      "copied": "Diagnostics copied",
+      "copyFailed": "Could not copy diagnostics"
+    },
     "validEpub": "Make sure the book file is a valid EPUB or PDF.",
     "noBookFile": "No book file available for book {{bookId}}",
     "reimportPromptTitle": "Book file missing",

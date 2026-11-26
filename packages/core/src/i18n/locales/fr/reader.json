@@ -3,6 +3,22 @@
     "untitled": "Sans titre",
     "loadingBook": "Chargement du livre...",
     "failedToLoad": "Échec du chargement du livre",
+    "loadFailedMessage": "Impossible d’ouvrir ce livre. Le fichier est peut-être endommagé ou non pris en charge.",
+    "largePdf": {
+      "title": "PDF volumineux",
+      "message": "Ce PDF fait {{size}}. L’ouvrir peut consommer beaucoup de mémoire et prendre du temps. L’ouvrir quand même ?",
+      "openAnyway": "Ouvrir quand même",
+      "cancelled": "Le PDF volumineux n’a pas été ouvert."
+    },
+    "errorBoundary": {
+      "title": "Un problème est survenu sur cette page",
+      "description": "Le livre n’a pas pu être affiché. Votre progression et vos notes sont conservées.",
+      "appTitle": "ReadAny a rencontré un problème",
+      "appDescription": "L’interface n’a pas pu être affichée. Votre bibliothèque et vos notes sont conservées.",
+      "copyDiagnostics": "Copier les diagnostics",
+      "copied": "Diagnostics copiés",
+      "copyFailed": "Impossible de copier les diagnostics"
+    },
     "validEpub": "Assurez-vous que le fichier est un EPUB ou PDF valide.",
     "noBookFile": "Aucun fichier disponible pour le livre {{bookId}}",
     "reimportPromptTitle": "Fichier du livre manquant",

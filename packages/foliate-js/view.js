@@ -93,7 +93,8 @@ const fetchFile = async (url) => {
   return new File([await res.blob()], new URL(res.url).pathname);
 };
 
-export const makeBook = async (file) => {
+export const makeBook = async (file, { signal } = {}) => {
+  signal?.throwIfAborted();
   if (typeof file === "string") file = await fetchFile(file);
   let book;
   if (file.isDirectory) {
@@ -118,7 +119,7 @@ export const makeBook = async (file) => {
     }
   } else if (await isPDF(file)) {
     const { makePDF } = await import("./pdf.js");
-    book = await makePDF(file);
+    book = await makePDF(file, { signal });
   } else {
     const { isMOBI, MOBI } = await import("./mobi.js");
     if (await isMOBI(file)) {
@@ -238,21 +239,71 @@ export class View extends HTMLElement {
   history = new History();
   constructor() {
     super();
-    this.history.addEventListener("popstate", ({ detail }) => {
-      const resolved = this.resolveNavigation(detail.state);
-      this.renderer.goTo(resolved);
+    this.history.addEventListener("popstate", async ({ detail }) => {
+      try {
+        await this.#navigate((renderer) => renderer.goTo(this.resolveNavigation(detail.state)));
+      } catch (error) {
+        console.error("Failed to restore reader history:", error);
+      }
     });
   }
+  #renderController;
+  #detachAbort;
+  #closed = false;
+  #fixedLayoutReady = false;
+
+  disconnectedCallback() {
+    if (this.#detachAbort) this.close();
+  }
+
   async open(book) {
     if (typeof book === "string" || typeof book.arrayBuffer === "function" || book.isDirectory)
       book = await makeBook(book);
+    if (this.#renderController) this.close();
+    const ownerSignal = book.renderSignal;
+    const controller = new AbortController();
+    const { signal } = controller;
+    this.#renderController = controller;
+    this.#closed = false;
+    const closeView = () => {
+      try {
+        this.close();
+      } finally {
+        this.remove();
+      }
+    };
+    let finishOnClose;
+    const closed = new Promise((resolve) => {
+      finishOnClose = () => resolve();
+    });
+    signal.addEventListener("abort", finishOnClose, { once: true });
+    try {
+      ownerSignal?.throwIfAborted();
+      if (ownerSignal) {
+        ownerSignal.addEventListener("abort", closeView, { once: true });
+        this.#detachAbort = () => ownerSignal.removeEventListener("abort", closeView);
+      }
+      await Promise.race([this.#open(book, signal), closed]);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (this.#renderController === controller && !this.#closed) closeView();
+      throw error;
+    } finally {
+      signal.removeEventListener("abort", finishOnClose);
+    }
+  }
+
+  async #open(book, signal) {
     this.book = book;
     this.language = languageInfo(book.metadata?.language);
 
     if (book.splitTOCHref && book.getTOCFragment) {
       const ids = book.sections.map((s) => s.id);
       this.#sectionProgress = new SectionProgress(book.sections, 1500, 1600);
-      const splitHref = book.splitTOCHref.bind(book);
+      const splitHref = (href) => {
+        signal.throwIfAborted();
+        return book.splitTOCHref(href);
+      };
       const getFragment = book.getTOCFragment.bind(book);
       this.#tocProgress = new TOCProgress();
       await this.#tocProgress.init({
@@ -261,6 +312,7 @@ export class View extends HTMLElement {
         splitHref,
         getFragment,
       });
+      signal.throwIfAborted();
       this.#pageProgress = new TOCProgress();
       await this.#pageProgress.init({
         toc: book.pageList ?? [],
@@ -268,14 +320,17 @@ export class View extends HTMLElement {
         splitHref,
         getFragment,
       });
+      signal.throwIfAborted();
     }
 
     this.isFixedLayout = this.book.rendition?.layout === "pre-paginated";
     if (this.isFixedLayout) {
       await import("./fixed-layout.js");
+      signal.throwIfAborted();
       this.renderer = document.createElement("foliate-fxl");
     } else {
       await import("./paginator.js");
+      signal.throwIfAborted();
       this.renderer = document.createElement("foliate-paginator");
     }
     this.renderer.setAttribute("exportparts", "head,foot,filter");
@@ -314,8 +369,19 @@ export class View extends HTMLElement {
     }
   }
   close() {
-    this.renderer?.destroy();
-    this.renderer?.remove();
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#fixedLayoutReady = false;
+    this.#renderController?.abort();
+    this.#detachAbort?.();
+    this.#detachAbort = undefined;
+    const renderer = this.renderer;
+    this.renderer = null;
+    try {
+      renderer?.destroy();
+    } finally {
+      renderer?.remove();
+    }
     this.#sectionProgress = null;
     this.#tocProgress = null;
     this.#pageProgress = null;
@@ -332,15 +398,45 @@ export class View extends HTMLElement {
     );
   }
   async init({ lastLocation, showTextStart }) {
+    const signal = this.#renderController?.signal;
+    signal?.throwIfAborted();
+    if (this.isFixedLayout) {
+      this.#fixedLayoutReady = false;
+      let resolved;
+      if (lastLocation != null && lastLocation !== "") {
+        resolved = await this.resolveNavigation(lastLocation);
+        signal?.throwIfAborted();
+        if (!Number.isSafeInteger(resolved?.index) || !this.book.sections[resolved.index]) {
+          console.warn("[Reader] Ignoring an invalid saved fixed-layout position", {
+            index: resolved?.index,
+            sectionCount: this.book.sections.length,
+          });
+          this.book.reportInvalidLocation?.(lastLocation);
+          resolved = null;
+        }
+      }
+      const start = showTextStart ? this.book.sections.findIndex((s) => s.linear !== "no") : 0;
+      const displayed = await this.renderer.goTo(
+        resolved ?? { index: Math.max(start, 0) },
+        resolved ? undefined : "page",
+      );
+      signal?.throwIfAborted();
+      if (displayed === false) throw new Error("The initial fixed-layout page was not displayed");
+      this.history.pushState(resolved ? lastLocation : Math.max(start, 0));
+      this.#fixedLayoutReady = true;
+      return;
+    }
     const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null;
     if (resolved) {
       await this.renderer.goTo(resolved);
+      signal?.throwIfAborted();
       this.history.pushState(lastLocation);
     } else if (showTextStart) await this.goToTextStart();
     else {
       this.history.pushState(0);
       await this.next();
     }
+    signal?.throwIfAborted();
   }
   #emit(name, detail, cancelable) {
     return this.dispatchEvent(new CustomEvent(name, { detail, cancelable }));
@@ -493,7 +589,10 @@ export class View extends HTMLElement {
     if (this.book.resolveCFI) return this.book.resolveCFI(cfi);
 
     const parts = CFI.parse(cfi);
-    const index = CFI.fake.toIndex((parts.parent ?? parts).shift());
+    const base = (parts.parent ?? parts).shift();
+    if (this.isFixedLayout && (base?.length !== 2 || base[0].index !== 6)) return undefined;
+    const index = CFI.fake.toIndex(base);
+    if (this.isFixedLayout && (!Number.isSafeInteger(index) || index < 0)) return undefined;
     const anchor = (doc) => CFI.toRange(doc, parts);
     return { index, anchor };
   }
@@ -512,10 +611,14 @@ export class View extends HTMLElement {
     }
   }
   async goTo(target) {
-    target = decodeURIComponent(target);
-    const resolved = this.resolveNavigation(target);
+    if (typeof target === "string") target = decodeURIComponent(target);
+    let resolved;
     try {
-      await this.renderer.goTo(resolved);
+      const displayed = await this.#navigate((renderer) => {
+        resolved = this.resolveNavigation(target);
+        return renderer.goTo(resolved);
+      });
+      if (!displayed) return;
       this.history.pushState(target);
       return resolved;
     } catch (e) {
@@ -524,15 +627,19 @@ export class View extends HTMLElement {
     }
   }
   async goToFraction(frac) {
-    const [index, anchor] = this.#sectionProgress.getSection(frac);
-    await this.renderer.goTo({ index, anchor });
-    this.history.pushState({ fraction: frac });
+    const displayed = await this.#navigate((renderer) => {
+      const [index, anchor] = this.#sectionProgress.getSection(frac);
+      return renderer.goTo({ index, anchor });
+    });
+    if (displayed) this.history.pushState({ fraction: frac });
   }
   async select(target) {
     try {
-      const obj = await this.resolveNavigation(target);
-      await this.renderer.goTo({ ...obj, select: true });
-      this.history.pushState(target);
+      const displayed = await this.#navigate(async (renderer) => {
+        const obj = await this.resolveNavigation(target);
+        return renderer.goTo({ ...obj, select: true });
+      });
+      if (displayed) this.history.pushState(target);
     } catch (e) {
       console.error(e);
       console.error(`Could not go to ${target}`);
@@ -564,11 +671,24 @@ export class View extends HTMLElement {
       console.error(`Could not get ${target}`);
     }
   }
+  async #navigate(action) {
+    if (!this.renderer || (this.isFixedLayout && !this.#fixedLayoutReady)) return false;
+    const signal = this.#renderController?.signal;
+    try {
+      return (await action(this.renderer)) !== false && !signal?.aborted;
+    } catch (error) {
+      if (signal?.aborted) return false;
+      if (!this.isFixedLayout) throw error;
+      if (this.book.reportRenderError) await this.book.reportRenderError(error);
+      else console.error("Failed to render fixed-layout page:", error);
+      return false;
+    }
+  }
   async prev(distance) {
-    await this.renderer.prev(distance);
+    await this.#navigate((renderer) => renderer.prev(distance));
   }
   async next(distance) {
-    await this.renderer.next(distance);
+    await this.#navigate((renderer) => renderer.next(distance));
   }
   goLeft() {
     return this.book.dir === "rtl" ? this.next() : this.prev();

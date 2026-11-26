@@ -4,20 +4,58 @@
  * Uses PDF.js TextLayer for text selection support.
  */
 import * as pdfjsLib from "pdfjs-dist";
-import { WorkerMessageHandler } from "pdfjs-dist/build/pdf.worker.mjs";
+import { ownPDFURL } from "./pdf-url.js";
 
-globalThis.pdfjsWorker ??= { WorkerMessageHandler };
+/**
+ * Explicit host contract for pdf.js runtime configuration.
+ *
+ * foliate-js is bundled by different hosts (Vite app, esbuild React Native
+ * reader). It must not guess a worker or asset location at import time:
+ *  - desktop passes `workerSrc` for the bundled, polyfilled worker;
+ *  - the React Native reader passes `workerMessageHandler` for its main-thread
+ *    fake worker (and may leave workerSrc unset).
+ *
+ * Each realm chooses its mode before opening a PDF. PDF.js caches its
+ * fake-worker handler, so clearing the global cannot switch a running realm
+ * back to real workers.
+ */
+let pdfWorkerMode;
+export const configurePDFWorker = ({ workerSrc, workerMessageHandler } = {}) => {
+  const mode = workerSrc ? "worker" : workerMessageHandler ? "handler" : undefined;
+  if (!mode || mode === pdfWorkerMode) return;
+  if (pdfWorkerMode) throw new Error("PDF worker mode is already configured for this realm");
 
-// Configure PDF.js worker — always set to match the API version
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
-const PDFJS_CDN_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}`;
-const PDFJS_DOCUMENT_OPTIONS = {
-  useWorkerFetch: false,
-  isEvalSupported: false,
-  useSystemFonts: true,
-  cMapUrl: `${PDFJS_CDN_BASE}/cmaps/`,
-  cMapPacked: true,
-  standardFontDataUrl: `${PDFJS_CDN_BASE}/standard_fonts/`,
+  if (workerSrc) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc;
+    delete globalThis.pdfjsWorker;
+  } else if (workerMessageHandler) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "";
+    globalThis.pdfjsWorker ??= { WorkerMessageHandler: workerMessageHandler };
+  }
+  pdfWorkerMode = mode;
+};
+
+const DEFAULT_PDFJS_ASSET_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${pdfjsLib.version}/`;
+
+// Runtime-injected asset base: the desktop app points this at its bundled
+// `vendor/pdfjs/` copy. Do not use import.meta.env here because this module is also
+// bundled into an esbuild IIFE for the mobile reader.
+const getPDFJSAssetBase = () => {
+  const configured = globalThis.__READANY_PDF_ASSET_BASE__;
+  if (typeof configured !== "string" || !configured) return DEFAULT_PDFJS_ASSET_BASE;
+  return configured.endsWith("/") ? configured : `${configured}/`;
+};
+
+const getPDFJSDocumentOptions = () => {
+  const assetBase = getPDFJSAssetBase();
+  return {
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+    cMapUrl: `${assetBase}cmaps/`,
+    cMapPacked: true,
+    standardFontDataUrl: `${assetBase}standard_fonts/`,
+  };
 };
 
 // Inline text_layer_builder CSS
@@ -486,7 +524,7 @@ const render = async (page, doc, zoom) => {
 /**
  * Render a single PDF page and return src/onZoom for the fixed-layout renderer.
  */
-const renderPage = async (page) => {
+const renderPage = (page) => {
   const viewport = page.getViewport({ scale: 1 });
 
   const data = `<!DOCTYPE html>
@@ -603,22 +641,226 @@ const createPageTextDocument = async (page, pageNumber) => {
 
 const fakePageCfi = (pageIndex) => `epubcfi(/6/${(pageIndex + 1) * 2})`;
 
-const loadPDFFromFile = async (file) => {
-  const arrayBuffer = await file.arrayBuffer();
-  return pdfjsLib.getDocument({
-    ...PDFJS_DOCUMENT_OPTIONS,
-    data: new Uint8Array(arrayBuffer),
-  }).promise;
+// The text cache holds detached documents for search. HTML page URLs instead
+// live only while a pending spread or displayed iframe holds a lease.
+const PAGE_TEXT_CACHE_LIMIT = 16;
+
+const readCachedPage = (cache, key) => {
+  const cached = cache.get(key);
+  if (cached === undefined) return undefined;
+  // Refresh insertion order so this is a small LRU rather than FIFO.
+  cache.delete(key);
+  cache.set(key, cached);
+  return cached;
 };
 
-const loadPDFFromURL = async (url) =>
-  pdfjsLib.getDocument({
-    ...PDFJS_DOCUMENT_OPTIONS,
+const writeCachedPage = (cache, key, value, limit) => {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+};
+
+const loadPDFFromFile = async (file, signal) => {
+  signal?.throwIfAborted();
+  const arrayBuffer = await file.arrayBuffer();
+  return createPDFLoadingTask(
+    { ...getPDFJSDocumentOptions(), data: new Uint8Array(arrayBuffer) },
+    signal,
+  );
+};
+
+const loadPDFFromURL = (url, signal) =>
+  createPDFLoadingTask({
+    ...getPDFJSDocumentOptions(),
     url,
     rangeChunkSize: 65536,
     disableAutoFetch: true,
     disableStream: false,
-  }).promise;
+  }, signal);
+
+const WORKER_HANDSHAKE_MS = 3000;
+const LOADING_TASK_DESTROY_MS = 2500;
+
+class PDFWorkerHandshakeTimeout extends Error {
+  constructor() {
+    super("PDF worker did not start in time. Retry opening the PDF or restart the app.");
+  }
+}
+
+async function startNativeWorker(workerSrc, signal) {
+  const worker = new Worker(workerSrc, { type: "module" });
+  const listeners = new AbortController();
+  const options = { signal: listeners.signal };
+  let timer;
+  try {
+    await new Promise((resolve, reject) => {
+      timer = setTimeout(() => reject(new PDFWorkerHandshakeTimeout()), WORKER_HANDSHAKE_MS);
+      // PDF.js sends ready after installing its message handler on the worker port.
+      worker.addEventListener(
+        "message",
+        ({ data }) => {
+          if (data?.sourceName === "worker" && data.targetName === "main" && data.action === "ready")
+            resolve();
+        },
+        options,
+      );
+      worker.addEventListener(
+        "error",
+        (event) => {
+          event.preventDefault();
+          reject(new Error(event.message || "PDF worker failed to start"));
+        },
+        options,
+      );
+      const abort = () => reject(signal.reason);
+      signal?.addEventListener("abort", abort, options);
+      if (signal?.aborted) abort();
+    });
+    signal?.throwIfAborted();
+    return worker;
+  } catch (error) {
+    worker.terminate();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    listeners.abort();
+  }
+}
+
+// PDF.js does not run the local half of WorkerTransport.destroy()
+// if Terminate never replies (or rejects). No public force-close API exists.
+function detachStalledTransport(task, worker, reason) {
+  const transport = task._transport;
+  task._transport = null;
+  task._worker = null;
+  task._capability?.reject(reason);
+  for (const handler of [worker?.messageHandler, transport?.messageHandler]) {
+    if (!handler) continue;
+    for (const callback of Object.values(handler.callbackCapabilities ?? {})) {
+      callback.reject(reason);
+    }
+    for (const stream of Object.values(handler.streamControllers ?? {})) {
+      if (!stream.isClosed) stream.controller.error(reason);
+      stream.startCall?.reject(reason);
+      stream.pullCall?.reject(reason);
+      stream.cancelCall?.reject(reason);
+    }
+  }
+  if (!transport) return;
+  transport.messageHandler?.destroy();
+  transport.messageHandler = null;
+  transport.commonObjs.clear();
+  transport.fontLoader.clear();
+  transport.filterFactory.destroy();
+  pdfjsLib.TextLayer?.cleanup();
+}
+
+export async function createPDFLoadingTask(source, signal) {
+  signal?.throwIfAborted();
+  let nativeWorker;
+  if (pdfWorkerMode === "worker" && !globalThis.pdfjsWorker?.WorkerMessageHandler) {
+    const { workerSrc } = pdfjsLib.GlobalWorkerOptions;
+    try {
+      nativeWorker = await startNativeWorker(workerSrc, signal);
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (error instanceof PDFWorkerHandshakeTimeout) throw error;
+      const { WorkerMessageHandler } = await import(/* @vite-ignore */ workerSrc);
+      globalThis.pdfjsWorker ??= { WorkerMessageHandler };
+    }
+  }
+
+  let worker;
+  let ownedURL;
+  const releaseOwnedResources = () => {
+    try {
+      ownedURL?.close();
+    } finally {
+      try {
+        worker?.destroy();
+      } finally {
+        nativeWorker?.terminate();
+      }
+    }
+  };
+  try {
+    signal?.throwIfAborted();
+    let options = source;
+    if (typeof source === "string" || source instanceof URL) options = { url: source };
+    else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) options = { data: source };
+    if (options?.url && !options.data && !options.range) {
+      ownedURL = ownPDFURL(options.url);
+      options = { ...options, url: ownedURL.url };
+    }
+    worker = new pdfjsLib.PDFWorker({ port: nativeWorker, verbosity: options?.verbosity });
+    const task = pdfjsLib.getDocument({ ...options, worker });
+    let teardown;
+    const destroy = () =>
+      (teardown ??= Promise.resolve().then(async () => {
+        let timer;
+        try {
+          await Promise.race([
+            task.destroy(),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error("PDF transport did not terminate in time")),
+                LOADING_TASK_DESTROY_MS);
+            }),
+          ]);
+        } catch (error) {
+          console.warn("Failed to release PDF loading task:", error);
+          try {
+            detachStalledTransport(task, worker, error);
+          } catch (cleanupError) {
+            console.warn("Failed to detach PDF transport:", cleanupError);
+          }
+        } finally {
+          clearTimeout(timer);
+          try {
+            releaseOwnedResources();
+          } catch (error) {
+            console.warn("Failed to release PDF URL or worker:", error);
+          }
+        }
+      }));
+    return { task, destroy };
+  } catch (error) {
+    // getDocument can throw before attaching its own handler to worker.promise.
+    worker?.promise.catch(() => {});
+    try {
+      releaseOwnedResources();
+    } catch (cleanupError) {
+      console.warn("Failed to release PDF URL or worker:", cleanupError);
+    }
+    throw error;
+  }
+}
+
+async function buildBookFromLoadingTask({ task, destroy }, fileName, signal) {
+  // PDF.js may abandon its loading promise after destroy(), so abort must
+  // also settle our own wait, even when the worker handshake is still pending.
+  let abort;
+  const aborted = new Promise((_, reject) => {
+    abort = () => reject(signal.reason);
+  });
+  signal?.addEventListener("abort", abort, { once: true });
+  try {
+    const building = task.promise.then((pdf) => {
+      signal?.throwIfAborted();
+      return _buildPDFBook(pdf, fileName, destroy);
+    });
+    if (signal?.aborted) abort();
+    return await (signal ? Promise.race([building, aborted]) : building);
+  } catch (error) {
+    await destroy();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", abort);
+  }
+}
 
 const makeTOCItem = async (item, pdf) => {
   let pageIndex = undefined;
@@ -643,26 +885,23 @@ const makeTOCItem = async (item, pdf) => {
 /**
  * Create a foliate-js compatible book object from a PDF file
  */
-export const makePDF = async (file) => {
-  const pdf = await loadPDFFromFile(file);
-  return _buildPDFBook(pdf, file.name);
-};
+export const makePDF = async (file, { signal } = {}) =>
+  buildBookFromLoadingTask(await loadPDFFromFile(file, signal), file.name, signal);
 
 /**
  * Create a foliate-js compatible book object from a PDF URL with Range support.
  * pdf.js will use HTTP Range requests to lazily load pages on demand,
  * avoiding loading the entire file into memory upfront.
  */
-export const makePDFFromURL = async (url, fileName) => {
-  const pdf = await loadPDFFromURL(url);
-  return _buildPDFBook(pdf, fileName);
-};
+export const makePDFFromURL = async (url, fileName, { signal } = {}) =>
+  buildBookFromLoadingTask(await loadPDFFromURL(url, signal), fileName, signal);
 
 export const extractPDFChapters = async (file, options = {}) => {
-  const pdf = await loadPDFFromFile(file);
+  const { task, destroy } = await loadPDFFromFile(file);
   const chapters = [];
 
   try {
+    const pdf = await task.promise;
     for (let i = 0; i < pdf.numPages; i++) {
       const pageNumber = i + 1;
       const page = await pdf.getPage(pageNumber);
@@ -684,13 +923,13 @@ export const extractPDFChapters = async (file, options = {}) => {
       });
     }
   } finally {
-    await pdf.destroy();
+    await destroy();
   }
 
   return chapters;
 };
 
-async function _buildPDFBook(pdf, fileName) {
+async function _buildPDFBook(pdf, fileName, destroy) {
   const numPages = pdf.numPages;
   const firstPage = await pdf.getPage(1);
   const viewport = firstPage.getViewport({ scale: 1 });
@@ -726,23 +965,55 @@ async function _buildPDFBook(pdf, fileName) {
   }
 
   // Sections - one per page
-  const cache = new Map();
+  const pageLoads = new Map();
   const textDocumentCache = new Map();
+  let destroyed = false;
+
+  async function acquirePage(index) {
+    if (destroyed) throw new Error("PDF book is closed");
+    let load = pageLoads.get(index);
+    if (!load) {
+      const entry = { users: 0, src: undefined, promise: undefined };
+      entry.promise = pdf.getPage(index + 1).then((page) => {
+        if (destroyed) throw new Error("PDF book is closed");
+        const result = renderPage(page);
+        entry.src = result.src;
+        return result;
+      });
+      pageLoads.set(index, entry);
+      load = entry;
+    }
+    load.users++;
+
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      if (--load.users !== 0) return;
+      pageLoads.delete(index);
+      if (load.src) URL.revokeObjectURL(load.src);
+    };
+
+    try {
+      const page = await load.promise;
+      if (destroyed) throw new Error("PDF book is closed");
+      return { ...page, release };
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
   book.sections = Array.from({ length: numPages }, (_, i) => ({
     id: i,
-    load: async () => {
-      const cached = cache.get(i);
-      if (cached) return cached;
-      const result = await renderPage(await pdf.getPage(i + 1));
-      cache.set(i, result);
-      return result;
-    },
+    load: () => acquirePage(i),
     createDocument: async () => {
-      const cached = textDocumentCache.get(i);
-      if (cached) return cached.cloneNode(true);
+      const cached = readCachedPage(textDocumentCache, i);
+      if (cached !== undefined) return cached.cloneNode(true);
 
       const doc = await createPageTextDocument(await pdf.getPage(i + 1), i + 1);
-      textDocumentCache.set(i, doc);
+      if (destroyed) throw new Error("PDF book is closed");
+      writeCachedPage(textDocumentCache, i, doc, PAGE_TEXT_CACHE_LIMIT);
       return doc.cloneNode(true);
     },
     size: 1000,
@@ -768,7 +1039,7 @@ async function _buildPDFBook(pdf, fileName) {
       const index = await pdf.getPageIndex(dest[0]);
       return { index };
     } catch {
-      return { index: 0 };
+      return undefined;
     }
   };
   book.splitTOCHref = async (href) => {
@@ -785,7 +1056,11 @@ async function _buildPDFBook(pdf, fileName) {
   };
   book.getTOCFragment = (doc) => doc.documentElement;
   book.getCover = async () => renderPageAsBlob(await pdf.getPage(1));
-  book.destroy = () => pdf.destroy();
+  book.destroy = () => {
+    destroyed = true;
+    textDocumentCache.clear();
+    return destroy();
+  };
 
   return book;
 }

@@ -1,0 +1,341 @@
+import { describe, expect, it } from "vitest";
+import {
+  findMissingMapUpsertApis,
+  installMapUpsertPolyfill,
+  installModernMapPolyfills,
+  installWeakMapUpsertPolyfill,
+} from "./modern-map";
+
+/**
+ * Fresh Map-like constructors per test. Sharing one prototype across tests
+ * would leak an earlier install into later "missing method" assertions.
+ */
+function createMapClass() {
+  return class FakeMap<K, V> {
+    #data = new Map<K, V>();
+
+    get size(): number {
+      return this.#data.size;
+    }
+
+    has(key: K): boolean {
+      return this.#data.has(key);
+    }
+
+    get(key: K): V | undefined {
+      return this.#data.get(key);
+    }
+
+    set(key: K, value: V): this {
+      this.#data.set(key, value);
+      return this;
+    }
+
+    delete(key: K): boolean {
+      return this.#data.delete(key);
+    }
+  };
+}
+
+function createWeakMapClass() {
+  return class FakeWeakMap<K extends object, V> {
+    #data = new WeakMap<K, V>();
+
+    has(key: K): boolean {
+      return this.#data.has(key);
+    }
+
+    get(key: K): V | undefined {
+      return this.#data.get(key);
+    }
+
+    set(key: K, value: V): this {
+      this.#data.set(key, value);
+      return this;
+    }
+
+    delete(key: K): boolean {
+      return this.#data.delete(key);
+    }
+  };
+}
+
+const ctorOf = (value: unknown) => value as { prototype: object };
+
+describe("installMapUpsertPolyfill", () => {
+  it("installs both methods on a constructor that lacks them", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+
+    expect(typeof map.getOrInsert).toBe("function");
+    expect(typeof map.getOrInsertComputed).toBe("function");
+  });
+
+  it("returns the existing value and does not overwrite it", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+    map.set("a", 1);
+
+    expect(map.getOrInsert("a", 2)).toBe(1);
+    expect(map.get("a")).toBe(1);
+  });
+
+  it("inserts and returns the default value for a missing key", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+
+    expect(map.getOrInsert("b", 7)).toBe(7);
+    expect(map.get("b")).toBe(7);
+  });
+
+  it("uses SameValueZero key matching for NaN and -0", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<number, string>();
+    map.set(Number.NaN, "nan");
+    map.set(-0, "zero");
+
+    expect(map.getOrInsertComputed(Number.NaN, () => "other")).toBe("nan");
+    expect(map.getOrInsert(0, "other")).toBe("zero");
+  });
+
+  it("computes only on a miss and passes the key", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, string>();
+    const seen: string[] = [];
+
+    const first = map.getOrInsertComputed("x", (key) => {
+      seen.push(key);
+      return `value-${key}`;
+    });
+    const second = map.getOrInsertComputed("x", (key) => {
+      seen.push(key);
+      return "unexpected";
+    });
+
+    expect(first).toBe("value-x");
+    expect(second).toBe("value-x");
+    expect(seen).toEqual(["x"]);
+  });
+
+  it("calls the callback with an undefined receiver", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+    let receiver: unknown = "not-called";
+
+    map.getOrInsertComputed("x", function (this: unknown) {
+      receiver = this;
+      return 1;
+    });
+
+    expect(receiver).toBeUndefined();
+  });
+
+  it("rejects a non-callable callback before looking up the key", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+    map.set("present", 1);
+
+    expect(() =>
+      (
+        map as unknown as {
+          getOrInsertComputed(key: string, callback: unknown): number;
+        }
+      ).getOrInsertComputed("present", 42),
+    ).toThrow(TypeError);
+  });
+
+  it("rejects an incompatible receiver", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const prototype = FakeMap.prototype as unknown as {
+      getOrInsert(this: unknown, key: string, value: number): number;
+      getOrInsertComputed(this: unknown, key: string, callback: () => number): number;
+    };
+
+    expect(() => prototype.getOrInsert.call({}, "a", 1)).toThrow(TypeError);
+    expect(() => prototype.getOrInsertComputed.call({}, "a", () => 1)).toThrow(TypeError);
+  });
+
+  it("does not overwrite a native implementation", () => {
+    const FakeMap = createMapClass();
+    const nativeGetOrInsert = () => "native";
+    Object.defineProperty(FakeMap.prototype, "getOrInsert", {
+      value: nativeGetOrInsert,
+      configurable: true,
+      writable: true,
+    });
+
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+
+    const map = new FakeMap<string, number>();
+    expect(map.getOrInsert).toBe(nativeGetOrInsert);
+  });
+
+  it("is idempotent", () => {
+    const FakeMap = createMapClass();
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+    const map = new FakeMap<string, number>();
+    const first = map.getOrInsert;
+
+    installMapUpsertPolyfill(ctorOf(FakeMap));
+
+    expect(map.getOrInsert).toBe(first);
+  });
+});
+
+describe("installWeakMapUpsertPolyfill", () => {
+  it("rejects an invalid key before calling the callback", () => {
+    const FakeWeakMap = createWeakMapClass();
+    installWeakMapUpsertPolyfill(ctorOf(FakeWeakMap));
+    const map = new FakeWeakMap<object, number>();
+    let calls = 0;
+    const callback = () => ++calls;
+
+    for (const key of [42, null, undefined, Symbol.for("registered")]) {
+      expect(() => Reflect.apply(map.getOrInsertComputed, map, [key, callback])).toThrow(TypeError);
+    }
+    expect(calls).toBe(0);
+  });
+
+  it("installs both methods and reuses existing values", () => {
+    const FakeWeakMap = createWeakMapClass();
+    installWeakMapUpsertPolyfill(ctorOf(FakeWeakMap));
+    const key = {};
+    const map = new FakeWeakMap<object, string>();
+    map.set(key, "existing");
+
+    expect(map.getOrInsert(key, "new")).toBe("existing");
+    expect(
+      map.getOrInsertComputed(key, () => {
+        throw new Error("callback should not run");
+      }),
+    ).toBe("existing");
+  });
+
+  it("computes and stores a missing key once", () => {
+    const FakeWeakMap = createWeakMapClass();
+    installWeakMapUpsertPolyfill(ctorOf(FakeWeakMap));
+    const key = {};
+    const map = new FakeWeakMap<object, number>();
+    let calls = 0;
+
+    expect(
+      map.getOrInsertComputed(key, () => {
+        calls += 1;
+        return 3;
+      }),
+    ).toBe(3);
+    expect(map.getOrInsertComputed(key, () => 4)).toBe(3);
+    expect(calls).toBe(1);
+  });
+});
+
+describe("installModernMapPolyfills", () => {
+  it("reports installed and skipped methods", () => {
+    const FakeMap = createMapClass();
+    const FakeWeakMap = createWeakMapClass();
+    const result = installModernMapPolyfills(ctorOf(FakeMap), ctorOf(FakeWeakMap));
+
+    expect(result.installed).toEqual([
+      "Map.getOrInsert",
+      "Map.getOrInsertComputed",
+      "WeakMap.getOrInsert",
+      "WeakMap.getOrInsertComputed",
+    ]);
+    expect(result.skipped).toEqual([]);
+    expect(result.missing).toEqual([]);
+
+    const second = installModernMapPolyfills(ctorOf(FakeMap), ctorOf(FakeWeakMap));
+    expect(second.installed).toEqual([]);
+    expect(second.skipped).toEqual([
+      "Map.getOrInsert",
+      "Map.getOrInsertComputed",
+      "WeakMap.getOrInsert",
+      "WeakMap.getOrInsertComputed",
+    ]);
+    expect(second.missing).toEqual([]);
+  });
+
+  it("reports missing (not installed) when the prototype is frozen", () => {
+    const FakeMap = createMapClass();
+    const FakeWeakMap = createWeakMapClass();
+    Object.freeze(FakeMap.prototype);
+
+    const result = installModernMapPolyfills(ctorOf(FakeMap), ctorOf(FakeWeakMap));
+
+    expect(result.installed).toEqual(["WeakMap.getOrInsert", "WeakMap.getOrInsertComputed"]);
+    expect(result.missing).toEqual(["Map.getOrInsert", "Map.getOrInsertComputed"]);
+    expect(findMissingMapUpsertApis(ctorOf(FakeMap), ctorOf(FakeWeakMap))).toEqual([
+      "Map.getOrInsert",
+      "Map.getOrInsertComputed",
+    ]);
+  });
+
+  it("installs on the real globals, stays idempotent, and restores them", () => {
+    const mapMethods = ["getOrInsert", "getOrInsertComputed"] as const;
+    const weakMapMethods = ["getOrInsert", "getOrInsertComputed"] as const;
+    const savedMap = new Map(
+      mapMethods.map(
+        (name) => [name, Object.getOwnPropertyDescriptor(Map.prototype, name)] as const,
+      ),
+    );
+    const savedWeakMap = new Map(
+      weakMapMethods.map(
+        (name) => [name, Object.getOwnPropertyDescriptor(WeakMap.prototype, name)] as const,
+      ),
+    );
+
+    try {
+      for (const name of mapMethods) delete (Map.prototype as Record<string, unknown>)[name];
+      for (const name of weakMapMethods)
+        delete (WeakMap.prototype as Record<string, unknown>)[name];
+
+      const result = installModernMapPolyfills();
+      expect(result.missing).toEqual([]);
+      expect(new Map([["a", 1]]).getOrInsert("a", 2)).toBe(1);
+      expect(new Map<string, number>().getOrInsertComputed("b", () => 3)).toBe(3);
+
+      const installedRef = Map.prototype.getOrInsertComputed;
+      installModernMapPolyfills();
+      expect(Map.prototype.getOrInsertComputed).toBe(installedRef);
+    } finally {
+      for (const name of mapMethods) {
+        const descriptor = savedMap.get(name);
+        if (descriptor) Object.defineProperty(Map.prototype, name, descriptor);
+        else delete (Map.prototype as Record<string, unknown>)[name];
+      }
+      for (const name of weakMapMethods) {
+        const descriptor = savedWeakMap.get(name);
+        if (descriptor) Object.defineProperty(WeakMap.prototype, name, descriptor);
+        else delete (WeakMap.prototype as Record<string, unknown>)[name];
+      }
+    }
+  });
+
+  it("finds missing APIs on an unpatched constructor", () => {
+    const FakeMap = createMapClass();
+    const FakeWeakMap = createWeakMapClass();
+
+    expect(findMissingMapUpsertApis(ctorOf(FakeMap), ctorOf(FakeWeakMap))).toEqual([
+      "Map.getOrInsert",
+      "Map.getOrInsertComputed",
+      "WeakMap.getOrInsert",
+      "WeakMap.getOrInsertComputed",
+    ]);
+  });
+
+  it("reports no missing APIs once installed", () => {
+    const FakeMap = createMapClass();
+    const FakeWeakMap = createWeakMapClass();
+    installModernMapPolyfills(ctorOf(FakeMap), ctorOf(FakeWeakMap));
+
+    expect(findMissingMapUpsertApis(ctorOf(FakeMap), ctorOf(FakeWeakMap))).toEqual([]);
+  });
+});

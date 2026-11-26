@@ -17,10 +17,12 @@ import { ReadSettingsPanel } from "@/components/settings/ReadSettings";
 import { useReadingSession } from "@/hooks/use-reading-session";
 import { useResizablePanel } from "@/hooks/use-resizable-panel";
 import { useResolvedSrc } from "@/hooks/use-resolved-src";
+import { copyErrorDiagnostics } from "@/lib/diagnostics";
 import { hasSeenReaderTour, startReaderTour } from "@/lib/reader-tour";
 import { DocumentLoader } from "@/lib/reader/document-loader";
 import type { BookDoc, BookFormat } from "@/lib/reader/document-loader";
 import { isFixedLayoutBook } from "@/lib/reader/document-loader";
+import { confirmLargePdfOpen } from "@/lib/reader/large-pdf-guard";
 import { resolveDesktopDataPath } from "@/lib/storage/desktop-library-root";
 import { useAnnotationStore } from "@/stores/annotation-store";
 import { useAppStore } from "@/stores/app-store";
@@ -31,6 +33,8 @@ import { useReaderStore } from "@/stores/reader-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useTTSStore } from "@/stores/tts-store";
 import { useChapterTranslation } from "@readany/core/hooks";
+import i18n from "@readany/core/i18n";
+import { createDocumentAttempt } from "@readany/core/reader/document-attempt";
 import { getPlatformService } from "@readany/core/services";
 import { getCSSFontFace, useFontStore, useReadingSessionStore } from "@readany/core/stores";
 import { useRubyStore } from "@readany/core/stores/ruby-store";
@@ -143,11 +147,26 @@ export function clearBlobCache(): void {
   fileBlobCache.clear();
 }
 
-async function getCachedBlob(filePath: string): Promise<Blob> {
+// Disk reads and native dialogs have no cancellation API and do not own a BookDoc.
+// Stop waiting on abort, but don't race DocumentLoader.open: it may deliver a document.
+async function waitForReaderInput<T>(read: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  const { promise, reject } = Promise.withResolvers<never>();
+  const abort = () => reject(signal.reason);
+  signal.addEventListener("abort", abort, { once: true });
+  try {
+    return await Promise.race([Promise.resolve().then(read), promise]);
+  } finally {
+    signal.removeEventListener("abort", abort);
+  }
+}
+
+async function getCachedBlob(filePath: string, signal: AbortSignal): Promise<Blob> {
   const cached = fileBlobCache.get(filePath);
   if (cached) return cached;
 
-  const blob = await loadFileAsBlob(filePath);
+  const blob = await waitForReaderInput(() => loadFileAsBlob(filePath), signal);
+  signal.throwIfAborted();
 
   if (fileBlobCache.size >= MAX_CACHE_SIZE) {
     const firstKey = fileBlobCache.keys().next().value;
@@ -190,19 +209,23 @@ function getAdjacentTTSSectionIndex(
  */
 async function loadAndParseBook(
   filePath: string,
-): Promise<{ bookDoc: BookDoc; format: BookFormat }> {
-  console.log("[loadAndParseBook] start, filePath:", filePath);
-  const blob = await getCachedBlob(filePath);
-  console.log("[loadAndParseBook] blob loaded, size:", blob.size);
+  signal: AbortSignal,
+): Promise<{ bookDoc: BookDoc; format: BookFormat } | null> {
+  const blob = await getCachedBlob(filePath, signal);
+  signal.throwIfAborted();
 
   const fileName = filePath.split("/").pop() || "book.epub";
+  if (!(await waitForReaderInput(() => confirmLargePdfOpen(fileName, blob.size), signal))) {
+    return null;
+  }
+  signal.throwIfAborted();
+
   const file = new File([blob], fileName, {
     type: blob.type || "application/octet-stream",
   });
 
   const loader = new DocumentLoader(file);
-  const { book, format } = await loader.open();
-  console.log("[loadAndParseBook] parsed, format:", format, "sections:", book.sections?.length);
+  const { book, format } = await loader.open(signal);
   return { bookDoc: book, format };
 }
 
@@ -583,8 +606,9 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     Map<string, { cfi: string; hasNote: boolean; color?: HighlightColor }>
   >(new Map());
 
-  // Reset rendered highlights tracking when book changes
+  // Reset rendered highlights tracking when the reader switches books.
   useEffect(() => {
+    if (!bookId) return;
     renderedHighlightsRef.current.clear();
     setFoliateReady(false);
     setTranslationReady(false);
@@ -761,11 +785,28 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [highlights, foliateReady, bookId]);
 
   // Book document state
-  const [bookDoc, setBookDoc] = useState<BookDoc | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const invalidLocationRef = useRef<{ bookId: string; cfi: string } | null>(null);
+  const [loadedBook, setLoadedBook] = useState<{
+    doc: BookDoc;
+    bookId: string;
+    filePath: string;
+    attempt: number;
+    signal: AbortSignal;
+  } | null>(null);
+  const bookDoc =
+    loadedBook &&
+    loadedBook.bookId === bookId &&
+    loadedBook.attempt === loadAttempt &&
+    loadedBook.filePath === book?.filePath
+      ? loadedBook.doc
+      : null;
   const [bookFormat, setBookFormat] = useState<BookFormat>("EPUB");
   const isFixedLayout = isFixedLayoutBook(bookFormat, bookDoc);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Full error object stays out of the UI but is available to "Copy diagnostics".
+  const lastLoadErrorRef = useRef<unknown>(null);
 
   useEffect(() => {
     currentSectionTotalRef.current = currentSectionTotal ?? bookDoc?.sections?.length ?? null;
@@ -936,7 +977,6 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [bookId, resetReaderTTSState]);
 
   const { t } = useTranslation();
-  const isInitializedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const ttsCoverSrc = useResolvedSrc(book?.meta.coverUrl);
 
@@ -1055,31 +1095,72 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     };
   }, [flushLatestProgress]);
 
-  // --- Load book on mount ---
+  // The borrowed view closes synchronously on abort, before the attempt releases its BookDoc.
   useEffect(() => {
-    if (!book?.filePath || isInitializedRef.current) return;
-    isInitializedRef.current = true;
+    const filePath = book?.filePath;
+    if (!filePath || !bookId) return;
+    const {
+      signal,
+      load,
+      release,
+      fail: reportFailure,
+    } = createDocumentAttempt((error) => {
+      setLoadedBook(null);
+      setFoliateReady(false);
+      setTranslationReady(false);
+      console.error("[ReaderView] Failed to open book:", error);
+      lastLoadErrorRef.current = error;
+      setError(
+        i18n.t("reader.loadFailedMessage", {
+          defaultValue: "This book could not be opened. The file may be damaged or unsupported.",
+        }),
+      );
+      setIsLoading(false);
+    });
 
     const initBook = async () => {
       try {
+        setLoadedBook(null);
         setIsLoading(true);
         setError(null);
-        const { bookDoc, format } = await loadAndParseBook(book.filePath!);
-        setBookDoc(bookDoc);
-        setBookFormat(format);
+        lastLoadErrorRef.current = null;
+        const parsed = await load(
+          (signal) => loadAndParseBook(filePath, signal),
+          (result) => result?.bookDoc,
+        );
+        if (signal.aborted) return;
+        if (!parsed) {
+          await release();
+          setIsLoading(false);
+          toast.info(
+            i18n.t("reader.largePdf.cancelled", { defaultValue: "Large PDF was not opened." }),
+          );
+          closeAppTab(tabId);
+          removeReaderTab(tabId);
+          return;
+        }
+        const doc = parsed.bookDoc;
+        doc.renderSignal = signal;
+        doc.reportRenderError = (error) => {
+          if (signal.aborted) return;
+          return reportFailure(error);
+        };
+        doc.reportInvalidLocation = (cfi) => {
+          invalidLocationRef.current = { bookId, cfi };
+        };
+        setLoadedBook({ doc, bookId, filePath, attempt: loadAttempt, signal });
+        setBookFormat(parsed.format);
       } catch (err) {
-        console.error("[ReaderView] Failed to load book:", err);
-        setError(err instanceof Error ? err.message : "Failed to load book");
-        setIsLoading(false);
+        await reportFailure(err);
       }
     };
 
     initBook();
 
     return () => {
-      isInitializedRef.current = false;
+      void release();
     };
-  }, [book?.filePath]);
+  }, [book?.filePath, bookId, tabId, closeAppTab, removeReaderTab, loadAttempt]);
 
   useEffect(() => {
     return eventBus.on("sync:completed", () => {
@@ -1088,6 +1169,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   }, [bookId, loadAnnotations]);
 
   useEffect(() => {
+    if (!bookId || !tabId || !bookFormat) return;
     sessionProgressRef.current = null;
     latestProgressRef.current = null;
     suppressProgressTracking(INITIAL_PROGRESS_RESTORE_GUARD_MS);
@@ -1208,21 +1290,15 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         return;
       }
 
-      isInitializedRef.current = false;
-      setBookDoc(null);
-      setError(null);
-      setIsLoading(true);
+      setLoadAttempt((attempt) => attempt + 1);
     } catch (err) {
       console.error("[ReaderView] Failed to re-import missing book:", err);
-      setError(
-        err instanceof Error
-          ? err.message
-          : t("reader.reimportFailed", "重新导入失败，请稍后再试。"),
-      );
+      lastLoadErrorRef.current = err;
+      setError(t("reader.reimportFailed", "重新导入失败，请稍后再试。"));
     } finally {
       setIsReimporting(false);
     }
-  }, [bookId, isReimporting, t]);
+  }, [book, bookId, isReimporting, t]);
 
   const handleCloseMissingBookTab = useCallback(() => {
     closeAppTab(tabId);
@@ -1361,18 +1437,25 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       setChapter,
       throttledSaveProgress,
       translationReady,
+      incrementCharactersRead,
+      incrementPagesRead,
     ],
   );
 
-  const handleTocReady = useCallback((toc: TOCItem[]) => {
-    setTocItems(toc);
-  }, []);
+  const documentSignal = loadedBook?.signal;
+  const handleTocReady = useCallback(
+    (toc: TOCItem[]) => {
+      if (!documentSignal?.aborted) setTocItems(toc);
+    },
+    [documentSignal],
+  );
 
   const handleLoaded = useCallback(() => {
+    if (documentSignal?.aborted) return;
     setIsLoading(false);
     // Mark foliate as ready to receive annotations
     setFoliateReady(true);
-  }, []);
+  }, [documentSignal]);
 
   // Show reader tour on first visit (after book loads)
   const tourTriggered = useRef(false);
@@ -1431,11 +1514,6 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     [highlights, bookId, chapterTranslation.reset],
   );
 
-  const handleError = useCallback((err: Error) => {
-    setError(err.message);
-    setIsLoading(false);
-  }, []);
-
   // Sync chapter translation visibility with DOM
   useEffect(() => {
     if (chapterTranslation.state.status !== "complete") return;
@@ -1447,19 +1525,19 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       const { originalVisible, translationVisible } = chapterTranslation.state;
       // Translation elements
       const translationEls = doc.querySelectorAll(".readany-translation");
-      translationEls.forEach((el) => {
+      for (const el of translationEls) {
         (el as HTMLElement).setAttribute("data-hidden", String(!translationVisible));
         // When original is hidden, show translation in original style
         (el as HTMLElement).setAttribute(
           "data-solo",
           String(!originalVisible && translationVisible),
         );
-      });
+      }
       // Original text elements
       const originalEls = doc.querySelectorAll("[data-translate-id]");
-      originalEls.forEach((el) => {
+      for (const el of originalEls) {
         (el as HTMLElement).setAttribute("data-original-hidden", String(!originalVisible));
-      });
+      }
     } catch {
       // Ignore
     }
@@ -1575,7 +1653,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
   // --- Selection actions ---
   const handleHighlight = useCallback(
     (color: HighlightColor = viewSettings.defaultHighlightColor ?? "yellow") => {
-      if (selection && selection.cfi) {
+      if (selection?.cfi) {
         updateReadSettings({ defaultHighlightColor: color });
         const existingHighlight = selection.highlightId
           ? highlights.find((h) => h.id === selection.highlightId)
@@ -1639,7 +1717,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   // Handle note button - open notebook panel with pending note
   const handleNote = useCallback(() => {
-    if (selection && selection.cfi) {
+    if (selection?.cfi) {
       // Check if this selection is already highlighted
       const existingHighlight = highlights.find(
         (h) => h.bookId === bookId && h.cfi === selection.cfi,
@@ -2253,6 +2331,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
       readerTab?.currentCfi,
       bookId,
       primeDesktopTTSLyricContext,
+      t,
     ],
   );
 
@@ -2299,6 +2378,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
     },
     [
       filterDistinctTTSSegments,
+      goToCFISafely,
       handleTTSPageEnd,
       ttsContinuousEnabled,
       ttsPlay,
@@ -2733,7 +2813,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         navigateToCfi(results[0].cfi);
       }
     },
-    [navigateToCfi, setSearchResults, setSearchIndex],
+    [navigateToCfi],
   );
 
   const navigateSearchResult = useCallback(
@@ -2930,12 +3010,17 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                 bookDoc={bookDoc}
                 format={bookFormat}
                 viewSettings={viewSettingsWithFonts}
-                lastLocation={book?.currentCfi || undefined}
+                lastLocation={
+                  invalidLocationRef.current?.bookId === bookId &&
+                  invalidLocationRef.current.cfi === book?.currentCfi
+                    ? undefined
+                    : book?.currentCfi || undefined
+                }
                 onRelocate={handleRelocate}
                 onTocReady={handleTocReady}
                 onLoaded={handleLoaded}
                 onSectionLoad={handleSectionLoad}
-                onError={handleError}
+                onError={bookDoc.reportRenderError}
                 onSelection={handleSelection}
                 onShowAnnotation={handleShowAnnotation}
                 onToggleSearch={handleToggleSearch}
@@ -2964,22 +3049,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                     <button
                       type="button"
                       className="mt-2 rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground hover:bg-primary/90"
-                      onClick={() => {
-                        isInitializedRef.current = false;
-                        setError(null);
-                        setBookDoc(null);
-                        setIsLoading(true);
-                        loadAndParseBook(book.filePath)
-                          .then(({ bookDoc, format }) => {
-                            setBookDoc(bookDoc);
-                            setBookFormat(format);
-                            isInitializedRef.current = true;
-                          })
-                          .catch((err) => {
-                            setError(err instanceof Error ? err.message : "Failed");
-                            setIsLoading(false);
-                          });
-                      }}
+                      onClick={() => setLoadAttempt((attempt) => attempt + 1)}
                     >
                       {t("common.retry")}
                     </button>
@@ -2992,6 +3062,23 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                       {t("common.back", "返回")}
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="rounded-lg border border-border bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-muted"
+                    onClick={() => {
+                      void copyErrorDiagnostics(lastLoadErrorRef.current, {
+                        scope: "reader",
+                        context: `bookId=${bookId}`,
+                      })
+                        .then(() => toast.success(t("reader.errorBoundary.copied")))
+                        .catch((copyError) => {
+                          console.error("[ReaderView] Failed to copy diagnostics:", copyError);
+                          toast.error(t("reader.errorBoundary.copyFailed"));
+                        });
+                    }}
+                  >
+                    {t("reader.errorBoundary.copyDiagnostics")}
+                  </button>
                   <button
                     type="button"
                     className="rounded-lg border border-border bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
@@ -3147,8 +3234,17 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         {showSettings && (
           <>
             <div
+              role="button"
+              tabIndex={0}
+              aria-label={t("common.close", { defaultValue: "Close" })}
               className="absolute inset-0 z-40 bg-black/20"
               onClick={() => setShowSettings(false)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape" || event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setShowSettings(false);
+                }
+              }}
             />
             <div className="absolute top-12 right-2 z-50 w-80 animate-in slide-in-from-top-2 duration-200 rounded-lg border border-border/60 bg-background shadow-lg">
               <div className="flex items-center justify-between border-b border-border/40 px-4 py-2">

@@ -3,6 +3,22 @@
     "untitled": "無題",
     "loadingBook": "本を読み込み中...",
     "failedToLoad": "本の読み込みに失敗しました",
+    "loadFailedMessage": "この本を開けませんでした。ファイルが破損しているか、未対応の形式の可能性があります。",
+    "largePdf": {
+      "title": "大きな PDF",
+      "message": "この PDF は {{size}} です。開くとメモリを大量に使用し、時間がかかる場合があります。開きますか？",
+      "openAnyway": "開く",
+      "cancelled": "大きな PDF を開きませんでした。"
+    },
+    "errorBoundary": {
+      "title": "このページで問題が発生しました",
+      "description": "本を表示できませんでした。読書の進捗とノートは保持されています。",
+      "appTitle": "ReadAny で問題が発生しました",
+      "appDescription": "画面を表示できませんでした。ライブラリとノートは保持されています。",
+      "copyDiagnostics": "診断情報をコピー",
+      "copied": "診断情報をコピーしました",
+      "copyFailed": "診断情報をコピーできませんでした"
+    },
     "validEpub": "有効なEPUBまたはPDFファイルか確認してください。",
     "noBookFile": "書籍{{bookId}}のファイルが見つかりません",
     "reimportPromptTitle": "本のファイルがありません",

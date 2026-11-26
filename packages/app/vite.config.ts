@@ -1,13 +1,35 @@
-import { createRequire } from "node:module";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { type Plugin, defineConfig, normalizePath } from "vite";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 const pdfjsDist = path.resolve(__dirname, "../../node_modules/pdfjs-dist");
+const pdfWorkerEntry = normalizePath(path.resolve(__dirname, "src/lib/pdf/pdf-worker-entry.ts"));
+
+function preservePdfWorkerExports(): Plugin {
+  let isPdfWorker = false;
+  return {
+    name: "readany:pdf-worker-exports",
+    // Vite sets preserveEntrySignatures to false after spreading worker.rollupOptions.
+    // Rollup's options hook runs after that and can preserve this entry's exports.
+    options(options) {
+      isPdfWorker = options.input === pdfWorkerEntry;
+      if (isPdfWorker) return { ...options, preserveEntrySignatures: "exports-only" };
+    },
+    generateBundle(_options, bundle) {
+      if (!isPdfWorker) return;
+      const hasHandler = Object.values(bundle).some(
+        (chunk) =>
+          chunk.type === "chunk" && chunk.isEntry && chunk.exports.includes("WorkerMessageHandler"),
+      );
+      if (!hasHandler) this.error("The PDF worker bundle must export WorkerMessageHandler");
+    },
+  };
+}
 
 // The About dialog shows the Tauri framework version. @tauri-apps/api releases
 // in lockstep but can differ by a patch, and its package.json is not importable
@@ -43,6 +65,7 @@ export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
   worker: {
     format: "es",
+    plugins: () => [preservePdfWorkerExports()],
   },
   resolve: {
     alias: {
