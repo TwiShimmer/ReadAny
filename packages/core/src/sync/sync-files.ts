@@ -305,6 +305,7 @@ type RemoteListings = {
   source: "manifest" | "scan";
   manifest: RemoteFileManifest | null;
   bookDirByBookId: Map<string, string>; // book.id -> existing folder name on remote
+  ambiguousBookDirsById: Map<string, string[]>;
   filePathByBookId: Map<string, string>;
   coverPathByBookId: Map<string, string>;
   fileSizeByBookId: Map<string, number>;
@@ -321,14 +322,16 @@ type RemoteListings = {
   unknownBookDirs: { folderName: string }[];
 };
 
-type MigrationResult = {
-  fileAtNew: boolean;
-  coverAtNew: boolean;
-  fileSize?: number;
-  coverSize?: number;
-  coverHash?: string;
-  coverSourcePath?: string;
-};
+type MigrationResult =
+  | { blocked: Omit<FileSyncFailure, "path"> }
+  | {
+      fileAtNew: boolean;
+      coverAtNew: boolean;
+      fileSize?: number;
+      coverSize?: number;
+      coverHash?: string;
+      coverSourcePath?: string;
+    };
 
 type RemoteFileManifestEntry = {
   folderName: string;
@@ -630,6 +633,7 @@ export async function syncFiles(
   const migrationTasks = bookInfos.map((info) => async () => {
     const result = await migrateBookRemoteState(backend, info, listings);
     migrationResults.set(info.book.id, result);
+    if ("blocked" in result) return;
     remoteFileAtNew.set(info.book.id, result.fileAtNew);
     remoteCoverAtNew.set(info.book.id, result.coverAtNew);
     if (isPositiveFiniteNumber(result.fileSize)) {
@@ -656,6 +660,30 @@ export async function syncFiles(
   for (const info of bookInfos) {
     const { book } = info;
     const migration = migrationResults.get(book.id) ?? { fileAtNew: false, coverAtNew: false };
+    if ("blocked" in migration) {
+      const candidates = [
+        {
+          path: info.remoteFilePath,
+          local: info.localFilePath,
+          downloadIfMissing: downloadRemoteBooks,
+        },
+        { path: info.remoteCoverPath, local: info.localCoverPath, downloadIfMissing: true },
+      ];
+      let reported = false;
+      for (const { path, local, downloadIfMissing } of candidates) {
+        if (!path) continue;
+        const localExists = localExistsMap.get(local) ?? false;
+        const download = forceDownloadAll || (downloadIfMissing && !localExists);
+        const upload = !disableUploads && localExists;
+        if (!download && !upload) continue;
+        if (download) filesDownloadFailed++;
+        if (upload) filesUploadFailed++;
+        failures.push({ path, ...migration.blocked });
+        reported = true;
+      }
+      if (!reported) failures.push({ path: info.remoteDir, ...migration.blocked });
+      continue;
+    }
 
     // --- Book file ---
     if (info.hasFile && info.fileExt) {
@@ -803,7 +831,8 @@ export async function syncFiles(
     const uploadStart = Date.now();
     const uploadResults = await runFileTasks(uploadTasks, "upload", uploadConcurrency, onProgress);
     filesUploaded = uploadResults.filter((r) => r.ok).length;
-    filesUploadFailed = uploadResults.length - filesUploaded;
+    filesUploadFailed += uploadResults.length - filesUploaded;
+    const firstUploadFailureIndex = failures.length;
     uploadTasks.forEach((task, index) => {
       const failure = failureFromResult(task, uploadResults[index] ?? { ok: true });
       if (failure) failures.push(failure);
@@ -811,7 +840,7 @@ export async function syncFiles(
     console.log(
       `[Sync] ✅ Upload completed: ${filesUploaded} succeeded, ${filesUploadFailed} failed in ${Date.now() - uploadStart}ms`,
     );
-    const firstUploadFailure = failures[0];
+    const firstUploadFailure = failures[firstUploadFailureIndex];
     if (firstUploadFailure) {
       console.warn(`[Sync] First upload failure: ${firstUploadFailure.message}`);
       onProgress?.({
@@ -837,7 +866,7 @@ export async function syncFiles(
       onProgress,
     );
     filesDownloaded = downloadResults.filter((r) => r.ok).length;
-    filesDownloadFailed = downloadResults.length - filesDownloaded;
+    filesDownloadFailed += downloadResults.length - filesDownloaded;
     downloadTasks.forEach((task, index) => {
       const failure = failureFromResult(task, downloadResults[index] ?? { ok: true });
       if (failure) failures.push(failure);
@@ -861,7 +890,7 @@ export async function syncFiles(
     const folderName = listings.bookDirByBookId.get(info.book.id);
     return folderName !== undefined && folderName !== info.expectedFolderName;
   });
-  if (!renamePending) {
+  if (!renamePending && !Array.from(migrationResults.values()).some((r) => "blocked" in r)) {
     await saveRemoteFileManifest(
       backend,
       bookInfos,
@@ -917,19 +946,27 @@ async function loadRemoteListings(
     }
   }
 
-  const allDirNames = bookDirs.filter((e) => e.isDirectory).map((e) => e.name);
+  const allDirNames = new Set(bookDirs.filter((e) => e.isDirectory).map((e) => e.name));
+  const dirNames = [...allDirNames];
 
-  // Match folders to known book ids by `endsWith(-{id})`. This works for any id format,
-  // including non-UUID ids that may appear during development or in tests.
   const bookDirByBookId = new Map<string, string>();
+  const ambiguousBookDirsById = new Map<string, string[]>();
   const matched = new Set<string>();
-  for (const id of currentBookIds) {
-    const suffix = `-${id}`;
-    const match = allDirNames.find((name) => name.endsWith(suffix) && !matched.has(name));
-    if (match) {
-      bookDirByBookId.set(id, match);
-      matched.add(match);
+  // Reserve exact current names before considering folders retained after a rename.
+  for (const { book, expectedFolderName } of bookInfos) {
+    if (allDirNames.has(expectedFolderName)) {
+      bookDirByBookId.set(book.id, expectedFolderName);
+      matched.add(expectedFolderName);
     }
+  }
+  // For non-UUID ids with overlapping suffixes, match the more specific id first.
+  for (const id of [...currentBookIds].sort((a, b) => b.length - a.length)) {
+    const staleDirs = dirNames.filter((name) => name.endsWith(`-${id}`) && !matched.has(name));
+    // Keep all folders for active books out of orphan cleanup, even if unused or ambiguous.
+    for (const name of staleDirs) matched.add(name);
+    if (bookDirByBookId.has(id)) continue;
+    if (staleDirs.length === 1) bookDirByBookId.set(id, staleDirs[0]);
+    if (staleDirs.length > 1) ambiguousBookDirsById.set(id, staleDirs.sort());
   }
   const fileSizeByBookId = new Map<string, number>();
   const coverSizeByBookId = new Map<string, number>();
@@ -952,6 +989,7 @@ async function loadRemoteListings(
     source: "scan",
     manifest,
     bookDirByBookId,
+    ambiguousBookDirsById,
     filePathByBookId: new Map(),
     coverPathByBookId: new Map(),
     fileSizeByBookId,
@@ -1045,6 +1083,7 @@ function buildListingsFromManifest(
     source: "manifest",
     manifest,
     bookDirByBookId,
+    ambiguousBookDirsById: new Map(),
     filePathByBookId,
     coverPathByBookId,
     fileSizeByBookId,
@@ -1159,6 +1198,14 @@ async function migrateBookRemoteState(
   listings: RemoteListings,
 ): Promise<MigrationResult> {
   const { book } = info;
+  const ambiguousDirs = listings.ambiguousBookDirsById.get(book.id);
+  if (ambiguousDirs) {
+    return {
+      blocked: {
+        message: `Cannot determine the current remote book folder: ${ambiguousDirs.join(", ")}`,
+      },
+    };
+  }
   const existingFolderName = listings.bookDirByBookId.get(book.id);
   let fileAtNew = false;
   let coverAtNew = false;
@@ -1171,16 +1218,19 @@ async function migrateBookRemoteState(
     if (existingFolderName !== info.expectedFolderName) {
       // Title changed (or sanitized form changed): rename folder by moving every child.
       const oldDir = `${REMOTE_BOOKS_ROOT}/${existingFolderName}`;
-      let oldFiles: RemoteFile[] | undefined;
+      let oldFiles: RemoteFile[];
       try {
         oldFiles = await backend.listDir(oldDir);
       } catch (e) {
-        console.warn(
-          `[Sync] Failed to list old book folder ${oldDir} (${errorStatus(e) ?? "unknown"})`,
-        );
+        return {
+          blocked: {
+            message: `Cannot verify remote book folder: ${oldDir}`,
+            status: errorStatus(e),
+          },
+        };
       }
-      let allMoved = oldFiles !== undefined;
-      for (const f of oldFiles ?? []) {
+      let allMoved = true;
+      for (const f of oldFiles) {
         const ext = getExt(f.name);
         if (!ext || f.isDirectory) {
           allMoved = false;
@@ -1218,11 +1268,13 @@ async function migrateBookRemoteState(
 
       // Folder name matches. Peek inside to verify which files are present.
       const dir = `${REMOTE_BOOKS_ROOT}/${existingFolderName}`;
-      let current: RemoteFile[] = [];
+      let current: RemoteFile[];
       try {
         current = await backend.listDir(dir);
       } catch (e) {
-        console.warn(`[Sync] Failed to list book folder ${dir}:`, syncErrorDiagnostic(e));
+        return {
+          blocked: { message: `Cannot verify remote book folder: ${dir}`, status: errorStatus(e) },
+        };
       }
       const sanitized = sanitizeBookTitleForFs(book.title);
       const expectedFileName = info.fileExt ? `${sanitized}.${info.fileExt}` : "";

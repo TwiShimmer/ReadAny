@@ -1295,6 +1295,127 @@ describe("sync-files", () => {
     );
 
     it.each([true, false])(
+      "prefers the current WebDAV collection on a later scan after MOVE (force download: %s)",
+      async (forceDownloadAll) => {
+        mockSelect.mockResolvedValue([
+          { id: "book-1", file_path: "books/book-1.epub", title: "New Title" },
+        ]);
+        mockAdapter.fileExists.mockResolvedValue(true);
+
+        let moved = false;
+        const root = `/dav${REMOTE_BOOKS_ROOT}/`;
+        const oldDir = `${root}Old%20Title-book-1/`;
+        const currentDir = `${root}New%20Title-book-1/`;
+        const source = `${oldDir}Old%20Title.epub`;
+        const target = `${currentDir}New%20Title.epub`;
+        const fetch = vi.fn((url: string, options?: FetchOptions) => {
+          const path = new URL(url).pathname;
+          switch (options?.method) {
+            case "GET":
+              if (path === target && moved) return new Response(epubBytes);
+              return new Response(null, { status: 404, headers: { "Content-Length": "0" } });
+            case "PROPFIND":
+              if (path === root)
+                return moved
+                  ? davListing([root, true], [oldDir, true], [currentDir, true])
+                  : davListing([root, true], [oldDir, true]);
+              if (path === oldDir)
+                return moved
+                  ? davListing([oldDir, true])
+                  : davListing([oldDir, true], [source, false]);
+              if (path === currentDir && moved)
+                return davListing([currentDir, true], [target, false]);
+              return davListing([path, true]);
+            case "MOVE":
+              expect(path).toBe(source);
+              expect(new URL(new Headers(options.headers).get("Destination") ?? "").pathname).toBe(
+                target,
+              );
+              moved = true;
+              return new Response(null, { status: 201 });
+            case "PUT":
+              return new Response(null, { status: 201 });
+            default:
+              throw new Error(`Unexpected method ${options?.method}`);
+          }
+        });
+        setPlatformService({ fetch } as unknown as IPlatformService);
+
+        await syncFiles(new WebDavBackend(config, "secret"), undefined, { disableUploads: true });
+        expect(moved).toBe(true);
+        const laterRequestsStart = fetch.mock.calls.length;
+        // A fresh client cannot rely on either the last scan's in-memory map or the manifest.
+        const result = await syncFiles(new WebDavBackend(config, "secret"), undefined, {
+          forceDownloadAll,
+        });
+
+        const requests = fetch.mock.calls
+          .slice(laterRequestsStart)
+          .map(([url, options]) => [options?.method, new URL(url).pathname]);
+        if (forceDownloadAll) expect(requests).toContainEqual(["GET", target]);
+        expect(requests).not.toContainEqual(["PUT", target]);
+        expect(result).toMatchObject({
+          filesDownloaded: forceDownloadAll ? 1 : 0,
+          filesUploaded: 0,
+          failures: [],
+        });
+        expect(fetch.mock.calls.filter(([, options]) => options?.method === "DELETE")).toEqual([]);
+      },
+    );
+
+    it.each([false, true])(
+      "reports unverifiable scan results without transferring or deleting book data (current folder listed: %s)",
+      async (currentListed) => {
+        const id = "550e8400-e29b-41d4-a716-446655440000";
+        mockSelect.mockResolvedValue([
+          { id, file_path: `books/${id}.epub`, title: "Current Title" },
+        ]);
+        mockAdapter.fileExists.mockResolvedValue(true);
+
+        const names = [`Old Title-${id}`, `${currentListed ? "Current" : "Older"} Title-${id}`];
+        const currentDir = `${REMOTE_BOOKS_ROOT}/Current Title-${id}`;
+        const backend = createMockBackend({
+          listDir: vi.fn(async (path: string) => {
+            if (path === REMOTE_BOOKS_ROOT) {
+              return names.map((name) => ({
+                name,
+                path: `${path}/${name}`,
+                size: 0,
+                lastModified: 0,
+                isDirectory: true,
+              }));
+            }
+            if (path === currentDir)
+              throw new WebDavError("forbidden", "Cannot list collection", { status: 403 });
+            return [];
+          }),
+        });
+
+        const result = await syncFiles(backend, undefined, { forceDownloadAll: true });
+
+        expect(result).toEqual({
+          filesUploaded: 0,
+          filesDownloaded: 0,
+          filesUploadFailed: 1,
+          filesDownloadFailed: 1,
+          failures: [
+            {
+              path: `${currentDir}/Current Title.epub`,
+              ...(currentListed
+                ? { message: `Cannot verify remote book folder: ${currentDir}`, status: 403 }
+                : { message: expect.stringContaining([...names].sort().join(", ")) }),
+            },
+          ],
+        });
+        expect(backend.get).not.toHaveBeenCalled();
+        expect(backend.put).not.toHaveBeenCalled();
+        expect(backend.move).not.toHaveBeenCalled();
+        expect(backend.delete).not.toHaveBeenCalled();
+        expect(backend.putJSON).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([true, false])(
       "never probes or deletes the old folder (all moved: %s)",
       async (allMoved) => {
         mockSelect.mockResolvedValue([
