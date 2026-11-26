@@ -475,13 +475,23 @@ fn is_nonempty_zip(path: &str, epub: bool) -> bool {
     }) {
         return false;
     }
-    let Ok(mime) = zip.by_name("mimetype") else {
+    let Some(mime_index) = zip.index_for_name("mimetype") else {
         return false;
     };
+    let Ok(mime) = zip.by_index_raw(mime_index) else {
+        return false;
+    };
+    if !mime.is_file() || mime.size() != 20 {
+        return false;
+    }
+    // Older desktop TXT conversions used Deflate. Leave decompression, CRC and
+    // full package validation to the shared validator before any local replace.
+    if mime.compression() == zip::CompressionMethod::DEFLATE {
+        return (1..=64).contains(&mime.compressed_size());
+    }
     let mut bytes = Vec::with_capacity(21);
-    mime.is_file()
-        && mime.size() == 20
-        && mime.compression() == zip::CompressionMethod::Stored
+    mime.compression() == zip::CompressionMethod::Stored
+        && mime.compressed_size() == 20
         && mime.take(21).read_to_end(&mut bytes).is_ok()
         && bytes == b"application/epub+zip"
 }

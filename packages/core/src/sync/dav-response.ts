@@ -1,5 +1,10 @@
 import { type Entry, type FileEntry, Reader, ZipReader } from "@zip.js/zip.js";
-import { parseEpubContainerPaths, parseEpubXmlRoot } from "../epub/inspect";
+import {
+  getPackageDir,
+  parseEpubReadingManifest,
+  parseEpubReadingPackagePaths,
+  resolvePackagePath,
+} from "../epub/inspect";
 import { getPathExtension } from "./local-book-paths";
 
 export const DAV_BODY_PREFIX_BYTES = 1024;
@@ -237,17 +242,30 @@ async function readEpubMetadata(entry: FileEntry, limit: number): Promise<string
   return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
-async function hasEpubContainer(entries: Map<string, FileEntry>): Promise<boolean> {
+function resolveEpubManifestHref(packageDir: string, href: string): string | undefined {
+  // Foliate resolves the URI relative to the package and decodes each path segment.
+  // Do not allow absolute paths, traversal or encoded path separators to be normalized away.
+  if (href !== href.trim() || /[\t\r\n?#]|%(?:2f|5c|23)/i.test(href)) return;
+  const parts = decodeURIComponent(href).split("/");
+  if (parts[parts.length - 1] === ".") return;
+  const relative = parts.filter((part) => part !== ".").join("/");
+  if (!safeEpubPath(relative)) return;
+  return resolvePackagePath(packageDir, relative);
+}
+
+async function hasReadableEpubPackage(entries: Map<string, FileEntry>): Promise<boolean> {
   const mime = entries.get("mimetype");
   const container = entries.get("META-INF/container.xml");
+  // Historical desktop TXT conversion deflated this entry. Its data must still be
+  // exactly the OCF mimetype, and it does not waive any container or package check.
   if (
     !mime ||
-    mime.compressionMethod !== 0 ||
+    mime.uncompressedSize !== 20 ||
     !container ||
-    (await readEpubMetadata(mime, 20)) !== "application/epub+zip"
+    (await readEpubMetadata(mime, 64)) !== "application/epub+zip"
   )
     return false;
-  const paths = parseEpubContainerPaths(
+  const paths = parseEpubReadingPackagePaths(
     await readEpubMetadata(container, MAX_EPUB_CONTAINER_BYTES),
   );
   if (
@@ -255,12 +273,16 @@ async function hasEpubContainer(entries: Map<string, FileEntry>): Promise<boolea
     paths.some((path) => !safeEpubPath(path) || !safeEpubPath(decodeURIComponent(path)))
   )
     return false;
-  // Inspect uses the first rootfile as the primary reading rendition.
+  // Match Foliate: the first rootfile with the package media type is the primary rendition.
   const opf = entries.get(paths[0]);
-  return (
-    !!opf &&
-    parseEpubXmlRoot(await readEpubMetadata(opf, MAX_EPUB_PACKAGE_BYTES)).localName === "package"
-  );
+  if (!opf) return false;
+  const packageDir = getPackageDir(opf.filename);
+  const manifest = parseEpubReadingManifest(await readEpubMetadata(opf, MAX_EPUB_PACKAGE_BYTES));
+  return manifest.every(({ href }) => {
+    const path = resolveEpubManifestHref(packageDir, href);
+    const entry = path && entries.get(path);
+    return !!entry && entry.uncompressedSize > 0 && entry.compressedSize > 0;
+  });
 }
 
 /** Scan ZIP headers and, for EPUB, read and CRC-check only the bounded OCF metadata. */
@@ -316,6 +338,7 @@ export async function isValidDavZip(
       if (
         !Number.isSafeInteger(entry.offset) ||
         entry.offset < 0 ||
+        entry.offset > directoryStart - 30 ||
         !Number.isSafeInteger(entry.compressedSize) ||
         entry.compressedSize < 0
       )
@@ -325,7 +348,10 @@ export async function isValidDavZip(
       const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
       const nameLength = view.getUint16(26, true);
       const dataOffset = entry.offset + 30 + nameLength + view.getUint16(28, true);
-      if (dataOffset + entry.compressedSize > (entries[index + 1]?.offset ?? directoryStart))
+      if (
+        dataOffset + entry.compressedSize >
+        Math.min(entries[index + 1]?.offset ?? directoryStart, directoryStart)
+      )
         return false;
       hasFile ||= !entry.directory && entry.uncompressedSize > 0;
       if (!epub) continue;
@@ -368,7 +394,7 @@ export async function isValidDavZip(
       names.add(path);
       if (!entry.directory) files.set(path, entry);
     }
-    return hasFile && (!epub || (await hasEpubContainer(files)));
+    return hasFile && (!epub || (await hasReadableEpubPackage(files)));
   } catch {
     return false;
   } finally {

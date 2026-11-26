@@ -2,6 +2,10 @@ import { DOMParser } from "@xmldom/xmldom";
 import { BlobReader, TextWriter, ZipReader, configure } from "@zip.js/zip.js";
 import { toArrayBuffer } from "./zip";
 
+const CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container";
+const PACKAGE_MEDIA_TYPE = "application/oebps-package+xml";
+const OPF_NS = "http://www.idpf.org/2007/opf";
+
 export type EpubInspectManifestItem = {
   id: string;
   href: string;
@@ -140,17 +144,27 @@ function parsePackagePath(containerXml: string): string {
 }
 
 /** Parse OCF metadata without resolving external resources. */
-export function parseEpubContainerPaths(xml: string): string[] {
+function parseEpubContainerPaths(xml: string, requirePackageMediaType = false): string[] {
   const root = parseEpubXmlRoot(xml);
-  if (root.localName !== "container") throw new Error("Invalid EPUB container.xml");
+  if (
+    root.localName !== "container" ||
+    (requirePackageMediaType && root.namespaceURI !== CONTAINER_NS)
+  )
+    throw new Error("Invalid EPUB container.xml");
   return childElements(root)
     .filter((element) => element.localName === "rootfiles")
     .flatMap(childElements)
-    .filter((element) => element.localName === "rootfile")
+    .filter(
+      (element) =>
+        element.localName === "rootfile" &&
+        (!requirePackageMediaType ||
+          (element.namespaceURI === CONTAINER_NS &&
+            element.getAttribute("media-type") === PACKAGE_MEDIA_TYPE)),
+    )
     .map((element) => element.getAttribute("full-path") ?? "");
 }
 
-export function parseEpubXmlRoot(xml: string): Element {
+function parseEpubXmlRoot(xml: string): Element {
   if (/<!(?:DOCTYPE|ENTITY)\b/i.test(xml)) throw new Error("Unexpected EPUB XML declaration");
   const rejectInvalidXml = () => {
     throw new Error("Invalid EPUB XML");
@@ -163,6 +177,48 @@ export function parseEpubXmlRoot(xml: string): Element {
   return doc.documentElement as unknown as Element;
 }
 
+export function parseEpubReadingPackagePaths(xml: string): string[] {
+  return parseEpubContainerPaths(xml, true);
+}
+
+function parseManifestItem(item: Element): EpubInspectManifestItem {
+  return {
+    id: item.getAttribute("id") ?? "",
+    href: item.getAttribute("href") ?? "",
+    mediaType: item.getAttribute("media-type") ?? "",
+    properties: item.getAttribute("properties") || undefined,
+  };
+}
+
+/** Inspect the untruncated OPF structure, without loading TOC or book resources. */
+export function parseEpubReadingManifest(xml: string): EpubInspectManifestItem[] {
+  const root = parseEpubXmlRoot(xml);
+  if (root.localName !== "package") throw new Error("Invalid EPUB package root");
+  // Foliate uses the OPF namespace when declared, but also handles older unnamespaced packages.
+  const usesOpfNamespace = root.namespaceURI === OPF_NS || root.lookupPrefix(OPF_NS);
+  const children = (element: Element, name: string) =>
+    childElements(element).filter(
+      (child) => child.localName === name && (!usesOpfNamespace || child.namespaceURI === OPF_NS),
+    );
+  const [metadata] = children(root, "metadata");
+  const [manifest] = children(root, "manifest");
+  const [spine] = children(root, "spine");
+  if (!metadata || !manifest || !spine) throw new Error("Incomplete EPUB package");
+
+  const items = children(manifest, "item").map(parseManifestItem);
+  const idrefs = children(spine, "itemref");
+  if (!items.length || !idrefs.length) throw new Error("Empty EPUB manifest or spine");
+  const ids = new Set<string>();
+  for (const { id, href, mediaType } of items) {
+    if (!id.trim() || !href.trim() || !mediaType.trim() || ids.has(id))
+      throw new Error("Invalid EPUB manifest item");
+    ids.add(id);
+  }
+  if (idrefs.some((item) => !ids.has(item.getAttribute("idref") ?? "")))
+    throw new Error("Invalid EPUB spine reference");
+  return items;
+}
+
 async function inspectPackageDocument(options: {
   opfXml: string;
   packagePath: string;
@@ -172,12 +228,7 @@ async function inspectPackageDocument(options: {
   const doc = parseXml(options.opfXml);
   const packageElement = doc.documentElement;
   const packageDir = getPackageDir(options.packagePath);
-  const manifestItems = elementsByLocalName(doc, "item").map((item) => ({
-    id: item.getAttribute("id") ?? "",
-    href: item.getAttribute("href") ?? "",
-    mediaType: item.getAttribute("media-type") ?? "",
-    properties: item.getAttribute("properties") || undefined,
-  }));
+  const manifestItems = elementsByLocalName(doc, "item").map(parseManifestItem);
   const manifestById = new Map(manifestItems.map((item) => [item.id, item]));
   const spineElement = elementsByLocalName(doc, "spine")[0];
   const spineItems = elementsByLocalName(spineElement ?? doc, "itemref").map((itemref) => {
