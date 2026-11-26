@@ -392,17 +392,11 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-/**
- * Existence is only actionable when the backend can answer. A 401/403/network
- * failure is "unknown", so callers must not delete or overwrite remote data.
- */
-async function remoteExistsSafe(backend: ISyncBackend, path: string): Promise<boolean> {
+// A positive probe can locate a download candidate, but never authorizes cleanup.
+async function probeMigrationTarget(backend: ISyncBackend, path: string): Promise<boolean> {
   try {
     return await backend.exists(path);
-  } catch (e) {
-    console.warn(
-      `[Sync] Cannot determine remote existence for ${path} (${errorStatus(e) ?? "unknown"})`,
-    );
+  } catch {
     return false;
   }
 }
@@ -1258,14 +1252,7 @@ async function migrateBookRemoteState(
       console.log(`[Sync] 🔁 Migrated legacy file → ${info.remoteFilePath}`);
     } catch (e) {
       console.warn(`[Sync] Legacy file MOVE failed for ${book.id}:`, syncErrorDiagnostic(e));
-      if (await remoteExistsSafe(backend, info.remoteFilePath)) {
-        try {
-          await backend.delete(legacy);
-          fileAtNew = true;
-          fileSize = listings.legacyFileSizeByName.get(info.legacyRemoteFileName) ?? fileSize;
-          console.log(`[Sync] 🧹 Deleted redundant legacy file ${info.legacyRemoteFileName}`);
-        } catch {}
-      }
+      fileAtNew = await probeMigrationTarget(backend, info.remoteFilePath);
     }
   }
 
@@ -1278,14 +1265,7 @@ async function migrateBookRemoteState(
       console.log(`[Sync] 🔁 Migrated legacy cover → ${info.remoteCoverPath}`);
     } catch (e) {
       console.warn(`[Sync] Legacy cover MOVE failed for ${book.id}:`, syncErrorDiagnostic(e));
-      if (await remoteExistsSafe(backend, info.remoteCoverPath)) {
-        try {
-          await backend.delete(legacy);
-          coverAtNew = true;
-          coverSize = listings.legacyCoverSizeByName.get(info.legacyRemoteCoverName) ?? coverSize;
-          console.log(`[Sync] 🧹 Deleted redundant legacy cover ${info.legacyRemoteCoverName}`);
-        } catch {}
-      }
+      coverAtNew = await probeMigrationTarget(backend, info.remoteCoverPath);
     }
   }
 

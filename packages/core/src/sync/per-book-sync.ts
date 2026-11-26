@@ -626,6 +626,8 @@ export async function runPerBookSync(
     if (!isPerBookIndex(rawRemoteIndex)) {
       const migration = await importLegacySnapshots(backend, progress, forceApply);
       legacyImported = migration.imported;
+      // Imported sessions can predate our cursor. Replay them if the import changed rows.
+      if (migration.applied > 0) await setMetadata(SESSIONS_PUSHED_AT_KEY, "0");
       changes += migration.applied;
     }
     const remoteIndex = isPerBookIndex(rawRemoteIndex) ? rawRemoteIndex : emptyIndex();
@@ -946,9 +948,7 @@ export async function runPerBookSync(
     if (!receiveOnly) {
       // The legacy global cursor may already have skipped local sessions during download-only sync.
       // Replay once rather than using it to initialize the independent upload cursor.
-      const pushedAt = legacyImported
-        ? 0
-        : Number((await getMetadata(SESSIONS_PUSHED_AT_KEY)) ?? 0);
+      const pushedAt = Number((await getMetadata(SESSIONS_PUSHED_AT_KEY)) ?? 0);
       const changedSessions = await db.select<Row>(
         "SELECT * FROM reading_sessions WHERE updated_at > ?",
         [pushedAt],
@@ -964,6 +964,23 @@ export async function runPerBookSync(
       for (const [month, sessions] of byMonth) {
         const path = `${SESSIONS_DIR}/${month}.json`;
         const remote = await backend.getJSON<SessionShardFile>(path);
+        // A retry may still be doing a full replay (e.g. the index was not
+        // published yet). Do not rewrite rows already covered by that shard.
+        if (remote?.schemaVersion === 1) {
+          const remoteById = new Map((remote.sessions ?? []).map((row) => [row.id, row]));
+          if (
+            sessions.every((row) => {
+              const existing = remoteById.get(row.id);
+              return (
+                existing &&
+                (Number(existing.updated_at) > Number(row.updated_at) ||
+                  (Object.keys(existing).length === Object.keys(row).length &&
+                    Object.entries(row).every(([key, value]) => existing[key] === value)))
+              );
+            })
+          )
+            continue;
+        }
         const merged = mergeItemRows(sessions, remote?.sessions, "updated_at");
         const file: SessionShardFile = {
           schemaVersion: 1,
@@ -975,6 +992,7 @@ export async function runPerBookSync(
         changes += sessions.length;
         await sleep(0);
       }
+      await setMetadata(SESSIONS_PUSHED_AT_KEY, String(syncStartedAt));
     }
     for (const shard of shardEntries) {
       if (shard.isDirectory || !shard.name.endsWith(".json")) continue;
@@ -1068,7 +1086,6 @@ export async function runPerBookSync(
     }
 
     if (filesUploadFailed === 0 && filesDownloadFailed === 0) {
-      if (!receiveOnly) await setMetadata(SESSIONS_PUSHED_AT_KEY, String(syncStartedAt));
       await setLastSyncTimestamp(syncStartedAt);
     }
 
