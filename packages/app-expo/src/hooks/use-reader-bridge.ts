@@ -97,6 +97,8 @@ export interface ReaderBridgeCallbacks {
 
 export function useReaderBridge(callbacks: ReaderBridgeCallbacks) {
   const webViewRef = useRef<WebView>(null);
+  const readyWebViewRef = useRef<WebView | null>(null);
+  const pendingOpenRef = useRef<string | null>(null);
   const callbacksRef = useRef(callbacks);
   callbacksRef.current = callbacks;
   const pendingVisibleTextResolveRef = useRef<((text: string) => void) | null>(null);
@@ -123,6 +125,7 @@ export function useReaderBridge(callbacks: ReaderBridgeCallbacks) {
     ((paragraphs: Array<{ id: string; text: string; tagName: string }>) => void) | null
   >(null);
   const pendingChapterTranslationInjectionResolveRef = useRef(new Map<string, () => void>());
+  const invalidLocationRef = useRef<{ uri: string; cfi: string } | null>(null);
 
   // ─── Send commands to WebView ───
 
@@ -146,12 +149,20 @@ export function useReaderBridge(callbacks: ReaderBridgeCallbacks) {
       paginatedLayout?: "single" | "double";
       settings?: ReaderInitialSettings;
     }) => {
+      const invalid = invalidLocationRef.current;
+      const lastLocation =
+        invalid && invalid.uri === params.uri && invalid.cfi === params.lastLocation
+          ? undefined
+          : params.lastLocation;
       const msg = JSON.stringify({
         type: "openBook",
         ...params,
+        lastLocation,
         settings: withJustifiedTextSetting(params.settings),
       });
-      inject(`handleCommand(${msg})`);
+      const view = webViewRef.current;
+      if (view && view === readyWebViewRef.current) inject(`handleCommand(${msg})`);
+      else pendingOpenRef.current = msg;
     },
     [inject],
   );
@@ -719,14 +730,27 @@ export function useReaderBridge(callbacks: ReaderBridgeCallbacks) {
       const cb = callbacksRef.current;
 
       switch (msg.type) {
-        case "ready":
+        case "ready": {
+          const view = webViewRef.current;
+          readyWebViewRef.current = view;
+          // Retry can arrive before a replacement WebView has installed handleCommand.
+          if (view && pendingOpenRef.current) {
+            view.injectJavaScript(`handleCommand(${pendingOpenRef.current}); true;`);
+            pendingOpenRef.current = null;
+          }
           cb.onReady?.();
           break;
+        }
         case "loaded":
           cb.onLoaded?.();
           break;
         case "relocate":
           cb.onRelocate?.(msg);
+          break;
+        case "invalidLastLocation":
+          if (typeof msg.uri === "string" && typeof msg.cfi === "string") {
+            invalidLocationRef.current = { uri: msg.uri, cfi: msg.cfi };
+          }
           break;
         case "bookTextMetrics":
           cb.onBookTextMetrics?.({

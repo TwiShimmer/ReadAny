@@ -400,9 +400,21 @@ export class View extends HTMLElement {
   async init({ lastLocation, showTextStart }) {
     const signal = this.#renderController?.signal;
     signal?.throwIfAborted();
-    const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null;
     if (this.isFixedLayout) {
       this.#fixedLayoutReady = false;
+      let resolved;
+      if (lastLocation != null && lastLocation !== "") {
+        resolved = await this.resolveNavigation(lastLocation);
+        signal?.throwIfAborted();
+        if (!Number.isSafeInteger(resolved?.index) || !this.book.sections[resolved.index]) {
+          console.warn("[Reader] Ignoring an invalid saved fixed-layout position", {
+            index: resolved?.index,
+            sectionCount: this.book.sections.length,
+          });
+          this.book.reportInvalidLocation?.(lastLocation);
+          resolved = null;
+        }
+      }
       const start = showTextStart ? this.book.sections.findIndex((s) => s.linear !== "no") : 0;
       const displayed = await this.renderer.goTo(
         resolved ?? { index: Math.max(start, 0) },
@@ -414,6 +426,7 @@ export class View extends HTMLElement {
       this.#fixedLayoutReady = true;
       return;
     }
+    const resolved = lastLocation ? this.resolveNavigation(lastLocation) : null;
     if (resolved) {
       await this.renderer.goTo(resolved);
       signal?.throwIfAborted();
@@ -576,7 +589,10 @@ export class View extends HTMLElement {
     if (this.book.resolveCFI) return this.book.resolveCFI(cfi);
 
     const parts = CFI.parse(cfi);
-    const index = CFI.fake.toIndex((parts.parent ?? parts).shift());
+    const base = (parts.parent ?? parts).shift();
+    if (this.isFixedLayout && (base?.length !== 2 || base[0].index !== 6)) return undefined;
+    const index = CFI.fake.toIndex(base);
+    if (this.isFixedLayout && (!Number.isSafeInteger(index) || index < 0)) return undefined;
     const anchor = (doc) => CFI.toRange(doc, parts);
     return { index, anchor };
   }

@@ -54,6 +54,7 @@ export interface BookDoc {
   destroy?(): void | Promise<void>;
   renderSignal?: AbortSignal;
   reportRenderError?(error: unknown): void | Promise<void>;
+  reportInvalidLocation?(cfi: string): void;
 }
 
 /** File extension map */

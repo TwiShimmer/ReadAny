@@ -1039,7 +1039,7 @@ async function _buildPDFBook(pdf, fileName, destroy) {
       const index = await pdf.getPageIndex(dest[0]);
       return { index };
     } catch {
-      return { index: 0 };
+      return undefined;
     }
   };
   book.splitTOCHref = async (href) => {

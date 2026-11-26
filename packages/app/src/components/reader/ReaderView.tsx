@@ -786,6 +786,7 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
 
   // Book document state
   const [loadAttempt, setLoadAttempt] = useState(0);
+  const invalidLocationRef = useRef<{ bookId: string; cfi: string } | null>(null);
   const [loadedBook, setLoadedBook] = useState<{
     doc: BookDoc;
     bookId: string;
@@ -1143,6 +1144,9 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
         doc.reportRenderError = (error) => {
           if (signal.aborted) return;
           return reportFailure(error);
+        };
+        doc.reportInvalidLocation = (cfi) => {
+          invalidLocationRef.current = { bookId, cfi };
         };
         setLoadedBook({ doc, bookId, filePath, attempt: loadAttempt, signal });
         setBookFormat(parsed.format);
@@ -3006,7 +3010,12 @@ export function ReaderView({ bookId, tabId }: ReaderViewProps) {
                 bookDoc={bookDoc}
                 format={bookFormat}
                 viewSettings={viewSettingsWithFonts}
-                lastLocation={book?.currentCfi || undefined}
+                lastLocation={
+                  invalidLocationRef.current?.bookId === bookId &&
+                  invalidLocationRef.current.cfi === book?.currentCfi
+                    ? undefined
+                    : book?.currentCfi || undefined
+                }
                 onRelocate={handleRelocate}
                 onTocReady={handleTocReady}
                 onLoaded={handleLoaded}

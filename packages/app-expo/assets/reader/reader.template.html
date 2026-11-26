@@ -1571,6 +1571,7 @@
         signal.throwIfAborted();
         book.renderSignal = signal;
         book.reportRenderError = (error) => attempt.fail(error);
+        book.reportInvalidLocation = (cfi) => postToRN('invalidLastLocation', { uri: msg.uri, cfi });
         currentBook = book;
         attachBookTransformHandler(book);
 
